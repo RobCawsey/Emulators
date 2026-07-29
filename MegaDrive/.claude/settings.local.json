@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dotnet build *)",
+      "Bash(dotnet test *)",
+      "Bash(uuidgen)",
+      "Bash(python3 -c \"import uuid; print\\(uuid.uuid4\\(\\)\\)\")",
+      "Read(//c/Users/ROB~1.CAW/AppData/Local/Temp/claude/C--Emulation/98355323-18f6-43f8-bbfd-a27ac5c2ea1e/scratchpad/RomTrace/**)",
+      "Bash(dotnet run *)",
+      "Bash(powershell.exe -NoProfile -Command '$bytes = [System.IO.File]::ReadAllBytes\\(\"C:\\\\Users\\\\rob.cawsey\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Emulation\\\\98355323-18f6-43f8-bbfd-a27ac5c2ea1e\\\\scratchpad\\\\roms\\\\starchaser.bin\"\\); for \\($i=0x210; $i -lt 0x240; $i+=2\\) { $w = \\($bytes[$i] -shl 8\\) -bor $bytes[$i+1]; Write-Output \\(\"{0:X4}: {1:X4}\" -f $i, $w\\) }')",
+      "WebFetch(domain:gendev.spritesmind.net)",
+      "Bash(powershell -ExecutionPolicy Bypass -File capture.ps1 \"C:/Emulation/SagaRoms/omega_blast.bin\" \"omega_blast_screenshot5.png\" 4)",
+      "Bash(powershell -ExecutionPolicy Bypass -File capture_gameplay.ps1 \"C:/Emulation/SagaRoms/omega_blast.bin\" \"omega_blast_gameplay2.png\" 8)",
+      "Bash(powershell -ExecutionPolicy Bypass -File capture_sequence.ps1 \"C:/Emulation/SagaRoms/omega_blast.bin\" \"seq\")",
+      "Bash(powershell -ExecutionPolicy Bypass -File capture_clean_start.ps1 \"C:/Emulation/SagaRoms/omega_blast.bin\" \"clean\")",
+      "Bash(python3 -c ' *)",
+      "Bash(powershell -ExecutionPolicy Bypass -File \"C:/Users/ROB~1.CAW/AppData/Local/Temp/claude/C--Emulation/98355323-18f6-43f8-bbfd-a27ac5c2ea1e/scratchpad/screenshot_current.ps1\")",
+      "Bash(powershell -ExecutionPolicy Bypass -File \"C:/Users/ROB~1.CAW/AppData/Local/Temp/claude/C--Emulation/98355323-18f6-43f8-bbfd-a27ac5c2ea1e/scratchpad/find_process.ps1\")",
+      "Bash(powershell -Command \"Get-Process -Id 40984 -ErrorAction SilentlyContinue\")",
+      "Bash(powershell -ExecutionPolicy Bypass -File \"C:/Users/ROB~1.CAW/AppData/Local/Temp/claude/C--Emulation/98355323-18f6-43f8-bbfd-a27ac5c2ea1e/scratchpad/list_windows.ps1\")",
+      "Bash(gh repo *)",
+      "Bash(gh api *)",
+      "Bash(curl -s \"https://api.github.com/repos/Clownacy/clownmdemu-core\")",
+      "Bash(curl -s \"https://api.github.com/repos/Clownacy/clownmdemu-core/contents/\")",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebSearch",
+      "Bash(powershell -File \"C:/Users/ROB~1.CAW/AppData/Local/Temp/claude/C--Emulation/98355323-18f6-43f8-bbfd-a27ac5c2ea1e/scratchpad/crop_title.ps1\")"
+    ]
+  }
+}
