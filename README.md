@@ -22,7 +22,10 @@ This repository contains C# implementations of classic video game console emulat
 
 ## Status
 
-These emulators are works in progress. Features and hardware support will continue to improve as development progresses.
+Both emulators are functional and capable of running software. Core emulation features have been implemented, including CPU execution, memory management, graphics, and input handling.
+
+Some memory addressing modes and edge-case hardware behaviours may still be incomplete or require refinement. The implementations are under active development, with ongoing work focused on improving compatibility, accuracy, and overall emulation fidelity.
+
 
 ## Disclaimer
 
