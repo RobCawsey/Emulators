@@ -1,4 +1,4 @@
-C# Console Emulators
+# C# Console Emulators
 
 This repository contains C# implementations of classic video game console emulators. The goal of the project is to explore emulator development by recreating the hardware and behaviour of vintage gaming systems in managed code.
 
