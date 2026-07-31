@@ -136,7 +136,7 @@ public sealed partial class Vdp
             int pixelY = spriteRow & 7;
 
             int tileIndex = sprite.TileIndex + tileCol * sprite.HeightCells + tileRow;
-            tileIndex = ApplyInterlaceTileIndex(tileIndex);
+            (tileIndex, pixelY) = ApplyInterlaceTileAddress(tileIndex, pixelY);
             uint tileDataAddress = (uint)(tileIndex * 32 + pixelY * 4 + pixelX / 2);
             byte tileByte = Vram[tileDataAddress & (VramSize - 1)];
             int colorIndex = (pixelX % 2 == 0) ? (tileByte >> 4) : (tileByte & 0x0F);

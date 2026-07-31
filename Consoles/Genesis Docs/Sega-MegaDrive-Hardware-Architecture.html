@@ -2289,10 +2289,14 @@
     That half-line vertical offset is <strong>IM1</strong> (register 12 = <code>01</code>) — a
     positional trick only, where both fields keep reading the exact same VRAM tile data and just
     display it shifted, which is why it's of little use to a game that wants each field to actually
-    show something different. <strong>IM2</strong> (register 12 = <code>11</code>) goes further:
-    it doubles the effective tile-row index used by planes, window, and sprites alike, so each
-    field can genuinely pull different pixel data out of VRAM instead of just repositioning the
-    same data — this is the mode <em>Sonic 2</em>'s two-player split-screen uses to get a taller
+    show something different. <strong>IM2</strong> (register 12 = <code>11</code>) goes further,
+    and the actual addressing scheme is more intricate than "double the tile index": a name-table
+    entry's pattern index drops its top bit and instead selects a <em>pair</em> of adjacent real
+    VRAM tiles — treat them as the top and bottom half of one logical 16-row-tall tile. Within
+    whichever half a given row falls in, each field doesn't read that physical tile's rows in
+    order; it samples every <em>other</em> row, offset by which field is currently being drawn.
+    That's what actually produces the doubled-vertical-detail effect once both fields are
+    combined — this is the mode <em>Sonic 2</em>'s two-player split-screen uses to get a taller
     combined picture out of two distinct fields. Either way, the field <em>rate</em> is unchanged:
     a game gains vertical detail by combining two fields, not by rendering any faster.
   </p>
@@ -2302,11 +2306,15 @@
       Interlace sees essentially no real-world use beyond the one commonly-cited <em>Sonic 2</em>
       example, and displaying it correctly requires an actual interlace-capable display or a
       deinterlacing step — neither of which most emulators (or modern LCDs) bother with, so it's
-      one of the least real-world-exercised corners of the whole VDP. The field-alternation and
-      IM1/IM2 tile-doubling mechanics described above are believed accurate, consistent with
-      GenesisSharp's own source, but the exact sub-line vertical positioning on real interlaced
-      hardware has not been independently verified against a physical CRT the way the V-counter's
-      jump behavior was.
+      one of the least real-world-exercised corners of the whole VDP. Unlike every other area
+      touched in GenesisSharp's recent VDP accuracy pass, this one has no real ROM and no known-
+      correct reference output to check against. The paired-tile addressing description above was
+      hand-derived from Genesis Plus GX's tile-cache address arithmetic rather than read off an
+      explanatory comment, and while working through it did catch a genuine, fixable bug (the
+      previous formula doubled the *full* pattern-index range instead of masking off its top bit
+      first, corrupting addressing for higher tile indices), the overall scheme is explicitly
+      labeled a best-effort reconstruction in GenesisSharp's own source, not a confirmed fact —
+      it is, honestly, the single least-verified claim anywhere in this document.
     </p>
   </div>
 
@@ -2990,7 +2998,9 @@
       quirks, the H-counter's visible-value range and jump location for both H32 and H40, and
       Mode 4's core rendering structure (including confirming a real SMS-only quirk is correctly
       absent from Genesis Mode 4, and flagging two Mode 4 details left unresolved rather than
-      guessed at — see §6's Mode 4 confidence note).</li>
+      guessed at — see §6's Mode 4 confidence note). Also the basis for a hand-derived (not
+      independently confirmed) reconstruction of IM2 interlace's paired-tile addressing, which
+      caught a genuine tile-index-range bug along the way — see §6's IM2 confidence note.</li>
     <li><strong>Charles MacDonald's <code>genvdp.txt</code></strong> — classic, widely-circulated
       VDP hardware documentation; the starting reference for register layout and scanline timing.</li>
     <li><strong>Nemesis's reverse-engineered VDP documentation</strong> — cited (via BlastEm) for
@@ -3011,17 +3021,24 @@
   <div class="callout confidence">
     <span class="tag">What isn't independently re-verified here</span>
     <p>
-      The H-counter's exact dot-by-dot <em>repeat pattern</em> within a line — especially H40's
-      non-uniform EDCLK-driven pixel clock — and IM2 interlace tile addressing still rely on
-      general platform knowledge rather than a specific, independently confirmed citation. Treat
-      any number in those areas as a reasonable approximation, not a hardware-verified constant.
-      (The window plane's row-stride, shadow/highlight's brightness math, and Mode 4's core
-      structure were in this list too until they were traced to specific Genesis Plus GX source —
-      see §6's confidence notes. Shadow/highlight's one remaining open question, the color-14
-      highlight operator's exact behavior, and Mode 4's two remaining open questions, a missing
-      sprite pattern-index mask and a possible tile-index bit-width mismatch, are called out
-      specifically in their own confidence notes rather than lumped in here. The H-counter's
-      visible-value range and jump location are now confirmed too.)
+      The H-counter's visible-value range and jump location are now confirmed (see §8's confidence
+      note), but its exact dot-by-dot <em>repeat pattern</em> within a line — especially H40's
+      non-uniform EDCLK-driven pixel clock — still relies on general platform knowledge rather than
+      a specific, independently confirmed citation. Treat any number in that area as a reasonable
+      approximation, not a hardware-verified constant. (The window plane's row-stride,
+      shadow/highlight's brightness math, and Mode 4's core structure were in this list too until
+      they were traced to specific Genesis Plus GX source — see §6's confidence notes.
+      Shadow/highlight's one remaining open question, the color-14 highlight operator's exact
+      behavior, and Mode 4's two remaining open questions, a missing sprite pattern-index mask and
+      a possible tile-index bit-width mismatch, are called out specifically in their own confidence
+      notes rather than lumped in here.)
+    </p>
+    <p>
+      IM2 interlace addressing is a special case: it <em>was</em> traced to a specific source
+      (Genesis Plus GX's tile-cache address arithmetic) and that tracing did catch a real bug, but
+      the resulting scheme was hand-derived rather than read off an explanatory comment, and there
+      is no real ROM or independently-known-correct output anywhere to check it against — see §6's
+      IM2 confidence note for the honest version of that story.
     </p>
   </div>
 

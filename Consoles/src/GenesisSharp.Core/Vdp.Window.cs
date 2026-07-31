@@ -43,10 +43,10 @@ public sealed partial class Vdp
         ushort entry = ReadVramWord(entryAddress);
 
         var (tileIndex, paletteLine, flipH, flipV, priority) = DecodeNameTableEntry(entry);
-        tileIndex = ApplyInterlaceTileIndex(tileIndex);
 
         int finalPixelX = flipH ? 7 - pixelX : pixelX;
         int finalPixelY = flipV ? 7 - pixelY : pixelY;
+        (tileIndex, finalPixelY) = ApplyInterlaceTileAddress(tileIndex, finalPixelY);
 
         uint tileDataAddress = (uint)(tileIndex * 32 + finalPixelY * 4 + finalPixelX / 2);
         byte tileByte = Vram[tileDataAddress & (VramSize - 1)];
