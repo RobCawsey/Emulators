@@ -59,26 +59,36 @@ public sealed partial class Vdp
             var b = GetPlanePixel(PlaneBNameTableBase, planeWidth, planeHeight, x, scanline, hScrollB, vScrollB);
             var s = spriteLine[x];
 
-            // Under shadow/highlight, a sprite pixel using palette line 3 with color index 14
-            // or 15 is a special operator, not a real color: it never wins compositing itself
-            // (whatever's beneath it shows through normally) but forces that pixel's
-            // brightness regardless of the usual priority-based default below.
+            // Under shadow/highlight, a sprite pixel using palette line 3 with color index 15 is
+            // a special operator, not a real color: it never wins compositing itself (whatever's
+            // beneath it shows through normally) but unconditionally forces that pixel to shadow
+            // brightness (confirmed against genesis-plus-gx's make_lut_bgobj_ste — see
+            // Vdp.ShadowHighlight.cs's type-level remarks for the full citation and for why color
+            // index 14 on palette line 3 is deliberately left as this codebase's original
+            // "always highlight" simplification rather than changed here).
             bool isHighlightOperator = shEnabled && s.HasValue && s.Value.PaletteLine == 3 && s.Value.ColorIndex == 14;
             bool isShadowOperator = shEnabled && s.HasValue && s.Value.PaletteLine == 3 && s.Value.ColorIndex == 15;
             var effectiveSprite = isHighlightOperator || isShadowOperator ? null : s;
 
             // Priority order, highest to lowest: high-priority sprite, high-priority A,
             // high-priority B, low-priority sprite, low-priority A, low-priority B, backdrop.
-            // The third element tracks whether the winning layer was high-priority, which is
-            // what decides the default shadow/highlight brightness below.
-            (int ColorIndex, int PaletteLine, bool HighPriority)? chosen =
-                effectiveSprite.HasValue && effectiveSprite.Value.Priority ? (effectiveSprite.Value.ColorIndex, effectiveSprite.Value.PaletteLine, true) :
-                a.Priority && a.ColorIndex != 0 ? (a.ColorIndex, a.PaletteLine, true) :
-                b.Priority && b.ColorIndex != 0 ? (b.ColorIndex, b.PaletteLine, true) :
-                effectiveSprite.HasValue ? (effectiveSprite.Value.ColorIndex, effectiveSprite.Value.PaletteLine, false) :
-                a.ColorIndex != 0 ? (a.ColorIndex, a.PaletteLine, false) :
-                b.ColorIndex != 0 ? (b.ColorIndex, b.PaletteLine, false) :
+            // The third element tracks whether the winning layer was high-priority, and the
+            // fourth whether it was a sprite — both feed the brightness decision below.
+            (int ColorIndex, int PaletteLine, bool HighPriority, bool IsSprite)? chosen =
+                effectiveSprite.HasValue && effectiveSprite.Value.Priority ? (effectiveSprite.Value.ColorIndex, effectiveSprite.Value.PaletteLine, true, true) :
+                a.Priority && a.ColorIndex != 0 ? (a.ColorIndex, a.PaletteLine, true, false) :
+                b.Priority && b.ColorIndex != 0 ? (b.ColorIndex, b.PaletteLine, true, false) :
+                effectiveSprite.HasValue ? (effectiveSprite.Value.ColorIndex, effectiveSprite.Value.PaletteLine, false, true) :
+                a.ColorIndex != 0 ? (a.ColorIndex, a.PaletteLine, false, false) :
+                b.ColorIndex != 0 ? (b.ColorIndex, b.PaletteLine, false, false) :
                 null;
+
+            // A sprite pixel using color index 14 on palette lines 0-2 (not line 3, which is the
+            // operator case above) is drawn as its own color but is unconditionally immune to the
+            // default shadow rule — confirmed against make_lut_bgobj_ste's unconditional
+            // "sf|0x40" (normal-brightness bucket) branch for sf in {0x0E, 0x1E, 0x2E}.
+            bool isForcedNormalSprite = shEnabled && chosen.HasValue && chosen.Value.IsSprite
+                && chosen.Value.PaletteLine != 3 && chosen.Value.ColorIndex == 14;
 
             ushort cramValue = chosen.HasValue
                 ? Cram[chosen.Value.PaletteLine * 16 + chosen.Value.ColorIndex]
@@ -88,9 +98,10 @@ public sealed partial class Vdp
 
             if (shEnabled)
             {
-                if (isHighlightOperator) (r, g, bl) = ApplyHighlight(r, g, bl);
-                else if (isShadowOperator) (r, g, bl) = ApplyShadow(r, g, bl);
-                else if (!(chosen.HasValue && chosen.Value.HighPriority)) (r, g, bl) = ApplyShadow(r, g, bl);
+                if (isHighlightOperator) (r, g, bl) = ApplyHighlight(cramValue);
+                else if (isShadowOperator) (r, g, bl) = ApplyShadow(cramValue);
+                else if (isForcedNormalSprite) { /* immune to the default shadow rule below */ }
+                else if (!(chosen.HasValue && chosen.Value.HighPriority)) (r, g, bl) = ApplyShadow(cramValue);
             }
 
             int offset = (scanline * ScreenWidth + x) * 3;

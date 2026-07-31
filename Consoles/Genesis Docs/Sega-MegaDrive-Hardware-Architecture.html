@@ -1445,10 +1445,20 @@
     <strong>low-priority</strong> layer (or the backdrop) default to <strong>shadow</strong> (half
     brightness); pixels won by a <strong>high-priority</strong> layer default to
     <strong>normal</strong>. That default can then be overridden, regardless of which priority
-    level actually won: a sprite drawn with palette line 3, color index 14 (the "shadow operator")
-    or color 15 (the "highlight operator") never appears as a visible color itself — instead,
-    wherever it's the topmost sprite at a pixel, it forces that pixel to shadow or highlight,
-    overriding whatever the priority-based default would have been.
+    level actually won: a sprite drawn with palette line 3, color index 14 (the "highlight
+    operator") or color 15 (the "shadow operator") never appears as a visible color itself —
+    instead, wherever it's the topmost sprite at a pixel, it forces that pixel to highlight or
+    shadow, overriding whatever the priority-based default would have been. (An earlier version of
+    this document had these two colors swapped — 14 and 15 are shown correctly matched to
+    Diagram 14 below.)
+  </p>
+  <p>
+    A separate, distinct quirk applies outside palette line 3: a sprite drawn with color index 14
+    on palette line <strong>0, 1, or 2</strong> is not an operator at all — it draws its own color
+    normally — but is unconditionally exempt from the default shadow rule above, regardless of its
+    own priority bit. In effect, that one color index is permanently "pinned" to normal brightness
+    on those three palette lines, while remaining a completely ordinary, fully-opaque sprite color
+    everywhere else.
   </p>
   <div class="diagram">
     <svg viewBox="0 0 980 320" xmlns="http://www.w3.org/2000/svg" font-family="Consolas, monospace">
@@ -1519,13 +1529,27 @@
   <div class="callout confidence">
     <span class="tag">Confidence note</span>
     <p>
-      The priority-based default (low priority → shadow, high priority → normal) and the two
-      operator colors' override behavior are consistent with GenesisSharp's own source and general
-      VDP documentation. The exact brightness math (this document and the emulator both treat
-      shadow as roughly half brightness and highlight as roughly partway to white) is a plausible,
-      clearly-differentiated approximation rather than an independently-verified DAC-level formula,
-      and edge cases like a pixel simultaneously overlapped by both a shadow <em>and</em> a
-      highlight operator sprite from different sources are not independently re-confirmed here.
+      The priority-based default (low priority → shadow, high priority → normal), the color-15
+      shadow operator, and the color-14/palette-0-2 normal-brightness pin are all confirmed against
+      Genesis Plus GX's <code>vdp_render.c</code> (<code>palette_init()</code> and
+      <code>make_lut_bgobj_ste()</code>). The real VDP DAC turns out to be a discrete
+      3-bit-per-channel model rather than a continuous blend: shadow reads each CRAM channel's raw
+      3-bit value directly (0-7), normal doubles it (0-14, even values only), and highlight adds 7
+      (7-14) — the "half brightness" / "partway to white" framing above is really just a plain-
+      language description of that same discrete math, not a separate looser approximation.
+    </p>
+    <p>
+      One piece is deliberately left unresolved: the color-14 <em>highlight</em> operator's exact
+      behavior in Genesis Plus GX's source branches on an incoming background intensity state
+      produced by an earlier compositing stage that wasn't traced all the way back. Both literal
+      readings of that branch suggest the common case might actually resolve to normal brightness
+      rather than highlight — which would contradict this document's own framing above, itself
+      drawn from long-standing, widely-cited community documentation (e.g. Charles MacDonald's
+      <code>genvdp.txt</code>). Rather than silently flip a widely-cited behavior on an unverified
+      re-derivation, GenesisSharp keeps the conventional "always highlight" behavior and flags the
+      conflict for whoever traces that earlier stage next. Edge cases like a pixel simultaneously
+      overlapped by both operators from different sources are also not independently re-confirmed
+      here.
     </p>
   </div>
 
@@ -2944,7 +2968,9 @@
   <ul>
     <li><strong>Genesis Plus GX</strong> (Charles MacDonald / Eke-Eke and contributors) — the
       most-consulted source for VDP DMA/FIFO timing, the status register bit layout, the
-      68000-side bus-request prefetch-noise quirk, and the window plane's H32/H40 row-stride.</li>
+      68000-side bus-request prefetch-noise quirk, the window plane's H32/H40 row-stride, and the
+      shadow/highlight mode's discrete DAC brightness model and sprite color-index operator
+      quirks.</li>
     <li><strong>Charles MacDonald's <code>genvdp.txt</code></strong> — classic, widely-circulated
       VDP hardware documentation; the starting reference for register layout and scanline timing.</li>
     <li><strong>Nemesis's reverse-engineered VDP documentation</strong> — cited (via BlastEm) for
@@ -2965,11 +2991,14 @@
   <div class="callout confidence">
     <span class="tag">What isn't independently re-verified here</span>
     <p>
-      The H-counter's exact dot-by-dot breakpoint behavior, Mode 4 (SMS-compatibility) timing, and
-      the precise analog mixing/brightness characteristics of shadow/highlight mode are all areas
-      where this document (and GenesisSharp's own source) relies on general platform knowledge
-      rather than a specific, independently confirmed citation. Treat any number in those areas as
-      a reasonable approximation, not a hardware-verified constant.
+      The H-counter's exact dot-by-dot breakpoint behavior and Mode 4 (SMS-compatibility) timing
+      are areas where this document (and GenesisSharp's own source) still relies on general
+      platform knowledge rather than a specific, independently confirmed citation. Treat any number
+      in those areas as a reasonable approximation, not a hardware-verified constant. (The window
+      plane's row-stride and shadow/highlight's brightness math were in this list too until they
+      were traced to specific Genesis Plus GX source — see §6's confidence notes. Shadow/highlight's
+      one remaining open question, the color-14 highlight operator's exact behavior, is called out
+      specifically there rather than lumped in here.)
     </p>
   </div>
 

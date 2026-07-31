@@ -542,9 +542,16 @@ pixel sets the collision flag (first-drawn sprite in link order wins and is neve
   window, and sprites. Sees essentially no real-world use (Sonic 2's 2-player split screen is the
   most commonly cited example) and is explicitly the lowest-confidence corner of the mainstream
   rendering path.
-- **Shadow/highlight** (`Vdp.ShadowHighlight.cs`): shadow halves each RGB channel, highlight pushes
-  it partway to white — a plausible, clearly-differentiated approximation, not a verified DAC-level
-  hardware formula.
+- **Shadow/highlight** (`Vdp.ShadowHighlight.cs`): confirmed against genesis-plus-gx's
+  `palette_init()`/`make_lut_bgobj_ste()` — the real VDP DAC is a discrete 3-bit-per-channel model
+  (shadow = raw component 0-7, normal = doubled 0-14, highlight = component+7, 7-14), which turns
+  out to be numerically identical to this file's previous "halve/push-toward-white" approximation
+  for every possible input. Also adds a previously-missing quirk: a sprite pixel using color index
+  14 on palette lines 0-2 (not just line 3) draws its own color but is unconditionally immune to
+  the default shadow rule. Color index 14 on palette line 3 specifically is deliberately left as
+  the original "always highlight" simplification rather than changed — see the file's type-level
+  remarks for why the reference source's own logic there is ambiguous without tracing an earlier
+  compositing stage this investigation didn't cover.
 - **Mode 4** (`Vdp.Mode4.cs`): SMS-compatibility mode, essentially unused by real Genesis software
   (exists for SMS-on-Genesis compatibility and VDP test suites). 4bpp *planar* tiles (not Mode 5's
   packed nibbles), a flat 64-entry sprite table with a sentinel terminator instead of a linked
@@ -865,10 +872,11 @@ A consolidated list, pulled from §3–§9, of what to check first if a game mis
 - **Z80**: no undocumented IXH/IXL/IYH/IYL; X/Y flag bits are an approximation; DD/FD timing
   constants aren't instruction-by-instruction verified; block I/O flags are simplified.
 - **VDP**: H-counter dot-exact timing is a linear approximation, not verified hardware breakpoints;
-  shadow/highlight brightness math is a plausible approximation, not a verified DAC-level formula;
   Mode 4 and interlace (IM2) are the least-real-world-tested rendering paths in the whole VDP.
-  (Window row-stride was previously listed here too but is now confirmed against genesis-plus-gx —
-  see §6.8.)
+  (Window row-stride and shadow/highlight brightness math were previously listed here too but are
+  now confirmed against genesis-plus-gx — see §6.8. Shadow/highlight's one remaining open question,
+  the exact behavior of color index 14 on palette line 3, is called out specifically in
+  `Vdp.ShadowHighlight.cs`.)
 - **YM2612**: LFO, SSG-EG, and channel-3 "special mode" are entirely unmodeled. The rate-to-dB
   envelope curve is a smooth exponential approximation, not the chip's exact non-linear table.
 - **General**: no true whole-system single-instruction step (the frontend's "step instruction" is
@@ -900,11 +908,12 @@ Genesis/Mega Drive/Sega CD/Master System/Game Gear/SG-1000 emulator.
   consulted.)
 - Used to verify/root-cause: the VDP H-scroll table addressing formula; VDP DMA access-slot timing
   (including the copy-vs-fill 2× throughput difference); the VDP status register's DMA-busy bit
-  behavior; the VDP window plane's H32/H40 name-table row stride; the 68000-side Z80 bus-request
-  register's "prefetch noise on unused bits" quirk; the YM2612's Timer A tick rate, Total Level dB
-  step size, key-code fraction table, key-scale-rate formula, detune table shape, and — most
-  extensively — the exact operator-connection graph (and one-sample-delay behavior) for all 8 FM
-  algorithms.
+  behavior; the VDP window plane's H32/H40 name-table row stride; the VDP's discrete 3-bit-per-
+  channel shadow/highlight DAC model and its sprite color-index-14 operator quirks; the 68000-side
+  Z80 bus-request register's "prefetch noise on unused bits" quirk; the YM2612's Timer A tick rate,
+  Total Level dB step size, key-code fraction table, key-scale-rate formula, detune table shape, and
+  — most extensively — the exact operator-connection graph (and one-sample-delay behavior) for all
+  8 FM algorithms.
 
 **Nuked-OPN2** (`ym3438.c`) — vendored inside genesis-plus-gx, not separately cloned
 A cycle-accurate reverse-engineered YM2612 (OPN2) core; genesis-plus-gx's own FM engine is itself
@@ -969,9 +978,19 @@ distinction).
 ### What is *not* independently verified
 
 For completeness, and so future contributors know where to focus verification effort: the Z80
-core's opcode timing/flag tables, the VDP's H-counter dot-exact breakpoints, Mode 4 rendering, IM2
-interlace tile-doubling, and the shadow/highlight brightness formula are all built from general
-platform knowledge without a specific cited external source confirming them (see §12). If you find
-an authoritative source for any of these, updating the relevant file's doc comment — and this
-document — with the citation is exactly the kind of contribution this codebase's existing comments
-model.
+core's opcode timing/flag tables, the VDP's H-counter dot-exact breakpoints, Mode 4 rendering, and
+IM2 interlace tile-doubling are all built from general platform knowledge without a specific cited
+external source confirming them (see §12). If you find an authoritative source for any of these,
+updating the relevant file's doc comment — and this document — with the citation is exactly the
+kind of contribution this codebase's existing comments model.
+
+The shadow/highlight brightness formula was in this list too until it was traced to
+genesis-plus-gx's `palette_init()`/`make_lut_bgobj_ste()` (`vdp_render.c:797-921,973-1149`) — see
+§6.8. One piece of that investigation stayed unresolved on purpose: `make_lut_bgobj_ste`'s handling
+of sprite color index 14 on palette line 3 branches on an *incoming* background intensity state
+(`bx & 0x80`) produced by an earlier stage (`make_lut_bg`) that wasn't traced. Both literal readings
+of that branch suggest the common case actually resolves to normal brightness, not highlight, which
+would contradict long-cited community documentation (e.g. Charles MacDonald's genvdp.txt) — since
+that's a real conflict rather than a gap, this codebase deliberately kept the original "always
+highlight" behavior rather than flip it on an unverified re-derivation. Tracing `make_lut_bg` to
+resolve that conflict is a good next step for whoever picks this up.
