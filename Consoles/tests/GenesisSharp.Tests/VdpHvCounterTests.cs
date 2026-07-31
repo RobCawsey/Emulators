@@ -27,23 +27,35 @@ public class VdpHvCounterTests
         Assert.Equal(0xFF, vdp.VerticalCounter);
     }
 
-    [Fact]
-    public void HorizontalCounter_ScalesLinearlyAcrossH32TotalDots()
+    [Theory]
+    [InlineData(0, 0x00)]      // first dot of the line
+    [InlineData(295, 0x93)]    // last visible HC value before the real hardware jump
+    [InlineData(296, 0xE9)]    // first visible HC value after the jump (0x94-0xE8 never appear)
+    [InlineData(341, 0xFF)]    // last dot of the line
+    public void HorizontalCounter_MatchesRealHardwareJumpInH32(int dot, int expectedHc)
     {
+        // Confirmed against genesis-plus-gx's cycle2hc32 table (core/hvc.h): H32's visible HC
+        // range is 0x00-0x93, then jumps straight to 0xE9-0xFF.
         var vdp = new Vdp(); // Is40CellMode defaults false -> H32, 342 total dots
-        vdp.SetScanlineProgress(0.5);
+        vdp.SetScanlineProgress((dot + 0.5) / 342.0);
 
-        Assert.Equal(171, vdp.HorizontalCounter);
+        Assert.Equal(expectedHc, vdp.HorizontalCounter);
     }
 
-    [Fact]
-    public void HorizontalCounter_ScalesLinearlyAcrossH40TotalDots()
+    [Theory]
+    [InlineData(0, 0x00)]      // first dot of the line
+    [InlineData(364, 0xB6)]    // last visible HC value before the real hardware jump
+    [InlineData(365, 0xE4)]    // first visible HC value after the jump (0xB7-0xE3 never appear)
+    [InlineData(419, 0xFF)]    // last dot of the line
+    public void HorizontalCounter_MatchesRealHardwareJumpInH40(int dot, int expectedHc)
     {
+        // Confirmed against genesis-plus-gx's cycle2hc40 table (core/hvc.h): H40's visible HC
+        // range is 0x00-0xB6, then jumps straight to 0xE4-0xFF.
         var vdp = new Vdp();
         vdp.Registers[12] = 0x01; // H40
-        vdp.SetScanlineProgress(0.5);
+        vdp.SetScanlineProgress((dot + 0.5) / 420.0);
 
-        Assert.Equal(210, vdp.HorizontalCounter);
+        Assert.Equal(expectedHc, vdp.HorizontalCounter);
     }
 
     [Fact]
@@ -63,9 +75,9 @@ public class VdpHvCounterTests
     {
         var vdp = new Vdp();
         for (int i = 0; i < 10; i++) vdp.AdvanceScanline(); // V = 10
-        vdp.SetScanlineProgress(0.5); // H32, dot 171
+        vdp.SetScanlineProgress(0.5); // H32, dot 171 -> HC 0x55 (85)
 
-        Assert.Equal((ushort)((10 << 8) | 171), vdp.ReadHvCounter());
+        Assert.Equal((ushort)((10 << 8) | 85), vdp.ReadHvCounter());
     }
 
     [Fact]

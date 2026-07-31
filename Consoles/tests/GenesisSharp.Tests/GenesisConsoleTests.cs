@@ -142,12 +142,12 @@ public class GenesisConsoleTests
         var console = new GenesisConsole(Cartridge.LoadFromBin(new byte[0x10000]));
         console.Reset();
         for (int i = 0; i < 10; i++) console.Vdp.AdvanceScanline(); // V = 10
-        console.Vdp.SetScanlineProgress(0.5); // H32 default, dot 171
+        console.Vdp.SetScanlineProgress(0.5); // H32 default, dot 171 -> HC 0x55 (85)
 
         ushort value = ((Cpu68000.IBus)console).ReadWord(0xC00008);
 
         Assert.Equal(console.Vdp.ReadHvCounter(), value);
-        Assert.Equal((ushort)((10 << 8) | 171), value);
+        Assert.Equal((ushort)((10 << 8) | 85), value);
     }
 
     [Fact]

@@ -488,10 +488,18 @@ Omega Blast spinning forever on a VBlank-edge wait because that bit was wired to
 instead) — the corrected layout is credited to Nemesis's widely-cited reverse-engineered VDP
 documentation. The V-counter's non-linear jump (0xEA → 0xE5 partway through VBlank, because 262
 lines don't fit an 8-bit counter linearly) is real, well-documented hardware behavior and is
-modeled exactly; the **H-counter's equivalent jump quirk is explicitly not modeled with the same
-confidence** — it's a linear approximation across the scanline's dot count, monotonic but not
-verified against real breakpoints for H32 vs H40. If precise raster-timing tricks ever matter to a
-ROM you're testing, this is the first place to look.
+modeled exactly. The **H-counter has the same kind of jump**, and it's now modeled too: confirmed
+against genesis-plus-gx's `cycle2hc32`/`cycle2hc40` tables (`core/hvc.h`), the visible HC byte range
+skips a block of values partway through the line — H32 counts `0x00`-`0x93` then jumps to
+`0xE9`-`0xFF`; H40 counts `0x00`-`0xB6` then jumps to `0xE4`-`0xFF`. `HorizontalCounter`
+(`Vdp.HvCounter.cs`) reproduces that exact visible-value set and jump location, proportionally
+spread across the scanline's dot index — hardware-accurate at the start/end of the line and the
+jump's location, but **deliberately not a literal port of genesis-plus-gx's per-master-cycle
+tables**: H40's real dot clock alternates between two different rates within a line (EDCLK), so the
+true per-dot repeat pattern isn't uniform, and this emulator's coarser per-scanline cycle-budget
+model doesn't have the master-clock-accurate timing needed to reproduce that exactly. If precise
+dot-for-dot raster-timing tricks ever matter to a ROM you're testing, that non-uniformity is the
+first place to look.
 
 ### 6.6 Rendering pipeline (`Vdp.Render.cs`)
 
@@ -871,8 +879,10 @@ A consolidated list, pulled from §3–§9, of what to check first if a game mis
   timing is an average-case approximation, not the real data-dependent formula.
 - **Z80**: no undocumented IXH/IXL/IYH/IYL; X/Y flag bits are an approximation; DD/FD timing
   constants aren't instruction-by-instruction verified; block I/O flags are simplified.
-- **VDP**: H-counter dot-exact timing is a linear approximation, not verified hardware breakpoints;
-  Mode 4 and interlace (IM2) are the least-real-world-tested rendering paths in the whole VDP.
+- **VDP**: the H-counter's visible-value range and jump location are confirmed against
+  genesis-plus-gx, but its exact dot-for-dot repeat pattern within a line — especially H40's
+  non-uniform EDCLK-driven pixel clock — is not independently verified (see §6.5). Mode 4 and
+  interlace (IM2) are the least-real-world-tested rendering paths in the whole VDP.
   (Window row-stride and shadow/highlight brightness math were previously listed here too but are
   now confirmed against genesis-plus-gx — see §6.8. Shadow/highlight's one remaining open question,
   the exact behavior of color index 14 on palette line 3, is called out specifically in
@@ -909,11 +919,12 @@ Genesis/Mega Drive/Sega CD/Master System/Game Gear/SG-1000 emulator.
 - Used to verify/root-cause: the VDP H-scroll table addressing formula; VDP DMA access-slot timing
   (including the copy-vs-fill 2× throughput difference); the VDP status register's DMA-busy bit
   behavior; the VDP window plane's H32/H40 name-table row stride; the VDP's discrete 3-bit-per-
-  channel shadow/highlight DAC model and its sprite color-index-14 operator quirks; the 68000-side
-  Z80 bus-request register's "prefetch noise on unused bits" quirk; the YM2612's Timer A tick rate,
-  Total Level dB step size, key-code fraction table, key-scale-rate formula, detune table shape, and
-  — most extensively — the exact operator-connection graph (and one-sample-delay behavior) for all
-  8 FM algorithms.
+  channel shadow/highlight DAC model and its sprite color-index-14 operator quirks; the H-counter's
+  visible-value range and jump location for both H32 and H40; the 68000-side Z80 bus-request
+  register's "prefetch noise on unused bits" quirk; the YM2612's Timer A tick rate, Total Level dB
+  step size, key-code fraction table, key-scale-rate formula, detune table shape, and — most
+  extensively — the exact operator-connection graph (and one-sample-delay behavior) for all 8 FM
+  algorithms.
 
 **Nuked-OPN2** (`ym3438.c`) — vendored inside genesis-plus-gx, not separately cloned
 A cycle-accurate reverse-engineered YM2612 (OPN2) core; genesis-plus-gx's own FM engine is itself
@@ -978,11 +989,19 @@ distinction).
 ### What is *not* independently verified
 
 For completeness, and so future contributors know where to focus verification effort: the Z80
-core's opcode timing/flag tables, the VDP's H-counter dot-exact breakpoints, Mode 4 rendering, and
-IM2 interlace tile-doubling are all built from general platform knowledge without a specific cited
-external source confirming them (see §12). If you find an authoritative source for any of these,
-updating the relevant file's doc comment — and this document — with the citation is exactly the
-kind of contribution this codebase's existing comments model.
+core's opcode timing/flag tables, Mode 4 rendering, and IM2 interlace tile-doubling are all built
+from general platform knowledge without a specific cited external source confirming them (see §12).
+If you find an authoritative source for any of these, updating the relevant file's doc comment —
+and this document — with the citation is exactly the kind of contribution this codebase's existing
+comments model.
+
+The H-counter's visible-value range and jump location were in this list too until they were traced
+to genesis-plus-gx's `cycle2hc32`/`cycle2hc40` tables (`core/hvc.h`) — see §6.5. What's still
+unverified there is the exact dot-for-dot *repeat pattern* within a line: genesis-plus-gx's own
+tables show H40's real pixel clock alternating between two different rates (EDCLK), which this
+emulator's coarser per-scanline cycle-budget model doesn't reproduce — the fix ported the correct
+value *set* and jump boundary, proportionally spread across the line, rather than a literal
+per-master-cycle table.
 
 The shadow/highlight brightness formula was in this list too until it was traced to
 genesis-plus-gx's `palette_init()`/`make_lut_bgobj_ste()` (`vdp_render.c:797-921,973-1149`) — see
