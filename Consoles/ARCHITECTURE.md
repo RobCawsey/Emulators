@@ -564,8 +564,18 @@ pixel sets the collision flag (first-drawn sprite in link order wins and is neve
   (exists for SMS-on-Genesis compatibility and VDP test suites). 4bpp *planar* tiles (not Mode 5's
   packed nibbles), a flat 64-entry sprite table with a sentinel terminator instead of a linked
   list, fixed 256×192 active area, and a documented quirk where the backdrop color comes from the
-  *sprite* palette (line 1), not the background palette. Treat this file as the least-tested part
-  of the whole VDP.
+  *sprite* palette (line 1), not the background palette — this core structure is confirmed against
+  genesis-plus-gx's `render_bg_m4`/`render_obj_m4`/`color_update_m4`, including confirming that a
+  real SMS-chip-only tile-index-masking quirk is *correctly absent* here (it's gated off for any
+  system above plain SMS in the reference source, which is the only configuration this emulator
+  models). Two things that investigation surfaced but didn't resolve, flagged honestly in
+  `Vdp.Mode4.cs`'s type-level comment rather than guessed at: a separate register-6-based sprite
+  pattern-index mask that *does* apply on Genesis and isn't implemented here at all, and a
+  possible mismatch in the background tile-index bit width / whether Mode 4 background tiles
+  really support flipping the way this file assumes. Test coverage now includes both scroll-lock
+  axes, large (8×16) sprites, sprite collision, scroll wraparound at the real boundary, tile flip,
+  and both blanking paths — treat the two open structural questions above, not test coverage, as
+  the first place to look if this file's confidence needs raising further.
 
 ### 6.9 Save state (`Vdp.SaveState.cs`)
 
@@ -881,8 +891,12 @@ A consolidated list, pulled from §3–§9, of what to check first if a game mis
   constants aren't instruction-by-instruction verified; block I/O flags are simplified.
 - **VDP**: the H-counter's visible-value range and jump location are confirmed against
   genesis-plus-gx, but its exact dot-for-dot repeat pattern within a line — especially H40's
-  non-uniform EDCLK-driven pixel clock — is not independently verified (see §6.5). Mode 4 and
-  interlace (IM2) are the least-real-world-tested rendering paths in the whole VDP.
+  non-uniform EDCLK-driven pixel clock — is not independently verified (see §6.5). Interlace (IM2)
+  remains the least-real-world-tested rendering path in the whole VDP. Mode 4's core structure is
+  now confirmed against genesis-plus-gx and has substantially better test coverage, but two
+  specific structural questions (a Genesis-applicable sprite pattern-index mask this file doesn't
+  implement, and a possible background tile-index bit-width/flip mismatch) remain open — see
+  `Vdp.Mode4.cs`'s type-level comment and §6.8.
   (Window row-stride and shadow/highlight brightness math were previously listed here too but are
   now confirmed against genesis-plus-gx — see §6.8. Shadow/highlight's one remaining open question,
   the exact behavior of color index 14 on palette line 3, is called out specifically in
@@ -920,11 +934,12 @@ Genesis/Mega Drive/Sega CD/Master System/Game Gear/SG-1000 emulator.
   (including the copy-vs-fill 2× throughput difference); the VDP status register's DMA-busy bit
   behavior; the VDP window plane's H32/H40 name-table row stride; the VDP's discrete 3-bit-per-
   channel shadow/highlight DAC model and its sprite color-index-14 operator quirks; the H-counter's
-  visible-value range and jump location for both H32 and H40; the 68000-side Z80 bus-request
-  register's "prefetch noise on unused bits" quirk; the YM2612's Timer A tick rate, Total Level dB
-  step size, key-code fraction table, key-scale-rate formula, detune table shape, and — most
-  extensively — the exact operator-connection graph (and one-sample-delay behavior) for all 8 FM
-  algorithms.
+  visible-value range and jump location for both H32 and H40; Mode 4's core rendering structure
+  (and, separately, two specific Mode 4 details this investigation flagged as still open rather
+  than resolved — see `Vdp.Mode4.cs`); the 68000-side Z80 bus-request register's "prefetch noise on
+  unused bits" quirk; the YM2612's Timer A tick rate, Total Level dB step size, key-code fraction
+  table, key-scale-rate formula, detune table shape, and — most extensively — the exact
+  operator-connection graph (and one-sample-delay behavior) for all 8 FM algorithms.
 
 **Nuked-OPN2** (`ym3438.c`) — vendored inside genesis-plus-gx, not separately cloned
 A cycle-accurate reverse-engineered YM2612 (OPN2) core; genesis-plus-gx's own FM engine is itself
@@ -989,11 +1004,19 @@ distinction).
 ### What is *not* independently verified
 
 For completeness, and so future contributors know where to focus verification effort: the Z80
-core's opcode timing/flag tables, Mode 4 rendering, and IM2 interlace tile-doubling are all built
-from general platform knowledge without a specific cited external source confirming them (see §12).
-If you find an authoritative source for any of these, updating the relevant file's doc comment —
-and this document — with the citation is exactly the kind of contribution this codebase's existing
-comments model.
+core's opcode timing/flag tables and IM2 interlace tile-doubling are built from general platform
+knowledge without a specific cited external source confirming them (see §12). If you find an
+authoritative source for either of these, updating the relevant file's doc comment — and this
+document — with the citation is exactly the kind of contribution this codebase's existing comments
+model.
+
+Mode 4 rendering was in this list too until its core structure was traced to genesis-plus-gx's
+`render_bg_m4`/`render_obj_m4`/`color_update_m4` — see §6.8 and `Vdp.Mode4.cs`. That same
+investigation surfaced two specific pieces it couldn't resolve rather than papering over: a
+register-6-based sprite pattern-index mask genesis-plus-gx applies on Genesis-class hardware that
+this file doesn't implement at all, and a possible mismatch between this file's 9-bit background
+tile index (plus separate flip bits) and genesis-plus-gx's 11-bit mask for the same field. Both are
+called out precisely, with line citations, in `Vdp.Mode4.cs`'s type-level comment.
 
 The H-counter's visible-value range and jump location were in this list too until they were traced
 to genesis-plus-gx's `cycle2hc32`/`cycle2hc40` tables (`core/hvc.h`) — see §6.5. What's still

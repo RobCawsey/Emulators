@@ -1696,11 +1696,22 @@
     <p>
       Mode 4 is essentially unused by real Genesis software — it exists for Master System
       backward-compatibility and VDP test ROMs, not anything a commercial Genesis game shipped
-      with. Consistent with GenesisSharp's own source, this makes it the least real-world-exercised
-      rendering path in the whole VDP; treat the structural facts above (tile/sprite-table format,
-      fixed display size, backdrop-from-sprite-palette quirk) as reliable, but don't assume every
-      fine timing or edge-case detail has been exercised against real Master-System-on-Genesis
-      hardware the way Mode 5's own quirks have been against real commercial ROMs.
+      with. The structural facts above (tile/sprite-table format, fixed display size,
+      backdrop-from-sprite-palette quirk, the Y+1 sprite offset, the sentinel, the 8-sprite-per-line
+      cap) are confirmed against Genesis Plus GX's own Mode 4 renderer, including confirming that a
+      tile-index-masking quirk specific to the real standalone SMS chip (315-5124) is <em>correctly
+      absent</em> from Genesis Mode 4 compatibility — the reference source itself gates that quirk
+      off for anything above plain SMS hardware.
+    </p>
+    <p>
+      Two things that comparison surfaced but didn't resolve, worth flagging rather than glossing
+      over: Genesis Plus GX applies a separate, register-6-based sprite pattern-index mask that
+      <em>does</em> apply to Genesis-class hardware and isn't reproduced here at all, and there's a
+      possible mismatch between this document's assumption that Mode 4 background tiles support
+      horizontal/vertical flip and Genesis Plus GX's tile-index bit width for the same field. Given
+      how little real software depends on Mode 4 correctness at all, neither was chased down further
+      — they're the first place to look if this mode's confidence ever needs raising past
+      "structurally verified, two specific details still open."
     </p>
   </div>
 </section>
@@ -2976,7 +2987,10 @@
       most-consulted source for VDP DMA/FIFO timing, the status register bit layout, the
       68000-side bus-request prefetch-noise quirk, the window plane's H32/H40 row-stride, the
       shadow/highlight mode's discrete DAC brightness model and sprite color-index operator
-      quirks, and the H-counter's visible-value range and jump location for both H32 and H40.</li>
+      quirks, the H-counter's visible-value range and jump location for both H32 and H40, and
+      Mode 4's core rendering structure (including confirming a real SMS-only quirk is correctly
+      absent from Genesis Mode 4, and flagging two Mode 4 details left unresolved rather than
+      guessed at — see §6's Mode 4 confidence note).</li>
     <li><strong>Charles MacDonald's <code>genvdp.txt</code></strong> — classic, widely-circulated
       VDP hardware documentation; the starting reference for register layout and scanline timing.</li>
     <li><strong>Nemesis's reverse-engineered VDP documentation</strong> — cited (via BlastEm) for
@@ -2997,15 +3011,17 @@
   <div class="callout confidence">
     <span class="tag">What isn't independently re-verified here</span>
     <p>
-      Mode 4 (SMS-compatibility) timing is an area where this document (and GenesisSharp's own
-      source) still relies on general platform knowledge rather than a specific, independently
-      confirmed citation. Treat any number in that area as a reasonable approximation, not a
-      hardware-verified constant. (The window plane's row-stride and shadow/highlight's brightness
-      math were in this list too until they were traced to specific Genesis Plus GX source — see
-      §6's confidence notes. Shadow/highlight's one remaining open question, the color-14 highlight
-      operator's exact behavior, is called out specifically there rather than lumped in here. The
-      H-counter's visible-value range and jump location are now confirmed too, though its exact
-      dot-by-dot repeat pattern within a line is not — see §8's confidence note.)
+      The H-counter's exact dot-by-dot <em>repeat pattern</em> within a line — especially H40's
+      non-uniform EDCLK-driven pixel clock — and IM2 interlace tile addressing still rely on
+      general platform knowledge rather than a specific, independently confirmed citation. Treat
+      any number in those areas as a reasonable approximation, not a hardware-verified constant.
+      (The window plane's row-stride, shadow/highlight's brightness math, and Mode 4's core
+      structure were in this list too until they were traced to specific Genesis Plus GX source —
+      see §6's confidence notes. Shadow/highlight's one remaining open question, the color-14
+      highlight operator's exact behavior, and Mode 4's two remaining open questions, a missing
+      sprite pattern-index mask and a possible tile-index bit-width mismatch, are called out
+      specifically in their own confidence notes rather than lumped in here. The H-counter's
+      visible-value range and jump location are now confirmed too.)
     </p>
   </div>
 

@@ -13,6 +13,17 @@ public class VdpMode4Tests
         // (the default name-table entry everywhere) otherwise lives; the two would collide
         // and each stomp on the other's bytes if the table were left at its default base 0.
         vdp.Registers[2] = 0x0E;
+        // Sprite attribute table base = 0x100, away from tile data at address 0 -- and, more
+        // importantly, explicitly terminated with the 0xD0 sentinel as its very first byte. An
+        // *untouched* sprite table isn't actually empty: a zero Y-byte isn't the sentinel, so a
+        // background-only test that never writes sprite data would otherwise get 64 phantom
+        // "active" sprites at Y=1 (spanning scanlines 1-8), all sharing X=0/tile=0 from the same
+        // untouched VRAM. That's invisible to any test that only ever renders scanline 0 (every
+        // sprite starts at Y>=1), which is why this went unnoticed until a background test needed
+        // to check a later scanline. Tests that intentionally exercise real sprites overwrite
+        // this sentinel with their own Y-bytes (typically after moving the table back to base 0).
+        vdp.Registers[5] = 2;
+        vdp.Vram[vdp.Mode4SpriteAttributeTableBase] = 0xD0;
         return vdp;
     }
 
@@ -185,5 +196,157 @@ public class VdpMode4Tests
         vdp.RenderScanline(10);
 
         Assert.Equal(255, vdp.FrameBuffer[(10 * Vdp.ScreenWidth) * 3]); // red wins: background priority beats the sprite
+    }
+
+    [Fact]
+    public void Mode4TopRowsScrollLock_KeepsFirstSixteenRowsFixed()
+    {
+        var vdp = CreateVdp();
+        vdp.Registers[0] |= 0x80; // lock top rows (2 tile rows)
+        vdp.Registers[9] = 8; // vscroll = 8px
+
+        FillMode4Tile(vdp, 0, colorIndex: 7); // tile 0 (default name-table entry everywhere)
+        vdp.Cram[7] = 0x000E; // red
+
+        // (tileX=0, tileY=3) entry -> tile 1: only reachable once vscroll actually applies.
+        uint entryAddress = vdp.Mode4NameTableBase + (uint)(3 * 32) * 2;
+        vdp.Vram[entryAddress] = 0x00; vdp.Vram[entryAddress + 1] = 0x01;
+        FillMode4Tile(vdp, 1, colorIndex: 3);
+        vdp.Cram[3] = 0x0E00; // blue
+
+        vdp.RenderScanline(0);
+        vdp.RenderScanline(16);
+
+        // Locked: row 0 ignores vscroll, worldY = screenY directly -> tile 0 (red).
+        Assert.Equal(255, vdp.FrameBuffer[0]);
+        Assert.Equal(0, vdp.FrameBuffer[2]);
+        // Unlocked: row 16 scrolls by +8 -> worldY = 24 -> tileY = 3 -> tile 1 (blue).
+        Assert.Equal(255, vdp.FrameBuffer[(16 * Vdp.ScreenWidth) * 3 + 2]);
+    }
+
+    [Fact]
+    public void Mode4LargeSprites_UsesSixteenPixelTallSpritesAndForcesEvenTileIndex()
+    {
+        var vdp = CreateVdp();
+        vdp.Registers[1] |= 0x02; // 8x16 sprite mode
+        vdp.Registers[5] = 0;
+
+        vdp.Vram[0] = 0; // Y byte -> actual Y = 1
+        vdp.Vram[64] = 20; // X
+        vdp.Vram[65] = 5; // tile index 5 (odd) -> masked to 4 for the top half
+        FillMode4Tile(vdp, 4, colorIndex: 3);
+        vdp.Cram[1 * 16 + 3] = 0x0E00; // blue: top half (tile 4)
+        FillMode4Tile(vdp, 5, colorIndex: 6);
+        vdp.Cram[1 * 16 + 6] = 0x000E; // red: bottom half (tile 5)
+
+        vdp.RenderScanline(1);  // sprite row 0 -> top half
+        vdp.RenderScanline(9);  // sprite row 8 -> bottom half
+        vdp.RenderScanline(17); // one past the 16-row-tall sprite -- no longer visible
+
+        Assert.Equal(255, vdp.FrameBuffer[(1 * Vdp.ScreenWidth + 20) * 3 + 2]); // blue
+        Assert.Equal(255, vdp.FrameBuffer[(9 * Vdp.ScreenWidth + 20) * 3]); // red
+        Assert.Equal(0, vdp.FrameBuffer[(17 * Vdp.ScreenWidth + 20) * 3]);
+        Assert.Equal(0, vdp.FrameBuffer[(17 * Vdp.ScreenWidth + 20) * 3 + 2]);
+    }
+
+    [Fact]
+    public void SpriteCollision_SetsCollisionFlagWhenTwoOpaquePixelsOverlap()
+    {
+        var vdp = CreateVdp();
+        vdp.Registers[5] = 0;
+        FillMode4Tile(vdp, 1, colorIndex: 3);
+        vdp.Cram[1 * 16 + 3] = 0x0E00;
+
+        // Two sprites, same Y and X -> their opaque pixels land on the same screen position.
+        vdp.Vram[0] = 9; vdp.Vram[64] = 20; vdp.Vram[65] = 1; // sprite 0
+        vdp.Vram[1] = 9; vdp.Vram[66] = 20; vdp.Vram[67] = 1; // sprite 1
+
+        vdp.RenderScanline(10);
+
+        Assert.Equal(0x0020, vdp.ReadStatusRegister() & 0x0020);
+    }
+
+    [Fact]
+    public void BackgroundVerticalScroll_WrapsAtTwoHundredTwentyFourPixels()
+    {
+        var vdp = CreateVdp();
+        vdp.Registers[9] = 223; // vscroll = 223px -- screenY=1 lands exactly on the wrap boundary
+
+        FillMode4Tile(vdp, 0, colorIndex: 7); // tile 0, at tileY=0
+        vdp.Cram[7] = 0x000E; // red
+
+        vdp.RenderScanline(1); // worldY = (1 + 223) % 224 = 0 -> wraps back to tileY=0
+
+        Assert.Equal(255, vdp.FrameBuffer[(1 * Vdp.ScreenWidth) * 3]);
+    }
+
+    [Fact]
+    public void BackgroundHorizontalScroll_WrapsAtTwoHundredFiftySixPixels()
+    {
+        var vdp = CreateVdp();
+        vdp.Registers[8] = 1; // hscroll = 1px -- screenX=0 lands exactly on the wrap boundary
+
+        // (tileX=31, tileY=0) -- the rightmost column of the 256px-wide virtual plane -> tile 1.
+        uint entryAddress = vdp.Mode4NameTableBase + 31u * 2;
+        vdp.Vram[entryAddress] = 0x00; vdp.Vram[entryAddress + 1] = 0x01;
+        FillMode4Tile(vdp, 1, colorIndex: 3);
+        vdp.Cram[3] = 0x0E00; // blue
+
+        vdp.RenderScanline(0); // worldX = (0 - 1) & 0xFF = 255 -> tileX = 31
+
+        Assert.Equal(255, vdp.FrameBuffer[2]);
+    }
+
+    [Fact]
+    public void Background_AppliesHorizontalAndVerticalTileFlip()
+    {
+        var vdp = CreateVdp();
+        // An asymmetric tile: only the raw top-left pixel (pixelX=0, pixelY=0) is lit, color 3.
+        for (int plane = 0; plane < 4; plane++)
+        {
+            vdp.Vram[(uint)plane] = ((3 >> plane) & 1) != 0 ? (byte)0x80 : (byte)0x00;
+        }
+        vdp.Cram[3] = 0x000E; // red
+
+        // (tileX=0, tileY=0): tile 0, flipH (bit9) and flipV (bit10) both set.
+        ushort entry = 0x0600;
+        vdp.Vram[vdp.Mode4NameTableBase] = (byte)(entry >> 8);
+        vdp.Vram[vdp.Mode4NameTableBase + 1] = (byte)entry;
+
+        vdp.RenderScanline(7); // last row of the tile
+
+        // Flipped both ways, the raw top-left pixel renders at the tile's bottom-right corner.
+        Assert.Equal(255, vdp.FrameBuffer[(7 * Vdp.ScreenWidth + 7) * 3]);
+        Assert.Equal(0, vdp.FrameBuffer[(7 * Vdp.ScreenWidth + 0) * 3]);
+    }
+
+    [Fact]
+    public void RenderMode4Scanline_BlanksRowsAtOrBeyondOneNinetyTwo()
+    {
+        var vdp = CreateVdp();
+        FillMode4Tile(vdp, 0, colorIndex: 7); // would render red everywhere if not blanked
+        vdp.Cram[7] = 0x000E;
+
+        int offset = 192 * Vdp.ScreenWidth * 3;
+        vdp.FrameBuffer[offset] = 0xAB; // known non-black sentinel
+
+        vdp.RenderScanline(192);
+
+        Assert.Equal(0, vdp.FrameBuffer[offset]);
+    }
+
+    [Fact]
+    public void RenderMode4Scanline_BlanksColumnsAtOrBeyondTwoFiftySix()
+    {
+        var vdp = CreateVdp();
+        FillMode4Tile(vdp, 0, colorIndex: 7); // tile 0 would be opaque red at this column too
+        vdp.Cram[7] = 0x000E;
+
+        int offset = 256 * 3;
+        vdp.FrameBuffer[offset] = 0xAB; // known non-black sentinel
+
+        vdp.RenderScanline(0);
+
+        Assert.Equal(0, vdp.FrameBuffer[offset]); // column 256+ (H40's extra width) is blanked
     }
 }

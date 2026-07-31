@@ -3,13 +3,37 @@ namespace GenesisSharp.Core;
 /// <summary>Mode 4 — the Sega Master System's video mode, which the Genesis VDP retains for
 /// backward compatibility. Essentially no real Genesis software ever switches into this mode
 /// (it exists for SMS-on-Genesis compatibility and VDP test suites), so this has had far less
-/// real-world exposure to cross-check against than the Mode 5 renderer — treat everything in
-/// this file as an even lower-confidence first draft than the rest of the VDP.
+/// real-world exposure to cross-check against than the Mode 5 renderer.
 ///
 /// Mode 4 differs from Mode 5 in almost every particular: a single scrollable background
 /// plane instead of A/B, no window plane, 4bpp *planar* tiles (four separate bitplane bytes
 /// per row) instead of Mode 5's packed nibbles, a flat 64-entry sprite table with a sentinel
-/// terminator instead of a linked list, and a fixed 256x192 active area.</summary>
+/// terminator instead of a linked list, and a fixed 256x192 active area. This core structure —
+/// planar decode, the Y+1 sprite offset, the 0xD0 sentinel, the flat (not linked-list) sprite
+/// table, the 8-sprites-per-line cap, and the backdrop-from-sprite-palette-line-1 quirk below —
+/// is confirmed against genesis-plus-gx's <c>render_bg_m4</c>/<c>render_obj_m4</c>/
+/// <c>color_update_m4</c> (`vdp_render.c:1405-1527,3700-3813,1099-1109`).
+///
+/// One thing confirmed *absent* deliberately, not by oversight: genesis-plus-gx implements a
+/// register 3/4 tile-index-masking quirk specific to the real standalone SMS VDP chip
+/// (315-5124), gated behind `system_hw &lt;= SYSTEM_SMS` (`vdp_render.c:1490-1508` — for
+/// anything above that, i.e. Genesis Mode 4 compatibility, it falls straight through to a plain
+/// `attr &amp; 0x7FF` tile index with no masking). That gate means the SMS-specific quirk
+/// doesn't apply to the only configuration this emulator models, so it's correctly not
+/// implemented here.
+///
+/// Two things this investigation surfaced but did *not* resolve, flagged honestly rather than
+/// guessed at: (1) genesis-plus-gx's sprite renderer (`render_obj_m4`) applies a *separate*
+/// register-6-based pattern-index mask (`sg_mask`, `vdp_render.c:3713-3726`) that's gated the
+/// opposite way — its extra masking bits are added for `system_hw &gt; SYSTEM_SMS`, i.e. they
+/// *do* apply to Genesis Mode 4 sprites — which this file does not implement at all; register 6
+/// isn't read anywhere in this file's sprite path. (2) genesis-plus-gx's background tile index
+/// for MD is masked with `attr &amp; 0x7FF` (11 bits) where this file uses `entry &amp; 0x01FF`
+/// (9 bits) plus separate flip bits at 9/10 — whether real Mode 4 background tiles actually
+/// support hflip/vflip the way this file assumes, or whether those bits are actually high tile-
+/// index bits, wasn't confirmed. Given Mode 4's near-zero real-world relevance neither was
+/// pursued further here; both are good next steps if this file's confidence needs raising past
+/// "test-covered but structurally unverified in these two specific respects."</summary>
 public sealed partial class Vdp
 {
     public const int Mode4ScreenWidth = 256;
