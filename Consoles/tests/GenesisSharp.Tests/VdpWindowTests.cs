@@ -134,6 +134,29 @@ public class VdpWindowTests
     }
 
     [Fact]
+    public void H40Mode_AddressesWindowNameTableWithSixtyFourCellRowStride()
+    {
+        // Real hardware allocates the window's name table row as 64 cells wide in H40, not 32
+        // (confirmed against genesis-plus-gx's vdp_ctrl.c reg-3 write handler and vdp_render.c's
+        // "6 + (reg[12]&1)" row-address shift). Every other test in this file runs in the default
+        // H32 mode; this is the only one that exercises the H40 stride at all. tileY=1 is what
+        // distinguishes the two strides — at tileY=0 both a 32-cell and 64-cell stride produce the
+        // same VRAM address, so a bug here would go unnoticed at row 0.
+        var vdp = CreateVdp();
+        vdp.Registers[12] = 0x01; // H40 (320px) mode
+        vdp.Registers[18] = 0x80; // WVP=0, ShowsBottom=true -> window covers every row
+
+        WriteNameTableEntry(vdp, vdp.WindowNameTableBase, tileX: 5, tileY: 1, rowStrideCells: 64, tileIndex: 5, paletteLine: 0, priority: false);
+        FillTile(vdp, 5, colorIndex: 1);
+        vdp.Cram[1] = 0x000E; // red
+
+        vdp.RenderScanline(8); // tile row 1
+
+        int x = 5 * 8; // tileX=5 -> screenX 40
+        Assert.Equal(255, vdp.FrameBuffer[(8 * Vdp.ScreenWidth + x) * 3]); // red: read via the 64-cell stride
+    }
+
+    [Fact]
     public void LowPriorityWindow_IsHiddenBehindHighPriorityPlaneB()
     {
         var vdp = CreateVdp();

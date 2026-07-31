@@ -4,10 +4,13 @@ public sealed partial class Vdp
 {
     /// <summary>The window plane's name table row length in cells. Unlike plane A/B (whose
     /// width comes from register 16), this tracks the display width mode directly — 64 for
-    /// H40, 32 for H32 — rather than being a fixed value; that's a reasoned guess (it would
-    /// explain why sources describing only H40 usage call it "always 64"), not a verified
-    /// fact, and is exactly the kind of detail this file can't independently confirm (see
-    /// the type-level remarks).</summary>
+    /// H40, 32 for H32 — rather than being a fixed value. Confirmed against genesis-plus-gx's
+    /// <c>vdp_ctrl.c</c> register-3 write handler (window base masked to bits 15-12 in H40 vs.
+    /// 15-11 in H32, implying a fixed 64-cell allocation in H40) and <c>vdp_render.c</c>'s window
+    /// row-address computation, which shifts by <c>6 + (reg[12] &amp; 1)</c> — i.e. a 64-byte
+    /// (32-cell) row in H32 and a 128-byte (64-cell) row in H40, real hardware pre-allocating the
+    /// full 64-cell width even though only 40 columns are ever displayed. Independently
+    /// corroborated by SGDK's own H40 4KB-alignment requirement for the window base address.</summary>
     private int WindowRowStrideCells => Is40CellMode ? 64 : 32;
 
     /// <summary>Whichever of the horizontal/vertical split conditions applies, the window

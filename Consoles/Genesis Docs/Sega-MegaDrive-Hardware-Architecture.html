@@ -1179,9 +1179,12 @@
     <p>
       The split-position and left/right/above/below semantics above are confirmed against
       GenesisSharp's own source and general VDP documentation. The window's internal row-stride
-      constant (how its name-table addressing advances for H32 vs. H40) is flagged in that same
-      source as a reasoned guess rather than an independently re-verified fact — worth checking
-      first if a window-heavy game ever renders subtly wrong.
+      constant — 32 cells per row in H32, 64 in H40 — is confirmed against Genesis Plus GX's
+      <code>vdp_ctrl.c</code> register-3 write handler and <code>vdp_render.c</code>'s row-address
+      shift: real hardware pre-allocates a fixed 64-cell-wide window row in H40 even though only 40
+      columns are ever displayed, which is why the base address must be 4KB-aligned in H40 versus
+      2KB-aligned in H32 (independently corroborated by SGDK's own alignment requirement for the
+      window base register).
     </p>
   </div>
 
@@ -2940,8 +2943,8 @@
   </p>
   <ul>
     <li><strong>Genesis Plus GX</strong> (Charles MacDonald / Eke-Eke and contributors) — the
-      most-consulted source for VDP DMA/FIFO timing, the status register bit layout, and the
-      68000-side bus-request prefetch-noise quirk.</li>
+      most-consulted source for VDP DMA/FIFO timing, the status register bit layout, the
+      68000-side bus-request prefetch-noise quirk, and the window plane's H32/H40 row-stride.</li>
     <li><strong>Charles MacDonald's <code>genvdp.txt</code></strong> — classic, widely-circulated
       VDP hardware documentation; the starting reference for register layout and scanline timing.</li>
     <li><strong>Nemesis's reverse-engineered VDP documentation</strong> — cited (via BlastEm) for

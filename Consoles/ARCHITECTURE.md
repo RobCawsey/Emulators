@@ -535,7 +535,9 @@ pixel sets the collision flag (first-drawn sprite in link order wins and is neve
 ### 6.8 Window, interlace, shadow/highlight, Mode 4
 
 - **Window** (`Vdp.Window.cs`): unscrolled — screen coordinates map directly onto its name table.
-  The row-stride constant used for H32/H40 is flagged as a reasoned guess, not a verified fact.
+  The H32/H40 row-stride constant (32 cells / 64 cells) is confirmed against genesis-plus-gx's
+  `vdp_ctrl.c` register-3 write handler and `vdp_render.c`'s row-address shift — real hardware
+  pre-allocates a fixed 64-cell-wide window row in H40 even though only 40 columns are displayed.
 - **Interlace** (`Vdp.Interlace.cs`): field-parity tracking plus IM2 tile-index doubling on planes,
   window, and sprites. Sees essentially no real-world use (Sonic 2's 2-player split screen is the
   most commonly cited example) and is explicitly the lowest-confidence corner of the mainstream
@@ -863,9 +865,10 @@ A consolidated list, pulled from §3–§9, of what to check first if a game mis
 - **Z80**: no undocumented IXH/IXL/IYH/IYL; X/Y flag bits are an approximation; DD/FD timing
   constants aren't instruction-by-instruction verified; block I/O flags are simplified.
 - **VDP**: H-counter dot-exact timing is a linear approximation, not verified hardware breakpoints;
-  window row-stride is a reasoned guess; shadow/highlight brightness math is a plausible
-  approximation, not a verified DAC-level formula; Mode 4 and interlace (IM2) are the
-  least-real-world-tested rendering paths in the whole VDP.
+  shadow/highlight brightness math is a plausible approximation, not a verified DAC-level formula;
+  Mode 4 and interlace (IM2) are the least-real-world-tested rendering paths in the whole VDP.
+  (Window row-stride was previously listed here too but is now confirmed against genesis-plus-gx —
+  see §6.8.)
 - **YM2612**: LFO, SSG-EG, and channel-3 "special mode" are entirely unmodeled. The rate-to-dB
   envelope curve is a smooth exponential approximation, not the chip's exact non-linear table.
 - **General**: no true whole-system single-instruction step (the frontend's "step instruction" is
@@ -897,10 +900,11 @@ Genesis/Mega Drive/Sega CD/Master System/Game Gear/SG-1000 emulator.
   consulted.)
 - Used to verify/root-cause: the VDP H-scroll table addressing formula; VDP DMA access-slot timing
   (including the copy-vs-fill 2× throughput difference); the VDP status register's DMA-busy bit
-  behavior; the 68000-side Z80 bus-request register's "prefetch noise on unused bits" quirk; the
-  YM2612's Timer A tick rate, Total Level dB step size, key-code fraction table, key-scale-rate
-  formula, detune table shape, and — most extensively — the exact operator-connection graph (and
-  one-sample-delay behavior) for all 8 FM algorithms.
+  behavior; the VDP window plane's H32/H40 name-table row stride; the 68000-side Z80 bus-request
+  register's "prefetch noise on unused bits" quirk; the YM2612's Timer A tick rate, Total Level dB
+  step size, key-code fraction table, key-scale-rate formula, detune table shape, and — most
+  extensively — the exact operator-connection graph (and one-sample-delay behavior) for all 8 FM
+  algorithms.
 
 **Nuked-OPN2** (`ym3438.c`) — vendored inside genesis-plus-gx, not separately cloned
 A cycle-accurate reverse-engineered YM2612 (OPN2) core; genesis-plus-gx's own FM engine is itself
