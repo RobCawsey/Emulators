@@ -244,6 +244,63 @@
     nav.toc{position:relative;height:auto;border-right:none;border-bottom:1px solid var(--border-soft);}
     main{padding:32px 20px 80px;}
   }
+
+  /* Instruction reference (§14-16) */
+  .instr-group h3{
+    margin-top:36px;
+    padding-bottom:6px;
+    border-bottom:1px solid var(--border-soft);
+  }
+  .instr{
+    border-bottom:1px solid var(--border-soft);
+    padding:14px 0;
+  }
+  .instr:last-child{border-bottom:none;}
+  .instr h4{
+    font-family:var(--mono);
+    font-size:15px;
+    margin:0 0 8px 0;
+    color:var(--text);
+    display:flex;
+    align-items:baseline;
+    gap:10px;
+    flex-wrap:wrap;
+  }
+  .instr h4 .name{
+    font-family:var(--sans);
+    font-weight:400;
+    font-size:13px;
+    color:var(--text-faint);
+  }
+  .instr-desc{margin:0 0 10px 0;max-width:880px;}
+  dl.instr-meta{
+    display:grid;
+    grid-template-columns:112px 1fr;
+    gap:5px 14px;
+    margin:0;
+    max-width:880px;
+    font-size:13.5px;
+  }
+  dl.instr-meta dt{
+    color:var(--text-faint);
+    font-size:11px;
+    text-transform:uppercase;
+    letter-spacing:0.06em;
+    padding-top:2px;
+  }
+  dl.instr-meta dd{margin:0;color:var(--text-dim);}
+  dl.instr-meta dd.mono{font-family:var(--mono);color:var(--text);}
+  dl.instr-meta dd.gap{color:var(--amber);}
+  .addr-modes{
+    display:grid;
+    grid-template-columns:150px 1fr;
+    gap:8px 16px;
+    max-width:880px;
+    margin:0 0 20px 0;
+    font-size:14px;
+  }
+  .addr-modes .m{font-family:var(--mono);color:var(--amber);}
+  .addr-modes .d{color:var(--text-dim);}
 </style>
 </head>
 <body>
@@ -263,6 +320,10 @@
     <li><a href="#interrupts">Interrupts</a></li>
     <li><a href="#audio">Audio subsystem</a></li>
     <li><a href="#controllers">Controller ports</a></li>
+    <li><a href="#sh2-32x">The 32X extension: SH-2 CPUs (in progress)</a></li>
+    <li><a href="#instr-68000">68000 instruction reference</a></li>
+    <li><a href="#instr-z80">Z80 instruction reference</a></li>
+    <li><a href="#instr-sh2">SH-2 instruction reference</a></li>
     <li><a href="#sources">Sources &amp; confidence</a></li>
   </ol>
 </nav>
@@ -302,7 +363,7 @@
   <p>
     Every fact below was cross-checked (where noted) against real hardware documentation and
     established open-source emulators while this project's own C# emulator, GenesisSharp, was
-    built and debugged against real ROMs — see <a href="#sources">§11</a> for the full source list.
+    built and debugged against real ROMs — see <a href="#sources">§16</a> for the full source list.
   </p>
 </section>
 
@@ -2982,8 +3043,2261 @@
   </div>
 </section>
 
+<section id="sh2-32x">
+  <h2><span class="num">12</span> The 32X extension: SH-2 CPUs (in progress)</h2>
+  <p class="section-intro">
+    The <strong>Sega 32X</strong> (1994) is a cartridge-slot add-on that turns the console into a
+    three-CPU machine: it plugs a small board carrying <strong>two Hitachi SH-2 RISC processors</strong>,
+    a second frame-buffer-based graphics chip that overlays the existing VDP's output, and a PWM
+    sound chip, all sharing bus access with the 68000/Z80/VDP system described above. This section
+    covers only the two SH-2 CPUs — the part of the 32X that GenesisSharp currently has any support
+    for.
+  </p>
+  <ul>
+    <li><strong>Two SH-2s, "master" and "slave"</strong> — nominally identical chips, distinguished
+      only by which control-register bit they set/clear and how their reset vectors are wired;
+      33.4 MHz, roughly triple the main 68000's clock.</li>
+    <li><strong>32-bit RISC, fixed 16-bit instructions</strong> — a completely different shape from
+      either existing CPU on this bus: 16 general-purpose 32-bit registers, no variable-length
+      opcodes, no microcode-style multi-cycle addressing modes.</li>
+    <li><strong>Delayed branches</strong> — unlike the 68000 and Z80, the instruction immediately
+      following a branch/call/return always executes <em>before</em> the branch takes effect
+      (MIPS/SPARC-style). Getting this wrong is the single easiest mistake when emulating this chip.</li>
+    <li><strong>A configurable vector table</strong> — the SH-2's <code>VBR</code> register lets
+      software relocate its exception vector table anywhere in memory, unlike the 68000's fixed
+      table at address 0.</li>
+  </ul>
+
+  <div class="callout confidence">
+    <span class="tag">Confidence note</span>
+    <p>
+      The tables below are sourced entirely from <strong>PicoDrive</strong>
+      (<code>reference/PicoDrive/picodrive/pico/32x/memory.c</code> and <code>32x.c</code>), the
+      sole real reference implementation used for this project's 32X work — genesis-plus-gx has
+      never shipped 32X emulation, so there was no second source to cross-check against here the
+      way earlier sections of this document cross-check the base 68000/Z80/VDP facts against
+      multiple emulators. Every range is also exercised by GenesisSharp's own code today (cited
+      per-file below), not just transcribed from the reference source and left unverified.
+    </p>
+  </div>
+
+  <h3>How the 32X shares the bus</h3>
+  <p>
+    The 32X board doesn't replace anything in the memory maps described in <a href="#memmap">§4</a>
+    — it plugs new address ranges into the gaps that were previously open bus, and the existing
+    68000/Z80/VDP hardware keeps working exactly as documented above. The two SH-2s see an
+    entirely separate 32-bit address space of their own, split into four <strong>CS (chip select)
+    areas</strong> — the same "which physical chip does this address range belong to" concept the
+    68000 map already uses, just with four coarse areas instead of many small ones. Every SH-2
+    range below is mirrored again with bit <code>$20000000</code> set (SH-2's "cache-through"
+    view of the same physical memory); GenesisSharp's SH-2 core has no on-chip cache model, so
+    both views behave identically.
+  </p>
+
+  <h4>68000-side windows (all new; everything else in §4's map is unaffected)</h4>
+  <table>
+    <thead><tr><th class="mono">Range</th><th>Decodes to</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td class="mono">$A130EC–$A130EF</td><td>"MARS" ID register</td><td>Read-only ASCII <code>MARS</code> — the hardware-presence probe real 32X boot code checks before switching into 32X mode. Always live, independent of ADEN.</td></tr>
+      <tr><td class="mono">$A15100–$A1513F</td><td>Adapter/control register block</td><td>64 bytes, byte-addressable — see the register table below.</td></tr>
+      <tr><td class="mono">$A15180–$A1519F</td><td>32X VDP register block</td><td>Display mode, priority, autofill, frame-buffer-select — see the VDP register table below.</td></tr>
+      <tr><td class="mono">$A15200–$A153FF</td><td>32X palette</td><td>256 × 16-bit entries: bits 4:0/9:5/14:10 = R/G/B (5:5:5), bit 15 = a per-color priority marker (not a color channel).</td></tr>
+      <tr><td class="mono">$840000–$85FFFF</td><td>Frame buffer window (direct)</td><td>128KB — reads/writes go straight to whichever bank the SH-2s currently draw into.</td></tr>
+      <tr><td class="mono">$860000–$87FFFF</td><td>Frame buffer window (overwrite)</td><td>Same underlying bank as the window above, but a word write's zero bytes/words don't overwrite the existing value underneath — a masked-write mode real 32X software uses for sprite-style drawing without clearing the background first.</td></tr>
+    </tbody>
+  </table>
+
+  <h4>SH-2-side CS0–CS3 areas (base addresses; cache-through mirror at base + $20000000)</h4>
+  <table>
+    <thead><tr><th class="mono">Base</th><th>Area</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td class="mono">$00000000</td><td>CS0 — boot ROM + registers</td><td>Sub-decoded: <code>$4000–$403F</code> adapter/control registers (the same block the 68000 sees at <code>$A15100</code>), <code>$4100–$411F</code> VDP registers, <code>$4200–$43FF</code> palette; everything below that is each core's own boot ROM (2KB master / 1KB slave).</td></tr>
+      <tr><td class="mono">$02000000</td><td>CS1 — cartridge ROM</td><td>Unbanked, linear — reads the same ROM image the 68000 sees.</td></tr>
+      <tr><td class="mono">$04000000</td><td>CS2 — frame buffer</td><td>128KB window into whichever bank the SH-2s currently write to; bit <code>$20000</code> of the local offset selects the same overwrite (masked-write) mode as the 68000's <code>$860000</code> window.</td></tr>
+      <tr><td class="mono">$06000000</td><td>CS3 — SDRAM</td><td>256KB of SH-2-side work RAM, shared between both cores.</td></tr>
+    </tbody>
+  </table>
+
+  <h4>Adapter/control register block ($A15100 / $4000, 64 bytes)</h4>
+  <table>
+    <thead><tr><th class="mono">Offset</th><th>Register</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td class="mono">$00</td><td>FM / REN</td><td>Framebuffer-access-owner and cartridge-enable bits.</td></tr>
+      <tr><td class="mono">$01</td><td>nRES / ADEN</td><td>68000-exclusive: nRES/ADEN gate whether either SH-2 runs at all (both bits must be set), and there is a single shared reset line — no independent per-core reset exists anywhere in the register model. A 0→1 transition of nRES resets both cores together.</td></tr>
+      <tr><td class="mono">$02–$03</td><td>IRQ control</td><td>Storage only in GenesisSharp today — no 32X-side interrupt routing is implemented yet (see the status note below).</td></tr>
+      <tr><td class="mono">$04–$05</td><td>ROM bank (68000 side)</td><td>Storage only — GenesisSharp's SH-2 CS1 reads the cartridge image directly and unbanked instead of needing this.</td></tr>
+      <tr><td class="mono">$08–$13</td><td>DREQ source/destination/length/FIFO</td><td>Storage only — no DMA transfer logic implemented yet.</td></tr>
+      <tr><td class="mono">$14–$1D</td><td>IRQ pending-clear registers</td><td>Storage only, same reason as IRQ control above.</td></tr>
+      <tr><td class="mono">$20–$2F</td><td>COMM0–COMM7</td><td>Eight 16-bit registers, plain shared storage both the 68000 and both SH-2s can freely read and write — the primary channel real 32X software uses to hand data and commands between the three CPUs. GenesisSharp implements this fully; see <a href="#instr-sh2">§15</a>'s emulator for the CPU side.</td></tr>
+      <tr><td class="mono">$30–$3F</td><td>PWM</td><td>See the PWM register table below.</td></tr>
+    </tbody>
+  </table>
+
+  <h4>32X VDP register block ($A15180 / $4100)</h4>
+  <table>
+    <thead><tr><th class="mono">Offset</th><th>Register</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td class="mono">$00</td><td>Display mode / PRI / Mx</td><td><code>Mx</code> (bits 1:0) selects the display mode: 0 = blank (32X layer off), 1 = Packed Pixel (8bpp indexed), 2 = Direct Color (15-bit RGB), 3 = Run Length. GenesisSharp implements modes 0–2; Run Length degrades to blank rather than rendering garbage.</td></tr>
+      <tr><td class="mono">$02</td><td>SFT</td><td>Shifts the Packed Pixel scanline start by one byte. Direct Color mode ignores this bit.</td></tr>
+      <tr><td class="mono">$04</td><td>Fill length</td><td>Word count for the autofill burst.</td></tr>
+      <tr><td class="mono">$06</td><td>Fill start address</td><td>Frame-buffer word offset the autofill burst begins at.</td></tr>
+      <tr><td class="mono">$08</td><td>Fill data</td><td>Writing this register is what actually triggers the burst — it fills the write-target bank with the written value, <code>length</code> words starting at the start address above.</td></tr>
+      <tr><td class="mono">$0A</td><td>FBCR (frame buffer control)</td><td>VBLK/HBLK/PEN/nFEN status bits plus the one genuinely writable bit, <code>FS</code> — selects which of the two frame-buffer banks is currently displayed vs. currently being drawn into. VBLK mirrors the Genesis VDP's own vblank window one-for-one; HBLK/nFEN are not real hardware timing on real 32X hardware either (PicoDrive's own author calls this out) and are faked identically here via a free-running counter that advances on every FBCR read.</td></tr>
+    </tbody>
+  </table>
+
+  <h4>PWM registers ($A15130 / $4030, inside the adapter block above)</h4>
+  <table>
+    <thead><tr><th class="mono">Offset</th><th>Register</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td class="mono">$30 / $31</td><td>Control</td><td>Low nibble of the low byte (<code>xMd</code>) selects stereo routing — <code>$05</code> = normal stereo, <code>$0A</code> = swapped, four other specific values are confirmed invalid/silent (treated as mono here, a deliberate simplification since PicoDrive's own source doesn't fully resolve every other value either). The high byte's IRQ-timer nibble and low byte's RTP bit are SH-2-exclusive — confirmed asymmetric: the 68000 can only ever affect <code>xMd</code>.</td></tr>
+      <tr><td class="mono">$32 / $33</td><td>Cycle register</td><td>12-bit period controlling both the output sample rate (fixed at 3× the 68000's clock ÷ this value) and the amplitude scale each FIFO entry is rescaled against.</td></tr>
+      <tr><td class="mono">$34 / $35</td><td>Left/Mono FIFO</td><td>Write-only; a write to the low (odd) address pushes the just-written 16-bit value onto a 3-deep queue. Reads return only FULL/EMPTY status bits in the high byte, never data.</td></tr>
+      <tr><td class="mono">$36 / $37</td><td>Right FIFO</td><td>Same shape as the Left/Mono FIFO above.</td></tr>
+      <tr><td class="mono">$38 / $39</td><td>Mono FIFO alias</td><td>Writes here feed the same queue as the Left/Mono FIFO above.</td></tr>
+      <tr><td class="mono">$3A–$3F</td><td>Reserved</td><td>Ignored.</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Current GenesisSharp status</h3>
+  <p>
+    GenesisSharp implements a complete, standalone SH-2 instruction interpreter — every standard
+    opcode PicoDrive's own SH-2 core decodes as a real instruction is implemented, tested, and cited
+    against that reference source file-and-line. It is deliberately built the same way the existing
+    68000 and Z80 cores are: it knows nothing about the Genesis, the 32X's memory map, or the other
+    CPUs on the bus — it's just a CPU that can execute SH-2 machine code against whatever
+    <code>IBus</code> it's given.
+  </p>
+  <p>
+    Both SH-2s can now be released from reset by the 68000 and exchange data with it through the
+    shared communication registers, a 32X title's own frame buffer — Packed Pixel (8bpp indexed)
+    and Direct Color (15-bit RGB) display modes, composited correctly against the Genesis VDP's
+    own output — actually shows up, and its PWM audio output is audibly mixed in alongside the
+    PSG/YM2612. The whole subsystem also round-trips through GenesisSharp's own save states now,
+    and the debug window has a live tab showing both SH-2 cores' registers and a disassembly
+    listing. What still doesn't exist: Run Length display mode, DREQ/DMAC, 32X-side interrupt
+    routing (including PWM's own "feed me more data" interrupt — underrun degrades safely to
+    holding the last sample rather than breaking outright, but some real games may still go
+    audibly stale without it), and a synthesized boot-stub fallback, so an unmodified real 32X ROM
+    still won't boot without a real BIOS this project doesn't ship. See the project's own
+    <code>ARCHITECTURE.md</code> (§4a-§4a.4) for the software design and what's planned next.
+  </p>
+</section>
+
+<section id="instr-68000">
+  <h2><span class="num">13</span> 68000 instruction reference</h2>
+  <p class="section-intro">
+    The main CPU's instruction set. If this is your first time reading 68000 assembly: almost
+    every instruction below can act on a byte, word, or longword (written as
+    <code>.B</code>/<code>.W</code>/<code>.L</code> after the mnemonic), and most can read or write
+    almost any kind of location — a register, a memory address, an immediate constant — through a
+    shared notation called an <strong>effective address</strong> (<code>&lt;ea&gt;</code>),
+    explained first below.
+  </p>
+
+  <h3>How to read this section — effective addresses</h3>
+  <p>Wherever an instruction's syntax shows <code>&lt;ea&gt;</code>, any of the following may be used
+    (some instructions restrict which ones are legal — e.g. an <code>&lt;ea&gt;</code> that must be
+    writable can't be an immediate value):</p>
+  <div class="addr-modes">
+    <span class="m">Dn</span><span class="d">Data register direct — the operand is a data register's own value.</span>
+    <span class="m">An</span><span class="d">Address register direct — the operand is an address register's own value.</span>
+    <span class="m">(An)</span><span class="d">Address register indirect — memory at the address held in An.</span>
+    <span class="m">(An)+</span><span class="d">Postincrement — memory at An, then An is advanced by the operand's size afterward. The standard "pop"/iterate-forward idiom.</span>
+    <span class="m">-(An)</span><span class="d">Predecrement — An is reduced by the operand's size first, then memory at the new An is used. The standard "push"/iterate-backward idiom.</span>
+    <span class="m">d(An)</span><span class="d">Address register indirect with displacement — memory at An plus a constant.</span>
+    <span class="m">d(An,Xn)</span><span class="d">Indexed — memory at An plus another register (Xn) plus a small constant.</span>
+    <span class="m">Abs.W / Abs.L</span><span class="d">Absolute short/long — memory at a fixed address written directly in the instruction.</span>
+    <span class="m">d(PC)</span><span class="d">Program-counter relative — memory at the current instruction's address plus a constant; used for position-independent data references.</span>
+    <span class="m">d(PC,Xn)</span><span class="d">PC-relative indexed — same idea, plus an index register.</span>
+    <span class="m">#imm</span><span class="d">Immediate — a constant embedded directly in the instruction (only ever valid as a source, never a destination).</span>
+  </div>
+
+  <h3>Condition codes</h3>
+  <p>The status register's low byte (the CCR) holds five flags, all in a small register block
+    the whole instruction set shares:</p>
+  <div class="addr-modes">
+    <span class="m">X</span><span class="d">Extend — a "long carry" used to chain multi-word arithmetic (ADDX/SUBX/ROXL/ROXR read it as a carry-in). Usually mirrors C, but some instructions update one without the other.</span>
+    <span class="m">N</span><span class="d">Negative — set to the result's sign bit.</span>
+    <span class="m">Z</span><span class="d">Zero — set if the result was zero.</span>
+    <span class="m">V</span><span class="d">Overflow — set if a signed arithmetic result didn't fit.</span>
+    <span class="m">C</span><span class="d">Carry — set if an unsigned arithmetic result didn't fit (or a shift/rotate's bit fell off the end).</span>
+  </div>
+  <p>Sixteen condition codes, tested by <code>Bcc</code>/<code>DBcc</code>/<code>Scc</code>, are
+    built from these five flags:</p>
+  <table>
+    <thead><tr><th class="mono">Code</th><th>Name</th><th>True when</th><th class="mono">Code</th><th>Name</th><th>True when</th></tr></thead>
+    <tbody>
+      <tr><td class="mono">T</td><td>True</td><td>always</td><td class="mono">VC</td><td>Overflow Clear</td><td><span class="mono">!V</span></td></tr>
+      <tr><td class="mono">F</td><td>False</td><td>never (Scc/DBcc only)</td><td class="mono">VS</td><td>Overflow Set</td><td><span class="mono">V</span></td></tr>
+      <tr><td class="mono">HI</td><td>Higher</td><td><span class="mono">!C &amp;&amp; !Z</span></td><td class="mono">PL</td><td>Plus</td><td><span class="mono">!N</span></td></tr>
+      <tr><td class="mono">LS</td><td>Lower or Same</td><td><span class="mono">C || Z</span></td><td class="mono">MI</td><td>Minus</td><td><span class="mono">N</span></td></tr>
+      <tr><td class="mono">CC</td><td>Carry Clear</td><td><span class="mono">!C</span></td><td class="mono">GE</td><td>Greater or Equal</td><td><span class="mono">N == V</span></td></tr>
+      <tr><td class="mono">CS</td><td>Carry Set</td><td><span class="mono">C</span></td><td class="mono">LT</td><td>Less Than</td><td><span class="mono">N != V</span></td></tr>
+      <tr><td class="mono">NE</td><td>Not Equal</td><td><span class="mono">!Z</span></td><td class="mono">GT</td><td>Greater Than</td><td><span class="mono">N==V &amp;&amp; !Z</span></td></tr>
+      <tr><td class="mono">EQ</td><td>Equal</td><td><span class="mono">Z</span></td><td class="mono">LE</td><td>Less or Equal</td><td><span class="mono">N!=V || Z</span></td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout confidence">
+    <span class="tag">Where this core diverges from a real 68000</span>
+    <p>
+      Two instructions real hardware supports — <code>NEGX</code> and <code>NBCD</code> — aren't
+      implemented in GenesisSharp's core at all: hitting either one crashes the emulator with an
+      unhandled exception rather than trapping gracefully the way a genuinely illegal opcode does.
+      <code>CMPM</code> is decoded incorrectly and silently runs as <code>EOR</code> instead. These
+      are called out again at their entries below, and are tracked as known gaps in the project's
+      own architecture documentation — no real Genesis game is known to depend on any of the three.
+    </p>
+  </div>
+
+  <div class="instr-group">
+  <h3>Data movement</h3>
+
+  <div class="instr" id="m68k-move">
+    <h4><code>MOVE</code><span class="name">Move Data</span></h4>
+    <p class="instr-desc">Copies a value from any readable location to any writable one — the
+      single most common 68000 instruction.</p>
+    <dl class="instr-meta">
+      <dt>Sizes</dt><dd>Byte, Word, Long</dd>
+      <dt>Syntax</dt><dd class="mono">MOVE.&lt;size&gt; &lt;ea&gt;,&lt;ea&gt;</dd>
+      <dt>Flags</dt><dd>N/Z from the moved value; V/C cleared; X unaffected. (Skipped entirely if
+        the destination is an address register — see MOVEA.)</dd>
+      <dt>Example</dt><dd class="mono">MOVE.W D0,D1  ; D1's low 16 bits = D0's low 16 bits</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-movea">
+    <h4><code>MOVEA</code><span class="name">Move Address</span></h4>
+    <p class="instr-desc">MOVE's counterpart when the destination is an address register — the
+      same instruction encoding, just named differently by convention because address-register
+      writes never touch the flags.</p>
+    <dl class="instr-meta">
+      <dt>Sizes</dt><dd>Word, Long</dd>
+      <dt>Syntax</dt><dd class="mono">MOVEA.&lt;size&gt; &lt;ea&gt;,An</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-moveq">
+    <h4><code>MOVEQ</code><span class="name">Move Quick</span></h4>
+    <p class="instr-desc">Loads a small (8-bit) constant into a data register, sign-extended to a
+      full 32 bits — a compact, fast way to load small values like loop counters or -1/0/1.</p>
+    <dl class="instr-meta">
+      <dt>Sizes</dt><dd>Long only</dd>
+      <dt>Syntax</dt><dd class="mono">MOVEQ #&lt;data&gt;,Dn</dd>
+      <dt>Flags</dt><dd>N/Z from the sign-extended value; V/C cleared.</dd>
+      <dt>Example</dt><dd class="mono">MOVEQ #-1,D0  ; D0 = 0xFFFFFFFF</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-lea">
+    <h4><code>LEA</code><span class="name">Load Effective Address</span></h4>
+    <p class="instr-desc">Computes an address (without reading whatever's there) and loads it into
+      an address register — the usual way to point a register at a table or buffer.</p>
+    <dl class="instr-meta">
+      <dt>Sizes</dt><dd>Long only</dd>
+      <dt>Syntax</dt><dd class="mono">LEA &lt;ea&gt;,An</dd>
+      <dt>Flags</dt><dd>None.</dd>
+      <dt>Example</dt><dd class="mono">LEA (SomeTable,PC),A0  ; A0 = the table's address</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-pea">
+    <h4><code>PEA</code><span class="name">Push Effective Address</span></h4>
+    <p class="instr-desc">Like LEA, but pushes the computed address onto the stack instead of
+      loading it into a register.</p>
+    <dl class="instr-meta">
+      <dt>Sizes</dt><dd>Long only</dd>
+      <dt>Syntax</dt><dd class="mono">PEA &lt;ea&gt;</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-movem">
+    <h4><code>MOVEM</code><span class="name">Move Multiple Registers</span></h4>
+    <p class="instr-desc">Saves or restores a whole list of registers to/from memory in one
+      instruction, selected by a 16-bit mask — the usual way to save registers on entry to a
+      subroutine and restore them on exit.</p>
+    <dl class="instr-meta">
+      <dt>Sizes</dt><dd>Word, Long</dd>
+      <dt>Syntax</dt><dd class="mono">MOVEM.&lt;size&gt; &lt;register-list&gt;,&lt;ea&gt;</dd>
+      <dt>Variant</dt><dd class="mono">MOVEM.&lt;size&gt; &lt;ea&gt;,&lt;register-list&gt;</dd>
+      <dt>Flags</dt><dd>None.</dd>
+      <dt>Notes</dt><dd>A word-sized load sign-extends each register to the full 32 bits. The
+        <code>-(An)</code> (predecrement/store) form numbers its register-selection bits in
+        reverse order compared to every other addressing mode — an assembler handles this for
+        you, but it's worth knowing if you're ever reading raw machine code.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-movep">
+    <h4><code>MOVEP</code><span class="name">Move Peripheral Data</span></h4>
+    <p class="instr-desc">Transfers 2 or 4 bytes between a data register and memory, one byte at a
+      time at addresses 2 bytes apart — designed for talking to old 8-bit peripheral chips wired
+      onto only every other data line. The Genesis's own memory map never actually needs this.</p>
+    <dl class="instr-meta">
+      <dt>Sizes</dt><dd>Word, Long</dd>
+      <dt>Syntax</dt><dd class="mono">MOVEP.&lt;size&gt; Dn,d(An)</dd>
+      <dt>Variant</dt><dd class="mono">MOVEP.&lt;size&gt; d(An),Dn</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-exg">
+    <h4><code>EXG</code><span class="name">Exchange Registers</span></h4>
+    <p class="instr-desc">Swaps the entire 32-bit contents of two registers in one instruction.</p>
+    <dl class="instr-meta">
+      <dt>Sizes</dt><dd>Long only</dd>
+      <dt>Syntax</dt><dd class="mono">EXG Dx,Dy</dd>
+      <dt>Variants</dt><dd class="mono">EXG Ax,Ay &nbsp;·&nbsp; EXG Dx,Ay</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-swap">
+    <h4><code>SWAP</code><span class="name">Swap Register Halves</span></h4>
+    <p class="instr-desc">Swaps a data register's high and low 16-bit halves.</p>
+    <dl class="instr-meta">
+      <dt>Sizes</dt><dd>Long only</dd>
+      <dt>Syntax</dt><dd class="mono">SWAP Dn</dd>
+      <dt>Flags</dt><dd>N/Z from the swapped 32-bit value; V/C cleared.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-clr">
+    <h4><code>CLR</code><span class="name">Clear</span></h4>
+    <p class="instr-desc">Writes zero to a location.</p>
+    <dl class="instr-meta">
+      <dt>Sizes</dt><dd>Byte, Word, Long</dd>
+      <dt>Syntax</dt><dd class="mono">CLR.&lt;size&gt; &lt;ea&gt;</dd>
+      <dt>Flags</dt><dd>N=0, Z=1, V/C cleared.</dd>
+    </dl>
+  </div>
+  </div>
+
+  <div class="instr-group">
+  <h3>Integer arithmetic</h3>
+
+  <div class="instr" id="m68k-add">
+    <h4><code>ADD / ADDA / ADDI / ADDQ</code><span class="name">Add</span></h4>
+    <p class="instr-desc">Four related forms, all adding two values: <code>ADD</code> adds an
+      effective address and a data register (either direction); <code>ADDA</code> is the same but
+      targeting an address register (no flags, since address arithmetic doesn't set condition
+      codes); <code>ADDI</code> adds an immediate baked into the instruction; <code>ADDQ</code> is
+      a compact form for adding a small constant (1-8) in fewer bytes/cycles.</p>
+    <dl class="instr-meta">
+      <dt>Sizes</dt><dd>Byte, Word, Long (ADDA: Word/Long)</dd>
+      <dt>Syntax</dt><dd class="mono">ADD.&lt;size&gt; &lt;ea&gt;,Dn &nbsp;·&nbsp; ADD.&lt;size&gt; Dn,&lt;ea&gt;</dd>
+      <dt>Variants</dt><dd class="mono">ADDA.&lt;size&gt; &lt;ea&gt;,An &nbsp;·&nbsp;
+        ADDI.&lt;size&gt; #&lt;data&gt;,&lt;ea&gt; &nbsp;·&nbsp; ADDQ.&lt;size&gt; #&lt;1-8&gt;,&lt;ea&gt;</dd>
+      <dt>Flags</dt><dd>ADD/ADDI/ADDQ: N/Z/V/C from the sum, X mirrors C. ADDA: none. ADDQ against
+        an address-register destination: none (matches ADDA).</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-addx">
+    <h4><code>ADDX</code><span class="name">Add With Extend</span></h4>
+    <p class="instr-desc">Adds two values <em>plus</em> the X flag as a carry-in — chain several of
+      these together (register pairs, or memory via predecrement addressing) to add numbers wider
+      than 32 bits, one limb at a time.</p>
+    <dl class="instr-meta">
+      <dt>Sizes</dt><dd>Byte, Word, Long</dd>
+      <dt>Syntax</dt><dd class="mono">ADDX.&lt;size&gt; Dy,Dx</dd>
+      <dt>Variant</dt><dd class="mono">ADDX.&lt;size&gt; -(Ay),-(Ax)</dd>
+      <dt>Flags</dt><dd>N/V/C/X from the sum (including the X carry-in). Z is "sticky" — cleared
+        if the result is nonzero, but never forced back to 1 — so a whole multi-limb chain's Z
+        flag correctly reflects whether <em>every</em> limb was zero.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-sub">
+    <h4><code>SUB / SUBA / SUBI / SUBQ</code><span class="name">Subtract</span></h4>
+    <p class="instr-desc">The subtraction mirror of ADD/ADDA/ADDI/ADDQ, same four forms and the
+      same reasoning for each.</p>
+    <dl class="instr-meta">
+      <dt>Sizes</dt><dd>Byte, Word, Long (SUBA: Word/Long)</dd>
+      <dt>Syntax</dt><dd class="mono">SUB.&lt;size&gt; &lt;ea&gt;,Dn &nbsp;·&nbsp; SUB.&lt;size&gt; Dn,&lt;ea&gt;</dd>
+      <dt>Variants</dt><dd class="mono">SUBA.&lt;size&gt; &lt;ea&gt;,An &nbsp;·&nbsp;
+        SUBI.&lt;size&gt; #&lt;data&gt;,&lt;ea&gt; &nbsp;·&nbsp; SUBQ.&lt;size&gt; #&lt;1-8&gt;,&lt;ea&gt;</dd>
+      <dt>Flags</dt><dd>SUB/SUBI/SUBQ: N/Z/V/C from the difference, X mirrors C. SUBA and
+        SUBQ-against-An: none.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-subx">
+    <h4><code>SUBX</code><span class="name">Subtract With Extend</span></h4>
+    <p class="instr-desc">SUBX is to SUB what ADDX is to ADD — subtracts with the X flag as a
+      borrow-in, for wide subtraction chains.</p>
+    <dl class="instr-meta">
+      <dt>Sizes</dt><dd>Byte, Word, Long</dd>
+      <dt>Syntax</dt><dd class="mono">SUBX.&lt;size&gt; Dy,Dx</dd>
+      <dt>Variant</dt><dd class="mono">SUBX.&lt;size&gt; -(Ay),-(Ax)</dd>
+      <dt>Flags</dt><dd>Same sticky-Z shape as ADDX.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-neg">
+    <h4><code>NEG</code><span class="name">Negate</span></h4>
+    <p class="instr-desc">Replaces a value with its two's-complement negation (0 minus the value).</p>
+    <dl class="instr-meta">
+      <dt>Sizes</dt><dd>Byte, Word, Long</dd>
+      <dt>Syntax</dt><dd class="mono">NEG.&lt;size&gt; &lt;ea&gt;</dd>
+      <dt>Flags</dt><dd>N/Z/V/C as if subtracting the value from 0; X mirrors C.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-negx">
+    <h4><code>NEGX</code><span class="name">Negate With Extend</span></h4>
+    <p class="instr-desc">Real hardware's extend-aware negate (subtracts the value and X from 0),
+      for multi-limb negation chains.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">NEGX.&lt;size&gt; &lt;ea&gt;</dd>
+      <dt>Status</dt><dd class="gap">Not implemented in this core. Executing it crashes the
+        emulator with an unhandled exception rather than trapping gracefully — see the callout
+        above.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-cmp">
+    <h4><code>CMP / CMPA / CMPI</code><span class="name">Compare</span></h4>
+    <p class="instr-desc">Computes destination-minus-source like SUB, but only sets the flags —
+      the operands are left unchanged. Almost always immediately followed by a <code>Bcc</code>.</p>
+    <dl class="instr-meta">
+      <dt>Sizes</dt><dd>Byte, Word, Long (CMPA: Word/Long)</dd>
+      <dt>Syntax</dt><dd class="mono">CMP.&lt;size&gt; &lt;ea&gt;,Dn</dd>
+      <dt>Variants</dt><dd class="mono">CMPA.&lt;size&gt; &lt;ea&gt;,An &nbsp;·&nbsp;
+        CMPI.&lt;size&gt; #&lt;data&gt;,&lt;ea&gt;</dd>
+      <dt>Flags</dt><dd>N/Z/V/C from the subtraction; X is left alone (this is what
+        distinguishes a compare from a real subtract).</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-cmpm">
+    <h4><code>CMPM</code><span class="name">Compare Memory</span></h4>
+    <p class="instr-desc">On real hardware: compares two memory locations, both addressed with
+      postincrement, without modifying either.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">CMPM.&lt;size&gt; (Ay)+,(Ax)+</dd>
+      <dt>Status</dt><dd class="gap">Not decoded as a distinct instruction in this core — its bit
+        pattern is silently misinterpreted as <code>EOR</code> instead, which reads, XORs, and
+        writes back rather than comparing. See the callout above.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-muls">
+    <h4><code>MULU / MULS</code><span class="name">Multiply</span></h4>
+    <p class="instr-desc">Multiplies a 16-bit effective address by a data register's low 16 bits,
+      producing a full 32-bit result — unsigned for MULU, signed for MULS.</p>
+    <dl class="instr-meta">
+      <dt>Sizes</dt><dd>Word source, Long result</dd>
+      <dt>Syntax</dt><dd class="mono">MULU.W &lt;ea&gt;,Dn &nbsp;·&nbsp; MULS.W &lt;ea&gt;,Dn</dd>
+      <dt>Flags</dt><dd>N/Z from the 32-bit result; V/C cleared; X unaffected.</dd>
+      <dt>Notes</dt><dd>Genuinely variable timing — real hardware (and this core) takes longer the
+        more 1-bits the source has, unlike almost everything else in this instruction set, which
+        has a fixed cycle cost.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-divu">
+    <h4><code>DIVU / DIVS</code><span class="name">Divide</span></h4>
+    <p class="instr-desc">Divides a 32-bit dividend in a data register by a 16-bit effective
+      address, leaving the quotient in the low 16 bits and the remainder in the high 16 bits of the
+      same register — unsigned for DIVU, signed for DIVS.</p>
+    <dl class="instr-meta">
+      <dt>Sizes</dt><dd>Long dividend, Word divisor</dd>
+      <dt>Syntax</dt><dd class="mono">DIVU.W &lt;ea&gt;,Dn &nbsp;·&nbsp; DIVS.W &lt;ea&gt;,Dn</dd>
+      <dt>Flags</dt><dd>Normal case: N/Z from the quotient, C cleared, X unaffected. Overflow
+        (quotient too big for 16 bits): N/V forced true, Z forced false, Dn left unmodified.
+        Divide by zero: traps instead of completing, Dn left unmodified.</dd>
+      <dt>Notes</dt><dd>This core uses a flat average-case cycle count (140/158), not real
+        hardware's data-dependent iterative-division timing.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-ext">
+    <h4><code>EXT</code><span class="name">Sign Extend</span></h4>
+    <p class="instr-desc">Extends a smaller signed value already in a register out to fill a
+      bigger one, copying the sign bit into all the new high bits.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">EXT.W Dn &nbsp;<span class="d">; byte → word</span></dd>
+      <dt>Variant</dt><dd class="mono">EXT.L Dn &nbsp;<span class="d">; word → long</span></dd>
+      <dt>Flags</dt><dd>N/Z from the extended result; V/C cleared.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-tst">
+    <h4><code>TST</code><span class="name">Test</span></h4>
+    <p class="instr-desc">Sets flags from a value without modifying it or comparing it to
+      anything else — a plain "is this zero/negative?" check.</p>
+    <dl class="instr-meta">
+      <dt>Sizes</dt><dd>Byte, Word, Long</dd>
+      <dt>Syntax</dt><dd class="mono">TST.&lt;size&gt; &lt;ea&gt;</dd>
+      <dt>Flags</dt><dd>N/Z from the value; V/C cleared; X unaffected.</dd>
+    </dl>
+  </div>
+  </div>
+
+  <div class="instr-group">
+  <h3>Logical</h3>
+
+  <div class="instr" id="m68k-and">
+    <h4><code>AND / ANDI</code><span class="name">Bitwise AND</span></h4>
+    <p class="instr-desc">ANDs an effective address with a data register (either direction), or
+      with an immediate.</p>
+    <dl class="instr-meta">
+      <dt>Sizes</dt><dd>Byte, Word, Long</dd>
+      <dt>Syntax</dt><dd class="mono">AND.&lt;size&gt; &lt;ea&gt;,Dn &nbsp;·&nbsp; AND.&lt;size&gt; Dn,&lt;ea&gt;</dd>
+      <dt>Variant</dt><dd class="mono">ANDI.&lt;size&gt; #&lt;data&gt;,&lt;ea&gt;</dd>
+      <dt>Flags</dt><dd>N/Z from the result; V/C cleared; X unaffected.</dd>
+      <dt>Notes</dt><dd>ANDI also has a special form for combining an immediate directly into the
+        CCR or SR — see System Control.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-or">
+    <h4><code>OR / ORI</code><span class="name">Bitwise OR</span></h4>
+    <p class="instr-desc">Same shape as AND/ANDI, for bitwise OR.</p>
+    <dl class="instr-meta">
+      <dt>Sizes</dt><dd>Byte, Word, Long</dd>
+      <dt>Syntax</dt><dd class="mono">OR.&lt;size&gt; &lt;ea&gt;,Dn &nbsp;·&nbsp; OR.&lt;size&gt; Dn,&lt;ea&gt;</dd>
+      <dt>Variant</dt><dd class="mono">ORI.&lt;size&gt; #&lt;data&gt;,&lt;ea&gt;</dd>
+      <dt>Flags</dt><dd>N/Z from the result; V/C cleared.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-eor">
+    <h4><code>EOR / EORI</code><span class="name">Bitwise Exclusive OR</span></h4>
+    <p class="instr-desc">Same idea again for XOR — note EOR only ever writes into an effective
+      address from a data register (there's no "EA into Dn" direction, unlike AND/OR).</p>
+    <dl class="instr-meta">
+      <dt>Sizes</dt><dd>Byte, Word, Long</dd>
+      <dt>Syntax</dt><dd class="mono">EOR.&lt;size&gt; Dn,&lt;ea&gt;</dd>
+      <dt>Variant</dt><dd class="mono">EORI.&lt;size&gt; #&lt;data&gt;,&lt;ea&gt;</dd>
+      <dt>Flags</dt><dd>N/Z from the result; V/C cleared.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-not">
+    <h4><code>NOT</code><span class="name">Bitwise Complement</span></h4>
+    <p class="instr-desc">Flips every bit of a value.</p>
+    <dl class="instr-meta">
+      <dt>Sizes</dt><dd>Byte, Word, Long</dd>
+      <dt>Syntax</dt><dd class="mono">NOT.&lt;size&gt; &lt;ea&gt;</dd>
+      <dt>Flags</dt><dd>N/Z from the result; V/C cleared.</dd>
+    </dl>
+  </div>
+  </div>
+
+  <div class="instr-group">
+  <h3>Binary-coded decimal</h3>
+  <p>These operate on packed BCD — a byte holding two decimal digits, one per nibble — for doing
+    decimal arithmetic (e.g. a score display) without manual digit-by-digit correction.</p>
+
+  <div class="instr" id="m68k-abcd">
+    <h4><code>ABCD</code><span class="name">Add Decimal With Extend</span></h4>
+    <p class="instr-desc">Adds two packed-BCD bytes plus the X carry-in, keeping the result valid
+      BCD.</p>
+    <dl class="instr-meta">
+      <dt>Sizes</dt><dd>Byte only</dd>
+      <dt>Syntax</dt><dd class="mono">ABCD Dy,Dx</dd>
+      <dt>Variant</dt><dd class="mono">ABCD -(Ay),-(Ax)</dd>
+      <dt>Flags</dt><dd>C/X = carry out. Z is sticky, same shape as ADDX. N is set from the
+        result's top bit, though the manual doesn't formally define its meaning for BCD. V is
+        left alone (officially undefined).</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-sbcd">
+    <h4><code>SBCD</code><span class="name">Subtract Decimal With Extend</span></h4>
+    <p class="instr-desc">The BCD subtraction mirror of ABCD.</p>
+    <dl class="instr-meta">
+      <dt>Sizes</dt><dd>Byte only</dd>
+      <dt>Syntax</dt><dd class="mono">SBCD Dy,Dx</dd>
+      <dt>Variant</dt><dd class="mono">SBCD -(Ay),-(Ax)</dd>
+      <dt>Flags</dt><dd>Same shape as ABCD, borrow instead of carry.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-nbcd">
+    <h4><code>NBCD</code><span class="name">Negate Decimal</span></h4>
+    <p class="instr-desc">Real hardware's packed-BCD negate.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">NBCD &lt;ea&gt;</dd>
+      <dt>Status</dt><dd class="gap">Not implemented in this core, for the same reason as NEGX —
+        see the callout above.</dd>
+    </dl>
+  </div>
+  </div>
+
+  <div class="instr-group">
+  <h3>Shift and rotate</h3>
+  <p>Each of these has a register form (shift by an immediate count of 1-8, or by whatever count is
+    in another register) and a memory form (always word-sized, always shifts by exactly 1 bit).</p>
+
+  <div class="instr" id="m68k-asl">
+    <h4><code>ASL / ASR</code><span class="name">Arithmetic Shift</span></h4>
+    <p class="instr-desc">Shifts bits left or right. Right shifts preserve the sign bit
+      (arithmetic = signed-friendly); left shifts are identical to LSL.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">ASL.&lt;size&gt; #&lt;count&gt;,Dn &nbsp;·&nbsp; ASL.&lt;size&gt; Dn,Dn &nbsp;·&nbsp; ASL &lt;ea&gt;</dd>
+      <dt>Variant</dt><dd class="mono">ASR (same syntax shapes)</dd>
+      <dt>Flags</dt><dd>N/Z from the result. C/X = the last bit shifted out. ASL's V is set if
+        the sign bit ever changed value partway through the shift (true overflow detection, not
+        just "differs from the original"); ASR's V is always cleared.</dd>
+      <dt>Notes</dt><dd>A register-form shift with a computed count of zero leaves the value and X
+        completely unchanged (only C/V are cleared) — the one case where these instructions don't
+        touch the data at all.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-lsl">
+    <h4><code>LSL / LSR</code><span class="name">Logical Shift</span></h4>
+    <p class="instr-desc">Same syntax shapes as ASL/ASR, but always fills the vacated bit with 0
+      regardless of direction — the "unsigned" shift.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">LSL.&lt;size&gt; ... &nbsp;·&nbsp; LSR.&lt;size&gt; ...</dd>
+      <dt>Flags</dt><dd>N/Z from the result; V always cleared; C/X = the last bit shifted out.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-rol">
+    <h4><code>ROL / ROR</code><span class="name">Rotate</span></h4>
+    <p class="instr-desc">Rotates bits around, with the bit that falls off one end wrapping back
+      onto the other. Doesn't involve the X flag at all.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">ROL.&lt;size&gt; ... &nbsp;·&nbsp; ROR.&lt;size&gt; ...</dd>
+      <dt>Flags</dt><dd>N/Z from the result; V always cleared; C = the bit that wrapped around;
+        X explicitly untouched.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-roxl">
+    <h4><code>ROXL / ROXR</code><span class="name">Rotate Through Extend</span></h4>
+    <p class="instr-desc">Like ROL/ROR, but the X flag participates in the rotation as an extra
+      33rd bit — the bit that falls off goes into both C and X, and (unlike plain rotate) chaining
+      several of these lets you rotate a value wider than 32 bits.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">ROXL.&lt;size&gt; ... &nbsp;·&nbsp; ROXR.&lt;size&gt; ...</dd>
+      <dt>Flags</dt><dd>N/Z from the result; V always cleared; C and X both set to the bit that
+        rotated through.</dd>
+    </dl>
+  </div>
+  </div>
+
+  <div class="instr-group">
+  <h3>Bit manipulation</h3>
+  <p>All four instructions here test one bit first (always setting Z from it) and then, except for
+    BTST, also modify it.</p>
+
+  <div class="instr" id="m68k-btst">
+    <h4><code>BTST</code><span class="name">Test Bit</span></h4>
+    <p class="instr-desc">Tests a single bit without modifying anything.</p>
+    <dl class="instr-meta">
+      <dt>Sizes</dt><dd>Long (against a data register — the bit number wraps mod 32), Byte
+        (against memory — wraps mod 8)</dd>
+      <dt>Syntax</dt><dd class="mono">BTST Dn,&lt;ea&gt;</dd>
+      <dt>Variant</dt><dd class="mono">BTST #&lt;bit&gt;,&lt;ea&gt;</dd>
+      <dt>Flags</dt><dd>Z = 1 if the tested bit was 0, else 0. N/V/C/X untouched.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-bchg">
+    <h4><code>BCHG</code><span class="name">Test and Change Bit</span></h4>
+    <p class="instr-desc">Tests a bit like BTST, then toggles it.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">BCHG Dn,&lt;ea&gt;</dd>
+      <dt>Variant</dt><dd class="mono">BCHG #&lt;bit&gt;,&lt;ea&gt;</dd>
+      <dt>Flags</dt><dd>Z, same rule as BTST.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-bclr">
+    <h4><code>BCLR</code><span class="name">Test and Clear Bit</span></h4>
+    <p class="instr-desc">Tests a bit, then forces it to 0.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">BCLR Dn,&lt;ea&gt;</dd>
+      <dt>Variant</dt><dd class="mono">BCLR #&lt;bit&gt;,&lt;ea&gt;</dd>
+      <dt>Flags</dt><dd>Z, same rule as BTST.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-bset">
+    <h4><code>BSET</code><span class="name">Test and Set Bit</span></h4>
+    <p class="instr-desc">Tests a bit, then forces it to 1.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">BSET Dn,&lt;ea&gt;</dd>
+      <dt>Variant</dt><dd class="mono">BSET #&lt;bit&gt;,&lt;ea&gt;</dd>
+      <dt>Flags</dt><dd>Z, same rule as BTST.</dd>
+    </dl>
+  </div>
+  </div>
+
+  <div class="instr-group">
+  <h3>Program control</h3>
+
+  <div class="instr" id="m68k-bcc">
+    <h4><code>Bcc</code><span class="name">Branch Conditionally</span></h4>
+    <p class="instr-desc">Jumps to a nearby PC-relative address if the named condition (from the
+      table above) is true.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">Bcc &lt;label&gt;</dd>
+      <dt>Flags</dt><dd>None (reads flags, doesn't change them).</dd>
+      <dt>Example</dt><dd class="mono">CMP.W #10,D0 \ BEQ done  ; jump if D0 == 10</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-bra">
+    <h4><code>BRA</code><span class="name">Branch Always</span></h4>
+    <p class="instr-desc">Unconditional jump to a nearby PC-relative address — the plain "goto."</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">BRA &lt;label&gt;</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-bsr">
+    <h4><code>BSR</code><span class="name">Branch to Subroutine</span></h4>
+    <p class="instr-desc">Like BRA, but first pushes the return address — the PC-relative call
+      instruction.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">BSR &lt;label&gt;</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-dbcc">
+    <h4><code>DBcc</code><span class="name">Decrement and Branch</span></h4>
+    <p class="instr-desc">A combined loop-counter-and-branch: if the condition is already true,
+      falls through without touching the counter; otherwise decrements the counter's low word and
+      loops back unless it just wrapped from 0 to -1. <code>DBRA</code> (condition = False) is the
+      common "loop exactly N times" idiom.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">DBcc Dn,&lt;label&gt;</dd>
+      <dt>Flags</dt><dd>None.</dd>
+      <dt>Example</dt><dd class="mono">MOVE.W #9,D0 \ loop: ... \ DBRA D0,loop  ; runs 10 times</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-scc">
+    <h4><code>Scc</code><span class="name">Set Conditionally</span></h4>
+    <p class="instr-desc">Sets a byte to all-1s if the condition is true, all-0s if false — turns a
+      flag test into a plain boolean byte, without branching.</p>
+    <dl class="instr-meta">
+      <dt>Sizes</dt><dd>Byte only</dd>
+      <dt>Syntax</dt><dd class="mono">Scc &lt;ea&gt;</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-jmp">
+    <h4><code>JMP</code><span class="name">Jump</span></h4>
+    <p class="instr-desc">Unconditional jump to a computed address — unlike BRA, the target can be
+      anywhere addressable, not just PC-relative.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">JMP &lt;ea&gt;</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-jsr">
+    <h4><code>JSR</code><span class="name">Jump to Subroutine</span></h4>
+    <p class="instr-desc">Like JMP, but pushes a return address first — the general-purpose call
+      instruction.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">JSR &lt;ea&gt;</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-rts">
+    <h4><code>RTS</code><span class="name">Return from Subroutine</span></h4>
+    <p class="instr-desc">Pops a return address and jumps to it — pairs with BSR/JSR.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">RTS</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-rtr">
+    <h4><code>RTR</code><span class="name">Return and Restore</span></h4>
+    <p class="instr-desc">Like RTS, but also pops a byte into the CCR first — restores the flags a
+      subroutine saved on entry, then returns.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">RTR</dd>
+      <dt>Flags</dt><dd>X/N/Z/V/C replaced from the popped byte.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-chk">
+    <h4><code>CHK</code><span class="name">Check Register Against Bounds</span></h4>
+    <p class="instr-desc">Bounds-checks a data register's low word against the range [0, ea];
+      traps if it's negative or too large — a compact array-index safety check.</p>
+    <dl class="instr-meta">
+      <dt>Sizes</dt><dd>Word</dd>
+      <dt>Syntax</dt><dd class="mono">CHK &lt;ea&gt;,Dn</dd>
+      <dt>Flags</dt><dd>N set true if Dn was negative, false if too large; Z/V/C left alone either
+        way (undefined by the manual).</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-trap">
+    <h4><code>TRAP</code><span class="name">Software Trap</span></h4>
+    <p class="instr-desc">Unconditionally raises one of 16 software-selectable exception
+      vectors — a general-purpose "call into the operating system/BIOS" mechanism.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">TRAP #&lt;0-15&gt;</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-trapv">
+    <h4><code>TRAPV</code><span class="name">Trap on Overflow</span></h4>
+    <p class="instr-desc">Traps only if V is set; otherwise does nothing — a way to check for
+      signed-arithmetic overflow after the fact without an explicit branch.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">TRAPV</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-illegal">
+    <h4><code>ILLEGAL</code><span class="name">Illegal Instruction</span></h4>
+    <p class="instr-desc">Deliberately traps — some real ROMs (including Sonic 1) execute this
+      opcode on purpose as a "this code path should never run" guard.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">ILLEGAL</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-link">
+    <h4><code>LINK / UNLK</code><span class="name">Link and Unlink</span></h4>
+    <p class="instr-desc">The standard stack-frame setup/teardown pair: LINK pushes an address
+      register, points it at the new stack top, then reserves some local-variable space below it;
+      UNLK reverses all of that in one step.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">LINK An,#&lt;disp&gt;</dd>
+      <dt>Variant</dt><dd class="mono">UNLK An</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+  </div>
+
+  <div class="instr-group">
+  <h3>System control</h3>
+
+  <div class="instr" id="m68k-nop">
+    <h4><code>NOP</code><span class="name">No Operation</span></h4>
+    <p class="instr-desc">Does nothing.</p>
+    <dl class="instr-meta"><dt>Flags</dt><dd>None.</dd></dl>
+  </div>
+
+  <div class="instr" id="m68k-tas">
+    <h4><code>TAS</code><span class="name">Test and Set</span></h4>
+    <p class="instr-desc">Reads a byte, sets flags from it like TST, then unconditionally forces
+      its top bit to 1 and writes it back — a classic multi-processor mutex primitive (on real
+      hardware, done as one uninterruptible bus cycle).</p>
+    <dl class="instr-meta">
+      <dt>Sizes</dt><dd>Byte only</dd>
+      <dt>Syntax</dt><dd class="mono">TAS &lt;ea&gt;</dd>
+      <dt>Flags</dt><dd>N/Z from the value <em>before</em> the top bit is forced; V/C cleared.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-reset">
+    <h4><code>RESET</code><span class="name">Reset External Devices</span></h4>
+    <p class="instr-desc">Pulses a reset signal to external hardware — the CPU's own registers are
+      untouched. Privileged.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">RESET</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-rte">
+    <h4><code>RTE</code><span class="name">Return from Exception</span></h4>
+    <p class="instr-desc">Pops the status register and then the program counter — how every
+      interrupt/trap handler ends. Privileged on real hardware.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">RTE</dd>
+      <dt>Flags</dt><dd>The entire SR is replaced from the stack.</dd>
+      <dt>Notes</dt><dd class="gap">This core does not check supervisor privilege before allowing
+        RTE — a known, low-impact gap (real Genesis code essentially never leaves supervisor
+        mode).</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-stop">
+    <h4><code>STOP</code><span class="name">Stop</span></h4>
+    <p class="instr-desc">Loads a new value into the status register, then halts fetching further
+      instructions until an interrupt arrives. Privileged.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">STOP #&lt;data&gt;</dd>
+      <dt>Flags</dt><dd>The entire SR is replaced by the immediate value.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-movesr">
+    <h4><code>MOVE to/from SR, MOVE to CCR</code><span class="name">Move Status Register</span></h4>
+    <p class="instr-desc">Reads or replaces the status register (privileged both ways on this
+      chip) or just its low byte, the condition-code register (not privileged).</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">MOVE.W &lt;ea&gt;,SR &nbsp;·&nbsp; MOVE.W SR,&lt;ea&gt;
+        &nbsp;·&nbsp; MOVE.W &lt;ea&gt;,CCR</dd>
+      <dt>Flags</dt><dd>Replaced wholesale by the "to SR"/"to CCR" forms; unaffected by "from SR".</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-moveusp">
+    <h4><code>MOVE USP</code><span class="name">Move User Stack Pointer</span></h4>
+    <p class="instr-desc">Copies between an address register and the shadow user-mode stack
+      pointer. Privileged.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">MOVE An,USP &nbsp;·&nbsp; MOVE USP,An</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="m68k-andisr">
+    <h4><code>ANDI/ORI/EORI to CCR/SR</code><span class="name">Combine Immediate into Status</span></h4>
+    <p class="instr-desc">Combines an immediate value bitwise into the flags (CCR form) or the
+      whole status register (SR form, privileged) — used to clear or set specific flag bits
+      without disturbing the others, e.g. <code>ANDI #$FE,CCR</code> to clear just the carry flag.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">ANDI.B #&lt;data&gt;,CCR &nbsp;·&nbsp; ANDI.W #&lt;data&gt;,SR
+        (also ORI/EORI)</dd>
+      <dt>Flags</dt><dd>Combined directly into the flag bits.</dd>
+    </dl>
+  </div>
+  </div>
+</section>
+
+<section id="instr-z80">
+  <h2><span class="num">14</span> Z80 instruction reference</h2>
+  <p class="section-intro">
+    The sound CPU's instruction set. The Z80 is 8-bit at heart (its "16-bit" operations are really
+    pairs of 8-bit registers used together), and its instructions are encoded as 1, 2, or 4 bytes —
+    some opcodes need a prefix byte (<code>CB</code>, <code>ED</code>, <code>DD</code>, or
+    <code>FD</code>) before the real opcode. You don't need to know the byte encoding to read this
+    reference, just the assembly mnemonics.
+  </p>
+
+  <h3>Registers</h3>
+  <p>
+    Six general 8-bit registers — <code>B C D E H L</code> — usable individually or paired up as
+    16-bit values (<code>BC</code>, <code>DE</code>, <code>HL</code>), an 8-bit accumulator
+    <code>A</code> with its paired flags register <code>F</code>, and two 16-bit index registers
+    <code>IX</code>/<code>IY</code> mainly used for indexed memory access. Unusually, the whole
+    register file except IX/IY/SP/PC is <strong>duplicated</strong>: a hidden shadow set
+    (<code>A' F' B' C' D' E' H' L'</code>) can be swapped in wholesale with <code>EX AF,AF'</code>
+    and <code>EXX</code> — real Z80 code sometimes uses the shadow set as a fast alternative to
+    pushing/popping registers around an interrupt handler.
+  </p>
+
+  <h3>How to read this section — addressing modes</h3>
+  <div class="addr-modes">
+    <span class="m">r</span><span class="d">Register direct — B, C, D, E, H, L, or A.</span>
+    <span class="m">(HL)</span><span class="d">Register indirect — memory at the address in HL. In most instruction grids, this slots in everywhere a plain register r could go.</span>
+    <span class="m">(BC) / (DE)</span><span class="d">Register indirect through BC or DE — used only by a handful of dedicated load instructions.</span>
+    <span class="m">(IX+d) / (IY+d)</span><span class="d">Indexed — an index register plus a signed 8-bit displacement byte gives the memory address.</span>
+    <span class="m">(nn)</span><span class="d">Extended/absolute — a 16-bit address written directly in the instruction.</span>
+    <span class="m">n / nn</span><span class="d">Immediate — an 8-bit or 16-bit constant written directly in the instruction.</span>
+    <span class="m">e</span><span class="d">Relative — a signed 8-bit displacement added to PC, used only by JR/DJNZ/JR cc.</span>
+    <span class="m">implied</span><span class="d">The operand is fixed by the instruction itself (A, SP, the flags, I, R).</span>
+  </div>
+
+  <div class="callout confidence">
+    <span class="tag">How (IX+d)/(IY+d) indexing actually works in this core</span>
+    <p>
+      Rather than duplicating every opcode table for IX and IY, this core keeps one table and
+      redirects: whenever a <code>DD</code> or <code>FD</code> prefix is seen, every place that
+      would normally read or write <code>(HL)</code> — or use <code>HL</code> as a 16-bit pair —
+      transparently uses <code>(IX+d)</code>/<code>IX</code> (or the IY equivalents) instead. This
+      is why you'll see instructions below described once (e.g. "ADD HL,rr") that in practice also
+      exist as <code>ADD IX,rr</code> and <code>ADD IY,rr</code> forms.
+    </p>
+  </div>
+
+  <h3>Flags register (F)</h3>
+  <div class="addr-modes">
+    <span class="m">S</span><span class="d">Sign — copies the result's top bit.</span>
+    <span class="m">Z</span><span class="d">Zero — set if the result was zero.</span>
+    <span class="m">H</span><span class="d">Half-carry — carry/borrow out of bit 3, used internally by DAA for BCD correction.</span>
+    <span class="m">P/V</span><span class="d">Parity or Overflow, depending on the instruction — parity (even number of 1 bits) for logic ops, signed overflow for arithmetic.</span>
+    <span class="m">N</span><span class="d">Add/Subtract — records which kind of operation last ran, so DAA knows which correction to apply.</span>
+    <span class="m">C</span><span class="d">Carry — set if an unsigned result didn't fit.</span>
+    <span class="m">3 / 5 (undocumented)</span><span class="d">Two "leftover" bits with no official meaning, but real software occasionally depends on their well-known (if undocumented) behavior of mirroring bits 3/5 of whatever value was last handled. This core approximates them rather than reproducing every hardware corner case exactly.</span>
+  </div>
+
+  <div class="instr-group">
+  <h3>8-bit load</h3>
+
+  <div class="instr" id="z80-ldrr">
+    <h4><code>LD r,r'</code><span class="name">Load Register</span></h4>
+    <p class="instr-desc">Copies one register into another. With one side written as
+      <code>(HL)</code>, this is also how you read from or write to memory a byte at a time — and
+      under a DD/FD prefix, becomes a load through <code>(IX+d)</code>/<code>(IY+d)</code> instead.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">LD r,r'</dd>
+      <dt>Variants</dt><dd class="mono">LD r,(HL) &nbsp;·&nbsp; LD (HL),r</dd>
+      <dt>Flags</dt><dd>None.</dd>
+      <dt>Example</dt><dd class="mono">LD A,(HL)  ; A = the byte HL points at</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="z80-ldrn">
+    <h4><code>LD r,n</code><span class="name">Load Immediate</span></h4>
+    <p class="instr-desc">Loads an 8-bit constant into a register, or stores one straight into
+      memory at <code>(HL)</code>.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">LD r,n</dd>
+      <dt>Variant</dt><dd class="mono">LD (HL),n</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="z80-ldabc">
+    <h4><code>LD A,(BC) / LD A,(DE) / LD A,(nn)</code><span class="name">Load A from Memory</span></h4>
+    <p class="instr-desc">Three dedicated forms for loading the accumulator specifically — through
+      BC, through DE, or from a fixed 16-bit address.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">LD A,(BC) &nbsp;·&nbsp; LD A,(DE) &nbsp;·&nbsp; LD A,(nn)</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="z80-ldbca">
+    <h4><code>LD (BC),A / LD (DE),A / LD (nn),A</code><span class="name">Store A to Memory</span></h4>
+    <p class="instr-desc">The store-direction counterparts to the loads above.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">LD (BC),A &nbsp;·&nbsp; LD (DE),A &nbsp;·&nbsp; LD (nn),A</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="z80-ldai">
+    <h4><code>LD A,I / LD A,R</code><span class="name">Load A from a Special Register</span></h4>
+    <p class="instr-desc">Copies the interrupt-vector register (I) or memory-refresh register (R)
+      into A — one of the only places these instructions set flags from a plain load.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">LD A,I &nbsp;·&nbsp; LD A,R</dd>
+      <dt>Flags</dt><dd>S/Z from the value, H=0, N=0, P/V = the current interrupt-enable state
+        (IFF2), 3/5 from the value.</dd>
+      <dt>Notes</dt><dd>This core's R register increments once per instruction rather than once
+        per opcode-fetch (M1) cycle — a known simplification that only matters to code reading R
+        as a source of timing/entropy.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="z80-ldia">
+    <h4><code>LD I,A / LD R,A</code><span class="name">Store A to a Special Register</span></h4>
+    <p class="instr-desc">The store-direction counterparts to LD A,I / LD A,R.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">LD I,A &nbsp;·&nbsp; LD R,A</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+  </div>
+
+  <div class="instr-group">
+  <h3>16-bit load</h3>
+
+  <div class="instr" id="z80-lddnn">
+    <h4><code>LD dd,nn</code><span class="name">Load Register Pair Immediate</span></h4>
+    <p class="instr-desc">Loads a 16-bit constant into a register pair (or SP, or under a prefix,
+      IX/IY).</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">LD BC/DE/HL/SP,nn</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="z80-ldhlnn">
+    <h4><code>LD HL,(nn) / LD (nn),HL</code><span class="name">Load/Store 16-bit via Address</span></h4>
+    <p class="instr-desc">Loads or stores a register pair as two consecutive memory bytes at a
+      fixed 16-bit address. An ED-prefixed variant exists that works with BC/DE/SP too, not just HL.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">LD HL,(nn) &nbsp;·&nbsp; LD (nn),HL</dd>
+      <dt>Variant</dt><dd class="mono">LD BC/DE/HL/SP,(nn) &nbsp;·&nbsp; LD (nn),BC/DE/HL/SP</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="z80-ldsphl">
+    <h4><code>LD SP,HL</code><span class="name">Load Stack Pointer</span></h4>
+    <p class="instr-desc">Copies a register pair (HL, or IX/IY under a prefix) into SP.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">LD SP,HL</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="z80-push">
+    <h4><code>PUSH / POP</code><span class="name">Push/Pop Register Pair</span></h4>
+    <p class="instr-desc">The stack primitives: PUSH decrements SP by 2 and stores a register
+      pair; POP loads a pair back and advances SP by 2.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">PUSH BC/DE/HL/AF &nbsp;·&nbsp; POP BC/DE/HL/AF</dd>
+      <dt>Flags</dt><dd>None for BC/DE/HL. <code>POP AF</code> loads F directly, so the flags
+        become whatever was on the stack.</dd>
+    </dl>
+  </div>
+  </div>
+
+  <div class="instr-group">
+  <h3>Exchange, block transfer, and block search</h3>
+
+  <div class="instr" id="z80-ex">
+    <h4><code>EX / EXX</code><span class="name">Exchange</span></h4>
+    <p class="instr-desc">EX AF,AF' swaps A/F with the shadow pair. EXX swaps BC/DE/HL with their
+      shadow registers all at once (AF is untouched by EXX — it has its own separate swap). EX
+      DE,HL swaps two visible registers directly, and EX (SP),HL swaps a register pair with the two
+      bytes on top of the stack — a classic (if obscure) trick for manipulating a return address.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">EX AF,AF' &nbsp;·&nbsp; EXX &nbsp;·&nbsp; EX DE,HL
+        &nbsp;·&nbsp; EX (SP),HL</dd>
+      <dt>Flags</dt><dd>EX AF,AF' swaps the flags along with A; the others: none.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="z80-ldi">
+    <h4><code>LDI / LDD</code><span class="name">Load and Increment/Decrement</span></h4>
+    <p class="instr-desc">Copies one byte from <code>(HL)</code> to <code>(DE)</code>, then
+      advances (LDI) or retreats (LDD) both HL and DE, and decrements BC — the building block of a
+      block-memory copy, one byte per instruction.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">LDI &nbsp;·&nbsp; LDD</dd>
+      <dt>Flags</dt><dd>H=0, N=0, P/V = (BC≠0 after decrementing). S/Z/C unaffected.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="z80-ldir">
+    <h4><code>LDIR / LDDR</code><span class="name">Repeating Block Load</span></h4>
+    <p class="instr-desc">Repeats LDI/LDD automatically until BC reaches zero — the standard
+      "memcpy" idiom, one instruction doing an entire block copy.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">LDIR &nbsp;·&nbsp; LDDR</dd>
+      <dt>Flags</dt><dd>Same as LDI/LDD (P/V ends up 0, since it stops exactly when BC hits 0).</dd>
+      <dt>Example</dt><dd class="mono">LD HL,src \ LD DE,dst \ LD BC,len \ LDIR</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="z80-cpi">
+    <h4><code>CPI / CPD</code><span class="name">Compare and Increment/Decrement</span></h4>
+    <p class="instr-desc">Compares A against <code>(HL)</code> (like CP), then advances (CPI) or
+      retreats (CPD) HL and decrements BC — the building block of a linear search.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">CPI &nbsp;·&nbsp; CPD</dd>
+      <dt>Flags</dt><dd>S/H from the comparison, N=1, P/V = (BC≠0 after decrementing).</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="z80-cpir">
+    <h4><code>CPIR / CPDR</code><span class="name">Repeating Block Search</span></h4>
+    <p class="instr-desc">Repeats CPI/CPD until either BC reaches zero or a match is found — the
+      standard "find a byte in a buffer" idiom.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">CPIR &nbsp;·&nbsp; CPDR</dd>
+      <dt>Flags</dt><dd>Same as CPI/CPD.</dd>
+    </dl>
+  </div>
+  </div>
+
+  <div class="instr-group">
+  <h3>8-bit arithmetic and logic</h3>
+
+  <div class="instr" id="z80-add8">
+    <h4><code>ADD A,s / ADC A,s</code><span class="name">Add (With Carry)</span></h4>
+    <p class="instr-desc">Adds a value to the accumulator; ADC additionally adds the incoming
+      carry, for wide-addition chains.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">ADD A,r/(HL)/(IX+d)/(IY+d)/n</dd>
+      <dt>Variant</dt><dd class="mono">ADC A,s (same operand shapes)</dd>
+      <dt>Flags</dt><dd>S/Z/H/P(overflow)/C from the sum; N=0.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="z80-sub8">
+    <h4><code>SUB s / SBC A,s</code><span class="name">Subtract (With Carry)</span></h4>
+    <p class="instr-desc">Subtracts a value from A; SBC additionally subtracts the incoming carry
+      (as a borrow).</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">SUB r/(HL)/(IX+d)/(IY+d)/n</dd>
+      <dt>Variant</dt><dd class="mono">SBC A,s (same operand shapes)</dd>
+      <dt>Flags</dt><dd>S/Z/H/P(overflow)/C from the difference; N=1.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="z80-and8">
+    <h4><code>AND / OR / XOR</code><span class="name">Bitwise Logic</span></h4>
+    <p class="instr-desc">ANDs, ORs, or XORs a value into the accumulator.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">AND/OR/XOR r/(HL)/(IX+d)/(IY+d)/n</dd>
+      <dt>Flags</dt><dd>S/Z/P(parity) from the result; N=0, C=0. AND additionally always sets H=1;
+        OR/XOR clear it.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="z80-cp">
+    <h4><code>CP</code><span class="name">Compare</span></h4>
+    <p class="instr-desc">Like SUB, but discards the result — only the flags matter. Almost always
+      followed by a conditional jump.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">CP r/(HL)/(IX+d)/(IY+d)/n</dd>
+      <dt>Flags</dt><dd>Same as SUB.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="z80-inc8">
+    <h4><code>INC r / DEC r</code><span class="name">Increment/Decrement</span></h4>
+    <p class="instr-desc">Adds or subtracts 1 from a register or <code>(HL)</code>.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">INC r/(HL)/(IX+d)/(IY+d)</dd>
+      <dt>Variant</dt><dd class="mono">DEC (same operand shapes)</dd>
+      <dt>Flags</dt><dd>S/Z/H/P(overflow) from the result; N=0 for INC, N=1 for DEC. <strong>C is
+        never touched</strong> by either — the one arithmetic instruction pair that leaves carry
+        completely alone, useful for adjusting a loop counter without disturbing a
+        carry you're tracking separately.</dd>
+    </dl>
+  </div>
+  </div>
+
+  <div class="instr-group">
+  <h3>General-purpose arithmetic and CPU control</h3>
+
+  <div class="instr" id="z80-daa">
+    <h4><code>DAA</code><span class="name">Decimal Adjust A</span></h4>
+    <p class="instr-desc">Corrects A after a BCD add/subtract so it holds a valid two-digit
+      packed-decimal result, using the H and N flags to know what kind of correction to apply.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">DAA</dd>
+      <dt>Flags</dt><dd>C/H from the correction; S/Z/P(parity) from the adjusted A; N unaffected.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="z80-cpl">
+    <h4><code>CPL</code><span class="name">Complement A</span></h4>
+    <p class="instr-desc">Flips every bit of the accumulator.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">CPL</dd>
+      <dt>Flags</dt><dd>H=1, N=1; S/Z/P/C unaffected.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="z80-neg">
+    <h4><code>NEG</code><span class="name">Negate A</span></h4>
+    <p class="instr-desc">Replaces A with its two's-complement negation (0 minus A).</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">NEG</dd>
+      <dt>Flags</dt><dd>Full subtract-flag set, as if computing 0 − A.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="z80-ccf">
+    <h4><code>CCF / SCF</code><span class="name">Complement/Set Carry</span></h4>
+    <p class="instr-desc">CCF flips the carry flag; SCF forces it to 1.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">CCF &nbsp;·&nbsp; SCF</dd>
+      <dt>Flags</dt><dd>CCF: C = !C, H = old C, N=0. SCF: C=1, H=0, N=0. Both leave S/Z/P alone.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="z80-nop">
+    <h4><code>NOP</code><span class="name">No Operation</span></h4>
+    <p class="instr-desc">Does nothing for one instruction's worth of time.</p>
+    <dl class="instr-meta"><dt>Flags</dt><dd>None.</dd></dl>
+  </div>
+
+  <div class="instr" id="z80-halt">
+    <h4><code>HALT</code><span class="name">Halt</span></h4>
+    <p class="instr-desc">Stops executing new instructions and idles until an interrupt arrives.</p>
+    <dl class="instr-meta"><dt>Flags</dt><dd>None.</dd></dl>
+  </div>
+
+  <div class="instr" id="z80-di">
+    <h4><code>DI / EI</code><span class="name">Disable/Enable Interrupts</span></h4>
+    <p class="instr-desc">Turns maskable interrupts off (DI) or back on (EI).</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">DI &nbsp;·&nbsp; EI</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="z80-im">
+    <h4><code>IM 0 / IM 1 / IM 2</code><span class="name">Set Interrupt Mode</span></h4>
+    <p class="instr-desc">Selects how a maskable interrupt is serviced. The Genesis's own sound
+      driver uses IM 1, which always jumps to a single fixed address — the simplest of the three.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">IM 0 &nbsp;·&nbsp; IM 1 &nbsp;·&nbsp; IM 2</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+  </div>
+
+  <div class="instr-group">
+  <h3>16-bit arithmetic</h3>
+
+  <div class="instr" id="z80-addhl">
+    <h4><code>ADD HL,ss</code><span class="name">Add to HL</span></h4>
+    <p class="instr-desc">Adds a register pair to HL (or, under a DD/FD prefix, to IX/IY).
+      Notably leaves S/Z/P alone — the one 16-bit add that doesn't touch them, which is what
+      distinguishes it from the ED-prefixed ADC HL,ss below.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">ADD HL,BC/DE/HL/SP</dd>
+      <dt>Flags</dt><dd>H, N=0, C from the addition; S/Z/P explicitly unaffected.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="z80-adchl">
+    <h4><code>ADC HL,ss / SBC HL,ss</code><span class="name">Add/Subtract to HL With Carry</span></h4>
+    <p class="instr-desc">Like ADD HL,ss, but includes the carry flag and — unlike plain
+      ADD HL,ss — updates every flag, making this the one that behaves like a normal full-width
+      arithmetic instruction.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">ADC HL,BC/DE/HL/SP</dd>
+      <dt>Variant</dt><dd class="mono">SBC HL,BC/DE/HL/SP</dd>
+      <dt>Flags</dt><dd>S/Z/H/P(overflow)/C from the result; N=0 (ADC) or N=1 (SBC).</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="z80-incss">
+    <h4><code>INC ss / DEC ss</code><span class="name">Increment/Decrement Pair</span></h4>
+    <p class="instr-desc">Adds or subtracts 1 from a whole register pair (or SP, or IX/IY).</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">INC BC/DE/HL/SP</dd>
+      <dt>Variant</dt><dd class="mono">DEC (same operand shapes)</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+  </div>
+
+  <div class="instr-group">
+  <h3>Rotate and shift</h3>
+
+  <div class="instr" id="z80-rlca">
+    <h4><code>RLCA / RRCA</code><span class="name">Rotate A Circularly</span></h4>
+    <p class="instr-desc">Rotates the accumulator left or right, with the bit that falls off
+      wrapping into carry (and back into the register).</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">RLCA &nbsp;·&nbsp; RRCA</dd>
+      <dt>Flags</dt><dd>C = the bit rotated out; H=0, N=0; S/Z/P unaffected.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="z80-rla">
+    <h4><code>RLA / RRA</code><span class="name">Rotate A Through Carry</span></h4>
+    <p class="instr-desc">Like RLCA/RRCA, but the carry flag participates as a 9th bit — the old
+      carry feeds into the register, and the bit that falls off becomes the new carry.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">RLA &nbsp;·&nbsp; RRA</dd>
+      <dt>Flags</dt><dd>C = the bit rotated out; H=0, N=0; S/Z/P unaffected.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="z80-rlc">
+    <h4><code>RLC / RRC / RL / RR r</code><span class="name">Rotate Register</span></h4>
+    <p class="instr-desc">The general-purpose versions of RLCA/RRCA/RLA/RRA — same four rotations,
+      but usable on any register or memory location, and (unlike the accumulator-only forms above)
+      these do set S/Z/P from the result.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">RLC/RRC/RL/RR r/(HL)/(IX+d)/(IY+d)</dd>
+      <dt>Flags</dt><dd>C = the bit rotated out; H=0, N=0; S/Z/P(parity) from the result.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="z80-sla">
+    <h4><code>SLA / SRA / SRL r</code><span class="name">Shift Register</span></h4>
+    <p class="instr-desc">SLA shifts left, filling with 0. SRA shifts right while preserving the
+      sign bit (arithmetic/signed-friendly). SRL shifts right, filling with 0 (logical/unsigned).</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">SLA/SRA/SRL r/(HL)/(IX+d)/(IY+d)</dd>
+      <dt>Flags</dt><dd>C = the bit shifted out; H=0, N=0; S/Z/P(parity) from the result.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="z80-sll">
+    <h4><code>SLL r</code><span class="name">Shift Left, Undocumented</span></h4>
+    <p class="instr-desc">An undocumented variant of SLA that fills the vacated bit with 1
+      instead of 0 (nicknamed "SL1" in some references) — included here since this core implements
+      it, but real software essentially never relies on it deliberately.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">SLL r/(HL)/(IX+d)/(IY+d)</dd>
+      <dt>Flags</dt><dd>Same shape as SLA.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="z80-rld">
+    <h4><code>RLD / RRD</code><span class="name">Rotate Digit</span></h4>
+    <p class="instr-desc">Treats A's low nibble plus both nibbles of <code>(HL)</code> as one
+      12-bit value and rotates it by 4 bits (one BCD digit) left (RLD) or right (RRD) — a fast way
+      to shift a multi-digit packed-BCD number.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">RLD &nbsp;·&nbsp; RRD</dd>
+      <dt>Flags</dt><dd>S/Z/P(parity) from the new A; H=0, N=0; C explicitly unaffected.</dd>
+    </dl>
+  </div>
+  </div>
+
+  <div class="instr-group">
+  <h3>Bit manipulation</h3>
+
+  <div class="instr" id="z80-bit">
+    <h4><code>BIT b,r</code><span class="name">Test Bit</span></h4>
+    <p class="instr-desc">Tests a single bit (0-7) of a register or memory location without
+      modifying it.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">BIT b,r/(HL)/(IX+d)/(IY+d)</dd>
+      <dt>Flags</dt><dd>Z = 1 if the bit was 0. H=1 (forced). N=0. P/V mirrors Z (a documented Z80
+        quirk, not a bug). S = 1 only if testing bit 7 and it was set.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="z80-set">
+    <h4><code>SET b,r / RES b,r</code><span class="name">Set/Reset Bit</span></h4>
+    <p class="instr-desc">Forces a single bit to 1 (SET) or 0 (RES).</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">SET/RES b,r/(HL)/(IX+d)/(IY+d)</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+  </div>
+
+  <div class="instr-group">
+  <h3>Jump</h3>
+
+  <div class="instr" id="z80-jp">
+    <h4><code>JP nn</code><span class="name">Jump</span></h4>
+    <p class="instr-desc">Unconditional jump to a fixed 16-bit address.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">JP nn</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="z80-jpcc">
+    <h4><code>JP cc,nn</code><span class="name">Jump Conditionally</span></h4>
+    <p class="instr-desc">Jumps only if the named condition is true.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">JP NZ/Z/NC/C/PO/PE/P/M,nn</dd>
+      <dt>Conditions</dt><dd>NZ/Z = Z clear/set. NC/C = carry clear/set. PO/PE = parity odd/even
+        (reads the P/V flag as parity). P/M = sign plus/minus (reads P/V's sibling role... no —
+        reads S: plus = S clear, minus = S set).</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="z80-jphl">
+    <h4><code>JP (HL)</code><span class="name">Jump to HL</span></h4>
+    <p class="instr-desc">Jumps to the address held in HL (or IX/IY under a prefix) — despite the
+      parentheses in the mnemonic, this is <em>not</em> an indirect load; the jump target is the
+      register's value itself, not the memory it points to.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">JP (HL)</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="z80-jr">
+    <h4><code>JR e / JR cc,e</code><span class="name">Relative Jump</span></h4>
+    <p class="instr-desc">A shorter, PC-relative jump — unconditional, or conditional on just the
+      first four conditions (NZ/Z/NC/C — there's no relative-parity or relative-sign jump).</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">JR e</dd>
+      <dt>Variant</dt><dd class="mono">JR NZ/Z/NC/C,e</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="z80-djnz">
+    <h4><code>DJNZ e</code><span class="name">Decrement and Jump if Nonzero</span></h4>
+    <p class="instr-desc">Decrements B; if the result isn't zero, jumps — the standard "loop B
+      times" instruction, doing the decrement, test, and branch all in one.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">DJNZ e</dd>
+      <dt>Flags</dt><dd>None (B is treated as a plain counter, not compared via the flags).</dd>
+      <dt>Example</dt><dd class="mono">LD B,10 \ loop: ... \ DJNZ loop  ; runs 10 times</dd>
+    </dl>
+  </div>
+  </div>
+
+  <div class="instr-group">
+  <h3>Call and return</h3>
+
+  <div class="instr" id="z80-call">
+    <h4><code>CALL nn / CALL cc,nn</code><span class="name">Call Subroutine</span></h4>
+    <p class="instr-desc">Pushes the return address, then jumps — unconditionally or only if the
+      named condition holds.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">CALL nn</dd>
+      <dt>Variant</dt><dd class="mono">CALL NZ/Z/NC/C/PO/PE/P/M,nn</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="z80-ret">
+    <h4><code>RET / RET cc</code><span class="name">Return</span></h4>
+    <p class="instr-desc">Pops a return address and jumps to it — unconditionally or only if the
+      named condition holds.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">RET</dd>
+      <dt>Variant</dt><dd class="mono">RET NZ/Z/NC/C/PO/PE/P/M</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="z80-reti">
+    <h4><code>RETI / RETN</code><span class="name">Return from Interrupt</span></h4>
+    <p class="instr-desc">RETI ends a maskable-interrupt handler; RETN ends a non-maskable-interrupt
+      handler. Both pop the return address and restore the interrupt-enable state from before the
+      interrupt (from the shadow enable flag IFF2 back into the live one, IFF1).</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">RETI &nbsp;·&nbsp; RETN</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="z80-rst">
+    <h4><code>RST p</code><span class="name">Restart</span></h4>
+    <p class="instr-desc">A compact one-byte call to one of eight fixed low-memory addresses
+      (0x00, 0x08, 0x10, ... 0x38) — useful for frequently-called routines when code size matters.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">RST 00H/08H/10H/18H/20H/28H/30H/38H</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+  </div>
+
+  <div class="instr-group">
+  <h3>Input/output</h3>
+  <p>On the real Genesis, the Z80's I/O ports aren't wired to anything — these instructions are
+    implemented for completeness, but no Genesis sound driver has any working port hardware to
+    talk to.</p>
+
+  <div class="instr" id="z80-in">
+    <h4><code>IN A,(n) / IN r,(C)</code><span class="name">Input</span></h4>
+    <p class="instr-desc">Reads a byte from an I/O port — either a fixed port number (A form) or
+      the port number held in C (register form, which also sets flags from the value read).</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">IN A,(n)</dd>
+      <dt>Variant</dt><dd class="mono">IN r,(C)</dd>
+      <dt>Flags</dt><dd>IN A,(n): none. IN r,(C): S/Z/P(parity) from the value, H=0, N=0.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="z80-out">
+    <h4><code>OUT (n),A / OUT (C),r</code><span class="name">Output</span></h4>
+    <p class="instr-desc">The write-direction counterparts to IN.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">OUT (n),A</dd>
+      <dt>Variant</dt><dd class="mono">OUT (C),r</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="z80-ini">
+    <h4><code>INI / IND / OUTI / OUTD</code><span class="name">Block I/O Step</span></h4>
+    <p class="instr-desc">Transfers one byte between <code>(HL)</code> and the port numbered by C,
+      then advances (INI/OUTI) or retreats (IND/OUTD) HL and decrements B — the I/O equivalent of
+      LDI/LDD.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">INI &nbsp;·&nbsp; IND &nbsp;·&nbsp; OUTI &nbsp;·&nbsp; OUTD</dd>
+      <dt>Flags</dt><dd>Z = (B==0 after decrementing), N=1 — the two bits every reference agrees
+        on. The full documented flag set for this instruction family is notoriously intricate and
+        rarely depended upon by real software; H, P/V, and C are not computed to match it exactly
+        here.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="z80-inir">
+    <h4><code>INIR / INDR / OTIR / OTDR</code><span class="name">Repeating Block I/O</span></h4>
+    <p class="instr-desc">Repeats INI/IND/OUTI/OUTD until B reaches zero.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">INIR &nbsp;·&nbsp; INDR &nbsp;·&nbsp; OTIR &nbsp;·&nbsp; OTDR</dd>
+      <dt>Flags</dt><dd>Same simplified rule as INI/IND/OUTI/OUTD.</dd>
+    </dl>
+  </div>
+  </div>
+</section>
+
+<section id="instr-sh2">
+  <h2><span class="num">15</span> SH-2 instruction reference</h2>
+  <p class="section-intro">
+    The <a href="#sh2-32x">32X's</a> two application processors are Hitachi SH-2 RISC CPUs — a
+    completely different architecture from the 68000 and Z80 above: 32-bit registers, a fixed
+    16-bit instruction width (every instruction is exactly one word, unlike the 68000's variable
+    length), and only sixteen general-purpose registers with no separate "address register" file.
+    If you've never read RISC assembly before, the single biggest surprise versus the 68000/Z80 is
+    <strong>delayed branches</strong>, explained below — skipping that section will make several
+    instructions look like they do nothing.
+  </p>
+
+  <h3>Registers</h3>
+  <table>
+    <thead><tr><th class="mono">Register</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td class="mono">R0-R15</td><td>General-purpose, 32-bit. R0 is architecturally special in a
+        handful of indexed-addressing forms (e.g. <code>@(R0,Rn)</code>). R15 is the conventional
+        stack pointer — used implicitly when an exception pushes SR/PC — but unlike the 68000's A7,
+        ordinary code is free to use R15 as a plain register too.</td></tr>
+      <tr><td class="mono">PC</td><td>Program counter.</td></tr>
+      <tr><td class="mono">PR</td><td>Procedure register — holds the return address for
+        BSR/BSRF/JSR, and is what RTS jumps back to. The SH-2's equivalent of a link register.</td></tr>
+      <tr><td class="mono">GBR</td><td>Global base register — the base address for GBR-relative
+        addressing and the GBR-relative logic-immediate instructions.</td></tr>
+      <tr><td class="mono">VBR</td><td>Vector base register — the base address of the exception
+        vector table. Unlike the 68000's fixed table at address 0, software can relocate this
+        anywhere; it's zeroed on reset.</td></tr>
+      <tr><td class="mono">MACH / MACL</td><td>The 64-bit multiply-accumulate result, split into
+        high/low 32-bit halves — written by the MAC/MUL instruction family.</td></tr>
+      <tr><td class="mono">SR</td><td>Status register — holds the flags described below.</td></tr>
+    </tbody>
+  </table>
+
+  <h3>How to read this section — addressing modes</h3>
+  <div class="addr-modes">
+    <span class="m">Rn</span><span class="d">Register direct — the operand is the register's own value.</span>
+    <span class="m">@Rn</span><span class="d">Register indirect — the operand is in memory, at the address held in Rn.</span>
+    <span class="m">@Rn+</span><span class="d">Post-increment indirect — read/write through Rn, then Rn is advanced by the operand's size (1/2/4). The standard "pop" idiom.</span>
+    <span class="m">@-Rn</span><span class="d">Pre-decrement indirect — Rn is reduced by the operand's size first, then read/write through it. The standard "push" idiom.</span>
+    <span class="m">@(disp,Rn)</span><span class="d">Displacement indexed — address is Rn plus a small unsigned constant (scaled to the operand size for word/long forms).</span>
+    <span class="m">@(R0,Rn)</span><span class="d">Indexed — address is Rn plus R0, letting R0 act as a general-purpose index register.</span>
+    <span class="m">@(disp,GBR)</span><span class="d">GBR-relative — address is GBR plus a small unsigned constant.</span>
+    <span class="m">@(R0,GBR)</span><span class="d">GBR-relative indexed by R0.</span>
+    <span class="m">@(disp,PC)</span><span class="d">PC-relative — reads a constant out of a "literal pool" placed a few instructions away; used to load 16/32-bit values too big to fit as an immediate.</span>
+    <span class="m">#imm</span><span class="d">Immediate — an 8-bit constant embedded directly in the instruction, sign-extended for most instructions (AND/OR/XOR's immediate forms are the exception — zero-extended).</span>
+  </div>
+
+  <h3>Flags (the SR register)</h3>
+  <div class="addr-modes">
+    <span class="m">T</span><span class="d">Test/true — the SH-2's single primary flag. Read by BT/BF/BT.S/BF.S; written as the sole result by CMP/TST/DT and several other instructions. Where the 68000 has five flags, the SH-2 mostly has this one.</span>
+    <span class="m">S</span><span class="d">Saturation mode — changes whether MAC.W/MAC.L clamp on overflow instead of wrapping.</span>
+    <span class="m">Q / M</span><span class="d">Used only by the DIV0S/DIV1 iterative-division algorithm below — not general-purpose flags, and meaningless outside a division sequence.</span>
+    <span class="m">I3-I0</span><span class="d">The current interrupt priority mask (0-15) — not a condition flag, but the same register. An interrupt only fires if its level exceeds this value.</span>
+  </div>
+
+  <div class="callout confidence">
+    <span class="tag">The single biggest gotcha: delayed branches</span>
+    <p>
+      On the 68000/Z80, a branch takes effect immediately. On the SH-2, most branches
+      (<code>BRA</code>, <code>BSR</code>, <code>BRAF</code>, <code>BSRF</code>, <code>JMP</code>,
+      <code>JSR</code>, <code>RTS</code>, <code>RTE</code>, <code>BT.S</code>, <code>BF.S</code>)
+      are <strong>delayed</strong>: the single instruction immediately after the branch — the
+      "delay slot" — always executes <em>before</em> the jump actually happens, every time, whether
+      the branch is taken or not. This lets the CPU keep its pipeline full instead of stalling on
+      every branch. Real assembly routinely puts a useful instruction in the delay slot rather than
+      a NOP. The plain conditional branches <code>BT</code> and <code>BF</code> (no
+      <code>.S</code>) are the exception — those take effect immediately, with no delay slot, and
+      are easy to confuse with their delayed <code>.S</code> cousins.
+    </p>
+  </div>
+
+  <div class="instr-group">
+  <h3>Data transfer</h3>
+
+  <div class="instr" id="sh2-mov">
+    <h4><code>MOV</code><span class="name">Move Data</span></h4>
+    <p class="instr-desc">Copies a value between registers, or loads/stores a byte, word, or
+      longword between a register and memory. The single most common SH-2 instruction — it covers
+      what the 68000 splits across MOVE/MOVEA/MOVEQ.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">MOV.[B/W/L] &lt;src&gt;,&lt;dst&gt;</dd>
+      <dt>Operands</dt><dd>Register-to-register, or one side memory via @Rn / @Rn+ / @-Rn /
+        @(disp,Rn) / @(R0,Rn) — never both sides memory at once (no memory-to-memory move).</dd>
+      <dt>Flags</dt><dd>None.</dd>
+      <dt>Example</dt><dd class="mono">MOV.L @R4+,R0  ; R0 = [R4], then R4 += 4</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="sh2-movi">
+    <h4><code>MOV #imm,Rn</code><span class="name">Move Immediate</span></h4>
+    <p class="instr-desc">Loads an 8-bit constant into a register, sign-extended to 32 bits. To
+      load a bigger constant, real code uses <code>MOV.W</code>/<code>MOV.L @(disp,PC),Rn</code>
+      (a literal-pool load) instead — there's no direct "load a 16 or 32-bit immediate" opcode.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">MOV #imm,Rn</dd>
+      <dt>Flags</dt><dd>None.</dd>
+      <dt>Example</dt><dd class="mono">MOV #-1,R0  ; R0 = 0xFFFFFFFF</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="sh2-mova">
+    <h4><code>MOVA</code><span class="name">Move Effective Address</span></h4>
+    <p class="instr-desc">Computes a PC-relative address (rounded down to a 4-byte boundary first)
+      and loads it into R0 — always R0, never any other register. Used to compute the address of a
+      literal pool or jump table rather than the value stored there.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">MOVA @(disp,PC),R0</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="sh2-movt">
+    <h4><code>MOVT</code><span class="name">Move T Flag</span></h4>
+    <p class="instr-desc">Copies the T flag into a register as a plain 0 or 1 — the standard way to
+      turn a comparison result into a usable boolean value.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">MOVT Rn</dd>
+      <dt>Flags</dt><dd>None (reads T, doesn't change it).</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="sh2-swap">
+    <h4><code>SWAP.B / SWAP.W</code><span class="name">Swap Register Halves</span></h4>
+    <p class="instr-desc">SWAP.B swaps the low two bytes of a register; SWAP.W swaps its upper and
+      lower 16-bit halves. Mostly used for byte-order shuffling.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">SWAP.[B/W] Rm,Rn</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="sh2-extu">
+    <h4><code>EXTU.B / EXTU.W</code><span class="name">Extend Unsigned</span></h4>
+    <p class="instr-desc">Zero-extends the low byte (.B) or low word (.W) of a register, discarding
+      whatever was in the higher bits.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">EXTU.[B/W] Rm,Rn</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="sh2-exts">
+    <h4><code>EXTS.B / EXTS.W</code><span class="name">Extend Signed</span></h4>
+    <p class="instr-desc">Sign-extends the low byte (.B) or low word (.W) of a register — the
+      signed counterpart to EXTU.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">EXTS.[B/W] Rm,Rn</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="sh2-xtrct">
+    <h4><code>XTRCT</code><span class="name">Extract</span></h4>
+    <p class="instr-desc">Takes two registers as a conceptual 64-bit pair and extracts the middle
+      32 bits: the destination's high half becomes the source's low half, and the destination's low
+      half becomes its own former high half.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">XTRCT Rm,Rn</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+  </div>
+
+  <div class="instr-group">
+  <h3>Arithmetic</h3>
+
+  <div class="instr" id="sh2-add">
+    <h4><code>ADD</code><span class="name">Add</span></h4>
+    <p class="instr-desc">Adds two registers, or a register and an 8-bit sign-extended immediate,
+      with no flags affected — unlike the 68000, plain ADD doesn't touch the carry flag at all.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">ADD Rm,Rn</dd>
+      <dt>Variant</dt><dd class="mono">ADD #imm,Rn</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="sh2-addc">
+    <h4><code>ADDC</code><span class="name">Add With Carry</span></h4>
+    <p class="instr-desc">Adds two registers plus the incoming T flag (used as carry-in), and sets
+      T to the carry-out — chain several of these together to add numbers wider than 32 bits.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">ADDC Rm,Rn</dd>
+      <dt>Flags</dt><dd>T = carry out of the addition.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="sh2-addv">
+    <h4><code>ADDV</code><span class="name">Add With Overflow Check</span></h4>
+    <p class="instr-desc">Adds two registers as signed values and sets T if the result overflowed
+      a signed 32-bit range — the SH-2's equivalent of checking the 68000's V flag after an add.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">ADDV Rm,Rn</dd>
+      <dt>Flags</dt><dd>T = 1 on signed overflow, else 0.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="sh2-sub">
+    <h4><code>SUB</code><span class="name">Subtract</span></h4>
+    <p class="instr-desc">Subtracts Rm from Rn, no flags affected. There's no subtract-immediate
+      form — negate the constant and use ADD instead.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">SUB Rm,Rn</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="sh2-subc">
+    <h4><code>SUBC</code><span class="name">Subtract With Borrow</span></h4>
+    <p class="instr-desc">Subtracts Rm and the incoming T flag (as borrow-in) from Rn, and sets T
+      to the borrow-out — the subtraction counterpart to ADDC, for wide subtraction chains.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">SUBC Rm,Rn</dd>
+      <dt>Flags</dt><dd>T = borrow out of the subtraction.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="sh2-subv">
+    <h4><code>SUBV</code><span class="name">Subtract With Overflow Check</span></h4>
+    <p class="instr-desc">Subtracts Rm from Rn as signed values and sets T if the result overflowed
+      a signed 32-bit range.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">SUBV Rm,Rn</dd>
+      <dt>Flags</dt><dd>T = 1 on signed overflow, else 0.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="sh2-neg">
+    <h4><code>NEG / NEGC</code><span class="name">Negate</span></h4>
+    <p class="instr-desc">NEG computes the two's-complement negation of a register (0 minus the
+      value), no flags affected. NEGC additionally subtracts the incoming T flag (borrow-in) and
+      sets T to the borrow-out, the same way SUBC does for a full subtraction.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">NEG Rm,Rn</dd>
+      <dt>Variant</dt><dd class="mono">NEGC Rm,Rn</dd>
+      <dt>Flags</dt><dd>NEG: none. NEGC: T = borrow out.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="sh2-cmp">
+    <h4><code>CMP/xx</code><span class="name">Compare</span></h4>
+    <p class="instr-desc">Compares two values and sets T if the named condition holds — there's no
+      separate "compare" instruction the way the 68000 has one CMP with a condition tested
+      afterward by Bcc; instead the condition is baked into the mnemonic itself, and the very next
+      branch is almost always BT or BF.</p>
+    <dl class="instr-meta">
+      <dt>Forms</dt><dd class="mono">CMP/EQ CMP/GE CMP/GT CMP/HI CMP/HS Rm,Rn &nbsp;·&nbsp;
+        CMP/PL CMP/PZ Rn &nbsp;·&nbsp; CMP/EQ #imm,R0</dd>
+      <dt>Meaning</dt><dd>EQ: equal. GE/GT: signed ≥ / &gt;. HI/HS: unsigned &gt; / ≥. PL/PZ:
+        Rn &gt; 0 / Rn ≥ 0 (signed, against zero).</dd>
+      <dt>Flags</dt><dd>T = 1 if the condition holds, else 0.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="sh2-cmpstr">
+    <h4><code>CMP/STR</code><span class="name">Compare String</span></h4>
+    <p class="instr-desc">A byte-wise equality test: sets T if <em>any</em> of the four byte lanes
+      of the two registers are equal (found by XOR-ing the registers and checking whether any byte
+      of the result is zero). Useful for fast null-terminator/substring scanning.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">CMP/STR Rm,Rn</dd>
+      <dt>Flags</dt><dd>T = 1 if any byte lane matches, else 0.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="sh2-dt">
+    <h4><code>DT</code><span class="name">Decrement and Test</span></h4>
+    <p class="instr-desc">Decrements a register and sets T if it reached zero — the standard SH-2
+      loop-counter idiom, almost always paired with <code>BF</code> to loop while nonzero.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">DT Rn</dd>
+      <dt>Flags</dt><dd>T = 1 if Rn is now 0, else 0.</dd>
+      <dt>Example</dt><dd class="mono">loop: DT R4 &nbsp;\ BF loop  ; runs while R4 != 0</dd>
+    </dl>
+  </div>
+  </div>
+
+  <div class="instr-group">
+  <h3>Logic</h3>
+
+  <div class="instr" id="sh2-and">
+    <h4><code>AND</code><span class="name">Bitwise AND</span></h4>
+    <p class="instr-desc">ANDs two registers, or a register with an immediate, or a GBR-relative
+      memory byte with an immediate (read-modify-write).</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">AND Rm,Rn</dd>
+      <dt>Variants</dt><dd class="mono">AND #imm,R0 &nbsp;·&nbsp; AND.B #imm,@(R0,GBR)</dd>
+      <dt>Flags</dt><dd>None. (Unlike the 68000's AND, this never touches N/Z — test the result
+        with TST if you need a flag.)</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="sh2-or">
+    <h4><code>OR</code><span class="name">Bitwise OR</span></h4>
+    <p class="instr-desc">Same three forms as AND, for bitwise OR.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">OR Rm,Rn</dd>
+      <dt>Variants</dt><dd class="mono">OR #imm,R0 &nbsp;·&nbsp; OR.B #imm,@(R0,GBR)</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="sh2-xor">
+    <h4><code>XOR</code><span class="name">Bitwise XOR</span></h4>
+    <p class="instr-desc">Same three forms again, for bitwise exclusive-or.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">XOR Rm,Rn</dd>
+      <dt>Variants</dt><dd class="mono">XOR #imm,R0 &nbsp;·&nbsp; XOR.B #imm,@(R0,GBR)</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="sh2-tst">
+    <h4><code>TST</code><span class="name">Test Bits</span></h4>
+    <p class="instr-desc">ANDs two values together like AND does, but instead of keeping the
+      result, sets T if that result is zero — the SH-2 has no free flag-setting side effect on
+      AND/OR/XOR themselves, so TST exists specifically to test bits without an AND's result
+      overwriting a register you still need.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">TST Rm,Rn</dd>
+      <dt>Variants</dt><dd class="mono">TST #imm,R0 &nbsp;·&nbsp; TST.B #imm,@(R0,GBR)</dd>
+      <dt>Flags</dt><dd>T = 1 if the AND of the two operands is zero, else 0.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="sh2-not">
+    <h4><code>NOT</code><span class="name">Bitwise NOT</span></h4>
+    <p class="instr-desc">Complements every bit of a register (one's complement).</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">NOT Rm,Rn</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+  </div>
+
+  <div class="instr-group">
+  <h3>Shift and rotate</h3>
+
+  <div class="instr" id="sh2-shll">
+    <h4><code>SHLL / SHLR</code><span class="name">Shift Logical Left/Right (by 1)</span></h4>
+    <p class="instr-desc">Shifts a register left or right by exactly one bit, filling the vacated
+      bit with 0 and capturing the bit shifted out into T.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">SHLL Rn &nbsp;·&nbsp; SHLR Rn</dd>
+      <dt>Flags</dt><dd>T = the bit shifted out.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="sh2-shllfixed">
+    <h4><code>SHLL2/8/16, SHLR2/8/16</code><span class="name">Shift by a Fixed Count</span></h4>
+    <p class="instr-desc">Shift left or right by exactly 2, 8, or 16 bits in one instruction —
+      much cheaper than repeating SHLL/SHLR, and common for byte/nibble-aligned work. Unlike the
+      single-bit forms, these don't touch T at all.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">SHLL2 Rn &nbsp;·&nbsp; SHLL8 Rn &nbsp;·&nbsp; SHLL16 Rn
+        &nbsp;(and the SHLR equivalents)</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="sh2-shal">
+    <h4><code>SHAL / SHAR</code><span class="name">Shift Arithmetic Left/Right</span></h4>
+    <p class="instr-desc">SHAL is identical to SHLL (there's no difference between logical and
+      arithmetic left shift). SHAR shifts right by one bit while preserving the sign bit (copying
+      bit 31 back into itself) — the signed-division-friendly right shift.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">SHAL Rn &nbsp;·&nbsp; SHAR Rn</dd>
+      <dt>Flags</dt><dd>T = the bit shifted out.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="sh2-rotl">
+    <h4><code>ROTL / ROTR</code><span class="name">Rotate</span></h4>
+    <p class="instr-desc">Rotates a register by one bit, wrapping the bit that falls off one end
+      back onto the other — and also into T.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">ROTL Rn &nbsp;·&nbsp; ROTR Rn</dd>
+      <dt>Flags</dt><dd>T = the bit that wrapped around.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="sh2-rotcl">
+    <h4><code>ROTCL / ROTCR</code><span class="name">Rotate Through Carry</span></h4>
+    <p class="instr-desc">Like ROTL/ROTR, but the bit that falls off feeds into T <em>and</em> the
+      old T value is what fills the vacated bit — chain these across registers to rotate a value
+      wider than 32 bits.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">ROTCL Rn &nbsp;·&nbsp; ROTCR Rn</dd>
+      <dt>Flags</dt><dd>T = the bit shifted out; the incoming T fills the vacated bit.</dd>
+    </dl>
+  </div>
+  </div>
+
+  <div class="instr-group">
+  <h3>Divide</h3>
+  <p>
+    The SH-2 has no single-instruction divide the way the 68000's DIVU/DIVS is — division is built
+    from a setup instruction plus one <code>DIV1</code> per output bit (32 of them, for a full
+    32-bit quotient), typically wrapped in a loop by the assembler or compiler. This is unusual
+    enough to call out explicitly for anyone who's only used CPUs with a single DIV opcode.
+  </p>
+
+  <div class="instr" id="sh2-div0u">
+    <h4><code>DIV0U</code><span class="name">Divide Step 0, Unsigned</span></h4>
+    <p class="instr-desc">Initializes the flags used by the DIV1 loop for an <em>unsigned</em>
+      division — clears Q, M, and T.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">DIV0U</dd>
+      <dt>Flags</dt><dd>Q = 0, M = 0, T = 0.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="sh2-div0s">
+    <h4><code>DIV0S</code><span class="name">Divide Step 0, Signed</span></h4>
+    <p class="instr-desc">Initializes the same flags for a <em>signed</em> division: Q and M are
+      seeded from the dividend's and divisor's sign bits, and T from whether those signs differ
+      (i.e. whether the quotient will be negative).</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">DIV0S Rm,Rn</dd>
+      <dt>Flags</dt><dd>Q = sign of Rn, M = sign of Rm, T = Q XOR M.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="sh2-div1">
+    <h4><code>DIV1</code><span class="name">Divide Step 1</span></h4>
+    <p class="instr-desc">Performs one step of non-restoring binary division, producing a single
+      quotient bit per execution. Not meant to be understood by reading one instruction in
+      isolation — it only makes sense as 32 repetitions following a DIV0S/DIV0U, and its exact
+      bit-twiddling is genuinely easy to get wrong (this project's own implementation notes call
+      out a transcription bug that was caught and fixed by cross-checking against hundreds of
+      randomized test cases).</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">DIV1 Rm,Rn</dd>
+      <dt>Flags</dt><dd>Q, M, and T are all updated by the step; T reflects the new quotient bit.</dd>
+    </dl>
+  </div>
+  </div>
+
+  <div class="instr-group">
+  <h3>Multiply and multiply-accumulate</h3>
+
+  <div class="instr" id="sh2-mull">
+    <h4><code>MUL.L</code><span class="name">Multiply Long</span></h4>
+    <p class="instr-desc">Multiplies two 32-bit registers and keeps only the low 32 bits of the
+      result, written to MACL. MACH and T are left alone.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">MUL.L Rm,Rn</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="sh2-muls">
+    <h4><code>MULS.W / MULU.W</code><span class="name">Multiply Word</span></h4>
+    <p class="instr-desc">Multiplies the low 16 bits of two registers (signed for MULS, unsigned
+      for MULU) and writes the full 32-bit product to MACL.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">MULS.W Rm,Rn &nbsp;·&nbsp; MULU.W Rm,Rn</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="sh2-dmuls">
+    <h4><code>DMULS.L / DMULU.L</code><span class="name">Double-Length Multiply</span></h4>
+    <p class="instr-desc">Multiplies two full 32-bit registers (signed for DMULS, unsigned for
+      DMULU) and writes the complete 64-bit product across MACH:MACL — the only plain multiply
+      that uses MACH.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">DMULS.L Rm,Rn &nbsp;·&nbsp; DMULU.L Rm,Rn</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="sh2-macl">
+    <h4><code>MAC.L</code><span class="name">Multiply-Accumulate Long</span></h4>
+    <p class="instr-desc">Loads a 32-bit value from each of two post-incrementing pointer
+      registers, multiplies them, and adds the result into the 64-bit MACH:MACL accumulator. If the
+      S flag is set, the accumulation saturates (clamps) instead of wrapping on overflow. The
+      classic building block for a dot-product / FIR-filter inner loop.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">MAC.L @Rm+,@Rn+</dd>
+      <dt>Flags</dt><dd>None (S, an input, changes overflow behavior but isn't itself written).</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="sh2-macw">
+    <h4><code>MAC.W</code><span class="name">Multiply-Accumulate Word</span></h4>
+    <p class="instr-desc">Same idea as MAC.L but with 16-bit operands. Its overflow behavior
+      depends on S in a more involved way than MAC.L: with S clear it accumulates sign-extended
+      into the full 64-bit MACH:MACL; with S set it saturates <em>only</em> MACL as a 32-bit value
+      and leaves MACH untouched entirely.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">MAC.W @Rm+,@Rn+</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+  </div>
+
+  <div class="instr-group">
+  <h3>Branch and control flow</h3>
+  <p>Remember: every instruction in this group except <code>BT</code>/<code>BF</code> is
+    <strong>delayed</strong> — see the callout above.</p>
+
+  <div class="instr" id="sh2-bra">
+    <h4><code>BRA</code><span class="name">Branch</span></h4>
+    <p class="instr-desc">Unconditional jump to a PC-relative address. Delayed.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">BRA disp</dd>
+      <dt>Range</dt><dd>±4KB (a signed 12-bit word displacement).</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="sh2-braf">
+    <h4><code>BRAF</code><span class="name">Branch Far</span></h4>
+    <p class="instr-desc">Unconditional jump to PC plus the full 32-bit value in a register —
+      reaches anywhere, unlike BRA's limited range. Delayed.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">BRAF Rm</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="sh2-bsr">
+    <h4><code>BSR / BSRF</code><span class="name">Branch to Subroutine</span></h4>
+    <p class="instr-desc">Like BRA/BRAF, but first saves the return address into PR — the SH-2's
+      call instruction. Delayed. PR is set <em>before</em> the delay slot runs (only the jump
+      itself is deferred).</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">BSR disp &nbsp;·&nbsp; BSRF Rm</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="sh2-jmp">
+    <h4><code>JMP</code><span class="name">Jump</span></h4>
+    <p class="instr-desc">Unconditional jump to the absolute address held in a register. Delayed.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">JMP @Rm</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="sh2-jsr">
+    <h4><code>JSR</code><span class="name">Jump to Subroutine</span></h4>
+    <p class="instr-desc">Like JMP, but saves the return address into PR first — the
+      register-indirect call instruction. Delayed.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">JSR @Rm</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="sh2-rts">
+    <h4><code>RTS</code><span class="name">Return from Subroutine</span></h4>
+    <p class="instr-desc">Jumps to the address in PR — pairs with BSR/BSRF/JSR. Delayed.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">RTS</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="sh2-rte">
+    <h4><code>RTE</code><span class="name">Return from Exception</span></h4>
+    <p class="instr-desc">Pops PC and then SR off the stack and resumes. Unlike PC, SR is restored
+      <em>immediately</em> — not deferred through the delay slot the way the jump target is — so
+      the delay-slot instruction already runs under the restored flags/interrupt mask. Delayed.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">RTE</dd>
+      <dt>Flags</dt><dd>All of SR is replaced from the stack.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="sh2-bt">
+    <h4><code>BT / BF</code><span class="name">Branch if True/False</span></h4>
+    <p class="instr-desc">Jumps to a nearby PC-relative address if T is 1 (BT) or 0 (BF). These are
+      the <em>non</em>-delayed branches — the target takes effect immediately, with no instruction
+      after them unconditionally running first. Almost always follows a CMP/xx or DT.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">BT disp &nbsp;·&nbsp; BF disp</dd>
+      <dt>Range</dt><dd>±256 bytes (a signed 8-bit word displacement).</dd>
+      <dt>Flags</dt><dd>None (reads T, doesn't change it).</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="sh2-bts">
+    <h4><code>BT.S / BF.S</code><span class="name">Branch if True/False, Delayed</span></h4>
+    <p class="instr-desc">Same condition as BT/BF, but delayed — and unlike every other delayed
+      instruction here, the delay slot runs <em>whether or not the branch is taken</em>. That's a
+      real, easy-to-miss difference from plain BT/BF, not just "the same thing with a slot added."</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">BT.S disp &nbsp;·&nbsp; BF.S disp</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="sh2-trapa">
+    <h4><code>TRAPA</code><span class="name">Trap Always</span></h4>
+    <p class="instr-desc">Software interrupt: pushes SR and PC, then jumps to a vector selected by
+      an 8-bit immediate (vector = VBR + imm×4). Not delayed.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">TRAPA #imm</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+  </div>
+
+  <div class="instr-group">
+  <h3>System control</h3>
+
+  <div class="instr" id="sh2-nop">
+    <h4><code>NOP</code><span class="name">No Operation</span></h4>
+    <p class="instr-desc">Does nothing for one cycle.</p>
+    <dl class="instr-meta"><dt>Flags</dt><dd>None.</dd></dl>
+  </div>
+
+  <div class="instr" id="sh2-sleep">
+    <h4><code>SLEEP</code><span class="name">Sleep</span></h4>
+    <p class="instr-desc">Halts the CPU, re-executing this same instruction every cycle until an
+      interrupt arrives — the SH-2's "wait for interrupt" idiom.</p>
+    <dl class="instr-meta"><dt>Flags</dt><dd>None.</dd></dl>
+  </div>
+
+  <div class="instr" id="sh2-clrt">
+    <h4><code>CLRT / SETT</code><span class="name">Clear/Set T</span></h4>
+    <p class="instr-desc">Directly clears or sets the T flag.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">CLRT &nbsp;·&nbsp; SETT</dd>
+      <dt>Flags</dt><dd>T = 0 / T = 1.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="sh2-clrmac">
+    <h4><code>CLRMAC</code><span class="name">Clear MAC</span></h4>
+    <p class="instr-desc">Zeroes both MACH and MACL — run this before starting a fresh
+      multiply-accumulate sequence.</p>
+    <dl class="instr-meta"><dt>Flags</dt><dd>None.</dd></dl>
+  </div>
+
+  <div class="instr" id="sh2-ldc">
+    <h4><code>LDC / STC</code><span class="name">Load/Store Control Register</span></h4>
+    <p class="instr-desc">Copies a general register into SR/GBR/VBR (LDC) or the reverse (STC).
+      LDC into SR only loads the real flag bits (T/S/I3-I0/Q/M) — writing SR doesn't let you set
+      undefined/reserved bits. Memory-indirect forms (post-increment load, pre-decrement store) also
+      exist for saving/restoring these registers on a stack.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">LDC Rm,SR/GBR/VBR &nbsp;·&nbsp; STC SR/GBR/VBR,Rn</dd>
+      <dt>Variants</dt><dd class="mono">LDC.L @Rm+,SR/GBR/VBR &nbsp;·&nbsp; STC.L SR/GBR/VBR,@-Rn</dd>
+      <dt>Flags</dt><dd>LDC Rm,SR replaces T/S/I3-I0/Q/M from Rm; everything else: none.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="sh2-lds">
+    <h4><code>LDS / STS</code><span class="name">Load/Store System Register</span></h4>
+    <p class="instr-desc">Same idea as LDC/STC, but for MACH, MACL, and PR instead of SR/GBR/VBR.</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">LDS Rm,MACH/MACL/PR &nbsp;·&nbsp; STS MACH/MACL/PR,Rn</dd>
+      <dt>Variants</dt><dd class="mono">LDS.L @Rm+,... &nbsp;·&nbsp; STS.L ...,@-Rn</dd>
+      <dt>Flags</dt><dd>None.</dd>
+    </dl>
+  </div>
+
+  <div class="instr" id="sh2-tas">
+    <h4><code>TAS.B</code><span class="name">Test and Set</span></h4>
+    <p class="instr-desc">Reads a byte from memory, sets T if it was zero, then unconditionally
+      sets its top bit and writes it back — real hardware performs this as one locked bus cycle so
+      it can be used as a mutex/semaphore primitive between two bus masters (relevant on the 32X,
+      which has two SH-2s sharing memory).</p>
+    <dl class="instr-meta">
+      <dt>Syntax</dt><dd class="mono">TAS.B @Rn</dd>
+      <dt>Flags</dt><dd>T = 1 if the byte read was zero, else 0.</dd>
+    </dl>
+  </div>
+  </div>
+</section>
+
 <section id="sources">
-  <h2><span class="num">12</span> Sources &amp; confidence</h2>
+  <h2><span class="num">16</span> Sources &amp; confidence</h2>
   <p class="section-intro">
     This document draws on the same source material consulted while building and debugging
     GenesisSharp against real ROMs. Where a specific number or behavior above was directly
@@ -3016,6 +5330,10 @@
       semantics.</li>
     <li><strong>clown68000</strong>, validated against the <strong>SingleStepTests/m68000</strong>
       hardware-captured test-vector suite — consulted for 68000 edge-case behavior.</li>
+    <li><strong>PicoDrive</strong> (Gražvydas "notaz" Ignotas) — the only vendored reference with
+      real 32X and SH-2 support; the sole source for §12's SH-2 CPU facts, since Genesis Plus GX
+      has never shipped 32X emulation. Its SH-2 interpreter is itself MAME's portable SH-2 core
+      (Juergen Buchmueller).</li>
   </ul>
 
   <div class="callout confidence">

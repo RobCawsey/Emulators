@@ -551,7 +551,11 @@ public sealed class MainForm : Form
 
         _errorMessage = null;
         _loadedRomPath = romPath;
-        Text = romPath is null ? "GenesisSharp" : $"GenesisSharp — {Path.GetFileName(romPath)}";
+        // "[32X]" is purely a display indicator (Cartridge.Is32X's own remarks) -- it doesn't
+        // change how the ROM is loaded or how Sega32X is wired in, which happens unconditionally
+        // either way.
+        string x32Suffix = cartridge.Is32X ? " [32X]" : "";
+        Text = romPath is null ? "GenesisSharp" : $"GenesisSharp — {Path.GetFileName(romPath)}{x32Suffix}";
 
         // WASAPI's own internal buffer stays this many ms of audio queued ahead at all times --
         // a direct, constant contributor to the delay between a game action and hearing its

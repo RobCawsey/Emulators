@@ -46,6 +46,14 @@ public sealed class DebugForm : Form
         "  Refreshes automatically every frame while this window is\r\n" +
         "  visible.\r\n" +
         "\r\n" +
+        "32X TAB\r\n" +
+        "\r\n" +
+        "  Live registers and a scrolling disassembly listing for both\r\n" +
+        "  SH-2 cores (master/slave), plus the adapter's nRES/ADEN\r\n" +
+        "  release state. Shown whether or not the loaded ROM is a 32X\r\n" +
+        "  title -- for a non-32X ROM both cores simply sit held at\r\n" +
+        "  reset and never step.\r\n" +
+        "\r\n" +
         "VRAM TAB\r\n" +
         "\r\n" +
         "  A palette-line selector (0-3) and a zoomed-in view of every\r\n" +
@@ -60,6 +68,9 @@ public sealed class DebugForm : Form
     private readonly TextBox _registersText;
     private readonly TextBox _m68kDisasmText;
     private readonly TextBox _z80DisasmText;
+    private readonly TextBox _sh2RegistersText;
+    private readonly TextBox _msh2DisasmText;
+    private readonly TextBox _ssh2DisasmText;
     private readonly Button _pauseButton;
     private readonly ComboBox _paletteLineSelector;
     private readonly PictureBox _palettePreview;
@@ -167,6 +178,57 @@ public sealed class DebugForm : Form
         disasmPanel.Controls.Add(_m68kDisasmText, 0, 0);
         disasmPanel.Controls.Add(_z80DisasmText, 1, 0);
 
+        // 32X tab: same registers-box-on-top, disassembly-panel-below shape as the CPU tab,
+        // just for the two SH-2 cores instead of the 68000/Z80. Content is currently 17 lines
+        // (32X adapter line + blank + [master header/next/4 register rows/PR-GBR-VBR-MACH-MACL
+        // row] + blank + the same 7 lines for the slave) -- sized the same font-driven way as
+        // _registersText above, for the same reason (avoid silently clipping under DPI scaling).
+        const int sh2RegisterLineCount = 18;
+        _sh2RegistersText = new TextBox
+        {
+            Multiline = true,
+            ReadOnly = true,
+            Dock = DockStyle.Top,
+            Height = registersFont.Height * sh2RegisterLineCount + 16,
+            Font = registersFont,
+            BackColor = Color.Black,
+            ForeColor = Color.Lime,
+            ScrollBars = ScrollBars.Vertical,
+        };
+        var sh2DisasmPanel = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 2,
+            RowCount = 1,
+        };
+        sh2DisasmPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50f));
+        sh2DisasmPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50f));
+        sh2DisasmPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
+        _msh2DisasmText = new TextBox
+        {
+            Multiline = true,
+            ReadOnly = true,
+            Dock = DockStyle.Fill,
+            Font = disasmFont,
+            BackColor = Color.Black,
+            ForeColor = Color.Cyan,
+            ScrollBars = ScrollBars.Vertical,
+            WordWrap = false,
+        };
+        _ssh2DisasmText = new TextBox
+        {
+            Multiline = true,
+            ReadOnly = true,
+            Dock = DockStyle.Fill,
+            Font = disasmFont,
+            BackColor = Color.Black,
+            ForeColor = Color.Yellow,
+            ScrollBars = ScrollBars.Vertical,
+            WordWrap = false,
+        };
+        sh2DisasmPanel.Controls.Add(_msh2DisasmText, 0, 0);
+        sh2DisasmPanel.Controls.Add(_ssh2DisasmText, 1, 0);
+
         var paletteRowFont = new Font(FontFamily.GenericSansSerif, 12);
         var paletteRow = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(6), BackColor = RetroTheme.Panel };
         paletteRow.Controls.Add(new Label { Text = "VRAM palette line:", Font = paletteRowFont, ForeColor = RetroTheme.Text, AutoSize = true, Margin = new Padding(4, 10, 6, 0) });
@@ -216,6 +278,10 @@ public sealed class DebugForm : Form
         cpuTab.Controls.Add(disasmPanel);
         cpuTab.Controls.Add(_registersText);
 
+        var sh2Tab = new TabPage("32X") { BackColor = RetroTheme.Background };
+        sh2Tab.Controls.Add(sh2DisasmPanel);
+        sh2Tab.Controls.Add(_sh2RegistersText);
+
         var vramTab = new TabPage("VRAM") { BackColor = RetroTheme.Background };
         vramTab.Controls.Add(_vramScroll);
         vramTab.Controls.Add(paletteRow);
@@ -227,6 +293,7 @@ public sealed class DebugForm : Form
         var tabs = new TabControl { DrawMode = TabDrawMode.OwnerDrawFixed };
         tabs.DrawItem += DrawTab;
         tabs.TabPages.Add(cpuTab);
+        tabs.TabPages.Add(sh2Tab);
         tabs.TabPages.Add(vramTab);
 
         // Tab-strip chrome height is essentially font-driven, not size-driven, so it can be
@@ -272,8 +339,9 @@ public sealed class DebugForm : Form
         int toolbarHeight = toolbar.GetPreferredSize(Size.Empty).Height;
         int paletteRowHeight = paletteRow.GetPreferredSize(Size.Empty).Height;
         int cpuTabContentHeight = _registersText.Height + disasmFont.Height * DisasmLineCount + 16;
+        int sh2TabContentHeight = _sh2RegistersText.Height + disasmFont.Height * DisasmLineCount + 16;
         int vramTabContentHeight = paletteRowHeight + _vramBitmap.Height;
-        int contentHeight = menuStripHeight + toolbarHeight + tabChromeHeight + Math.Max(cpuTabContentHeight, vramTabContentHeight);
+        int contentHeight = menuStripHeight + toolbarHeight + tabChromeHeight + Math.Max(Math.Max(cpuTabContentHeight, sh2TabContentHeight), vramTabContentHeight);
         // Half the full grid width, on top of the vertical-fit sizing above -- at 128 columns
         // the grid itself is wider than any window needs to default to; _vramScroll's own
         // AutoScroll (already relied on for the vertical case) picks up a horizontal scrollbar
@@ -421,11 +489,14 @@ public sealed class DebugForm : Form
         if (_console is null)
         {
             _registersText.Text = "(no ROM loaded)";
+            _sh2RegistersText.Text = "(no ROM loaded)";
             return;
         }
 
         UpdateRegistersText();
         UpdateDisassembly();
+        UpdateSh2RegistersText();
+        UpdateSh2Disassembly();
         UpdatePalette();
         UpdateVram();
     }
@@ -530,6 +601,68 @@ public sealed class DebugForm : Form
 
         _m68kDisasmText.Lines = m68kLines.ToArray();
         _z80DisasmText.Lines = z80Lines.ToArray();
+    }
+
+    private void UpdateSh2RegistersText()
+    {
+        var sega32X = _console!.Sega32X;
+        var master = sega32X.MasterSh2;
+        var slave = sega32X.SlaveSh2;
+
+        // Peek reads only, same reasoning as UpdateRegistersText -- disassembling the current
+        // instruction must never itself advance PC or otherwise perturb emulation state.
+        string masterInstruction = SafeDecode(() => Sh2Disassembler.Decode(master.PC, sega32X.MasterSh2Bus).Text);
+        string slaveInstruction = SafeDecode(() => Sh2Disassembler.Decode(slave.PC, sega32X.SlaveSh2Bus).Text);
+
+        var lines = new List<string>
+        {
+            $"32X    nRES={sega32X.NRes}  ADEN={sega32X.Aden}",
+            "",
+            $"Master PC={master.PC:X8}  SR={master.SR:X8}  Cycles={master.TotalCycles}",
+            $"  Next: {masterInstruction}",
+        };
+        for (int i = 0; i < 16; i += 4)
+        {
+            lines.Add($"  R{i}-R{i + 3}: {master.R[i]:X8} {master.R[i + 1]:X8} {master.R[i + 2]:X8} {master.R[i + 3]:X8}");
+        }
+        lines.Add($"  PR={master.PR:X8}  GBR={master.GBR:X8}  VBR={master.VBR:X8}  MACH={master.MACH:X8}  MACL={master.MACL:X8}");
+
+        lines.Add("");
+        lines.Add($"Slave  PC={slave.PC:X8}  SR={slave.SR:X8}  Cycles={slave.TotalCycles}");
+        lines.Add($"  Next: {slaveInstruction}");
+        for (int i = 0; i < 16; i += 4)
+        {
+            lines.Add($"  R{i}-R{i + 3}: {slave.R[i]:X8} {slave.R[i + 1]:X8} {slave.R[i + 2]:X8} {slave.R[i + 3]:X8}");
+        }
+        lines.Add($"  PR={slave.PR:X8}  GBR={slave.GBR:X8}  VBR={slave.VBR:X8}  MACH={slave.MACH:X8}  MACL={slave.MACL:X8}");
+
+        _sh2RegistersText.Lines = lines.ToArray();
+    }
+
+    /// <summary>Labeled instruction-stream listing for both SH-2 cores -- same shape as
+    /// <see cref="UpdateDisassembly"/>, using <see cref="Sega32X.MasterSh2Bus"/>/
+    /// <see cref="Sega32X.SlaveSh2Bus"/> (the same bus each core executes against, exposed
+    /// read-only for exactly this peek-disassembly purpose) rather than a bus this form owns
+    /// itself.</summary>
+    private void UpdateSh2Disassembly()
+    {
+        var sega32X = _console!.Sega32X;
+        var master = sega32X.MasterSh2;
+        var slave = sega32X.SlaveSh2;
+
+        var masterLines = SafeDecodeLines(() =>
+        {
+            var instructions = Sh2Disassembler.DisassembleRange(master.PC, DisasmLineCount, sega32X.MasterSh2Bus);
+            return DisassemblyLabeler.FormatWithLabels(instructions, master.PC, a => a.ToString("X8"));
+        });
+        var slaveLines = SafeDecodeLines(() =>
+        {
+            var instructions = Sh2Disassembler.DisassembleRange(slave.PC, DisasmLineCount, sega32X.SlaveSh2Bus);
+            return DisassemblyLabeler.FormatWithLabels(instructions, slave.PC, a => a.ToString("X8"));
+        });
+
+        _msh2DisasmText.Lines = masterLines.ToArray();
+        _ssh2DisasmText.Lines = slaveLines.ToArray();
     }
 
     private void UpdatePalette()

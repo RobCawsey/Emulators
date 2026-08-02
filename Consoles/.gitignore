@@ -2,3 +2,7 @@ bin/
 obj/
 .vs/
 *.user
+
+# Local ROM dumps used for manual smoke-testing -- copyrighted commercial game images,
+# never to be committed.
+SagaRoms/

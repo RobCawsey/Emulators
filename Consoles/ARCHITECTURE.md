@@ -25,6 +25,7 @@ emulator (`NesSharp*`) that shares no code with GenesisSharp and is out of scope
 2. [Solution and project layout](#2-solution-and-project-layout)
 3. [The 68000 CPU core](#3-the-68000-cpu-core)
 4. [The Z80 CPU core](#4-the-z80-cpu-core)
+4a. [The SH-2 CPU core (32X, in progress)](#4a-the-sh-2-cpu-core-32x-in-progress)
 5. [GenesisConsole — the system bus and orchestrator](#5-genesisconsole--the-system-bus-and-orchestrator)
 6. [The VDP (Video Display Processor)](#6-the-vdp-video-display-processor)
 7. [Audio: YM2612 (FM) and PSG](#7-audio-ym2612-fm-and-psg)
@@ -94,25 +95,29 @@ GenesisSharp.sln
 src/
   GenesisSharp.Cpu68000/   — net9.0, no dependencies
   GenesisSharp.CpuZ80/     — net9.0, no dependencies
-  GenesisSharp.Core/       — net9.0, depends on Cpu68000 + CpuZ80
+  GenesisSharp.CpuSh2/     — net9.0, no dependencies (32X Phase 1)
+  GenesisSharp.Core/       — net9.0, depends on Cpu68000 + CpuZ80 + CpuSh2 (32X Phase 2)
   GenesisSharp.Frontend/   — net9.0-windows, WinForms, depends on Core, NAudio 2.3.0
 tests/
-  GenesisSharp.Tests/      — net9.0, xUnit, depends on Cpu68000 + CpuZ80 + Core (not Frontend)
+  GenesisSharp.Tests/      — net9.0, xUnit, depends on Cpu68000 + CpuZ80 + CpuSh2 + Core (not Frontend)
 SagaRoms/                  — real commercial/homebrew ROMs used by integration tests & manual testing
 reference/
   genesis-plus-gx/         — cloned reference emulator, used only for source comparison (never built/linked)
   SGDK/                    — cloned homebrew SDK, used only for source comparison
+  PicoDrive/picodrive/     — cloned reference emulator, ground truth for the SH-2/32X work (§4a)
 ```
 
-Dependency direction is strictly one-way: `Cpu68000`/`CpuZ80` → `Core` → `Frontend`. `Frontend`
-never references either CPU project directly — it only ever sees `Cpu68000.IBus`/`CpuZ80.IBus`
-(aliased in `DebugForm.cs` as `Cpu68000Bus`/`Z80Bus`) through `Core`. `Tests` references the CPU
-projects and `Core` directly (for low-level per-instruction unit tests) but not `Frontend`, since
+Dependency direction is strictly one-way: `Cpu68000`/`CpuZ80`/`CpuSh2` → `Core` → `Frontend`.
+`Frontend` never references any CPU project directly — it only ever sees `Cpu68000.IBus`/
+`CpuZ80.IBus` (aliased in `DebugForm.cs` as `Cpu68000Bus`/`Z80Bus`) through `Core`; there's no
+`CpuSh2`-facing frontend support yet (see §4a's known gaps). `Tests` references every CPU project
+and `Core` directly (for low-level per-instruction unit tests) but not `Frontend`, since
 `MainForm`/`DebugForm` have no automated coverage — see §10.
 
-`reference/genesis-plus-gx` and `reference/SGDK` are **not build dependencies of anything** — they
-are git clones kept around purely so that comments in this codebase can say "confirmed against
-genesis-plus-gx's `vdp_ctrl.c`" and you can go read that file yourself. See §13 for their licenses.
+`reference/genesis-plus-gx`, `reference/SGDK`, and `reference/PicoDrive` are **not build
+dependencies of anything** — they are git clones kept around purely so that comments in this
+codebase can say "confirmed against genesis-plus-gx's `vdp_ctrl.c`" (or PicoDrive's `sh2.c`) and
+you can go read that file yourself. See §13 for their licenses.
 
 Every project has `<Nullable>enable</Nullable>` and `<ImplicitUsings>enable</ImplicitUsings>`, set
 per-project (there's no shared `Directory.Build.props`). `GenesisSharp.Frontend` is the only
@@ -268,6 +273,320 @@ between `Step()` calls, so this is safe).
 - R increments once per instruction, not once per M1 cycle (an acknowledged inaccuracy for code
   that reads R via `LD A,R` for entropy/timing tricks).
 - Any genuinely unassigned opcode (main table or ED-prefixed) throws rather than behaving as a NOP.
+
+---
+
+## 4a. The SH-2 CPU core (32X, in progress)
+
+`src/GenesisSharp.CpuSh2/`, class `Sh2` — a `public sealed partial class` split across ~13 files
+by instruction category (`Sh2.DataTransfer.cs`, `Sh2.Arithmetic.cs`, `Sh2.Logic.cs`,
+`Sh2.Shift.cs`, `Sh2.Divide.cs`, `Sh2.MacMultiply.cs`, `Sh2.ControlFlow.cs`,
+`Sh2.SystemControl.cs`, `Sh2.Interrupts.cs`, `Sh2.Flags.cs`, `Sh2.Decode.cs`, `Sh2.cs`,
+`Sh2.SaveState.cs`). This is **Phase 1 of an in-progress Sega 32X extension** — a standalone,
+console-agnostic SH-2 interpreter with no 32X-specific knowledge, exactly as self-contained as
+`M68000`/`Z80` are. As of **Phase 2** (§4a.1, below), `GenesisSharp.Core` does construct and step
+two instances of it; as of **Phase 3** (§4a.2) a 32X title's own frame buffer graphics can actually
+be seen; as of **Phase 4** (§4a.3) its PWM audio can be heard, mixed in alongside PSG/YM2612; and
+as of **Phase 5** (§4a.4) the whole subsystem round-trips through save states and has a live debug
+tab.
+
+Ground truth for this core is **PicoDrive** (`reference/PicoDrive/picodrive/`), not
+genesis-plus-gx — genesis-plus-gx has never shipped 32X/SH-2 support. See §13 for its license and
+citation details.
+
+### Bus abstraction
+
+```csharp
+public interface IBus
+{
+    byte ReadByte(uint address);
+    ushort ReadWord(uint address);
+    uint ReadLong(uint address);
+    void WriteByte(uint address, byte value);
+    void WriteWord(uint address, ushort value);
+    void WriteLong(uint address, uint value);
+}
+```
+Shaped like the 68000's (width-typed methods, no port space — SH-2 has no port I/O), but with a
+full 32-bit `address` and no masking assumed at this layer, unlike the 68000's 24-bit bus. Which
+address bits are physically wired, and how the CS0–CS3 areas decode, is entirely a 32X-integration
+concern for a later phase — this core makes no assumption about it.
+
+### Register file
+
+`uint[16] R`, `PC`, `PR` (subroutine return address — SH-2's equivalent of a link register), `GBR`,
+`VBR` (vector base — SH-2's exception vector table location is configurable, unlike the 68000's
+fixed table), `MACH`/`MACL` (the 64-bit MAC accumulator, split in two), `SR` (T/S/I3-I0/Q/M bits —
+see `Sh2.Flags.cs`), `TotalCycles`.
+
+### Delayed-branch strategy — the key structural idea
+
+SH-2 is a delayed-branch architecture (MIPS/SPARC-style): the instruction immediately following
+`BRA`/`BSR`/`BRAF`/`BSRF`/`JMP`/`JSR`/`RTS`/`RTE`/`BT.S`/`BF.S` — the "delay slot" — always executes
+*before* the branch takes effect. Plain (non-delayed) `BT`/`BF` do **not** have a delay slot; this
+split is the single easiest mistake to make in this core.
+
+Rather than exposing the delay slot as state that survives between `Step()` calls, one `Step()`
+call fully consumes a delayed branch *and* its mandatory delay-slot instruction as one atomic unit
+(`ExecuteDelayedBranch` in `Sh2.ControlFlow.cs`: fetch the slot opcode, execute it, then apply the
+branch's `PC` update, returning their combined cycle cost). This mirrors `M68000`'s existing
+"`Step()` is atomic between calls" contract, and gets "interrupts aren't sampled between a branch
+and its delay slot" for free, with no special-cased suppression check needed. A nested
+`BRA`/`BSR` inside a delay slot is detected and raises the illegal-*slot*-instruction exception
+(vector 6, distinct from plain illegal instruction's vector 4) — the one case PicoDrive itself
+models for this condition.
+
+### Decode structure
+
+SH-2's fixed 16-bit, no-prefix-byte encoding is regular enough that `Sh2.Decode.cs` follows the
+Z80 core's "switch on the opcode's top nibble, then an inner switch/switch-expression on the low
+bits" shape rather than the 68000's hand-written tree — mirroring PicoDrive's own
+`op0000`–`op1111` dispatch functions one-for-one, including which nibbles get a flat
+switch-expression versus a `switch` statement for irregular sub-ranges. Every dispatch arm that
+PicoDrive itself decodes as `ILLEGAL` calls `RaiseIllegalInstruction()` (the real hardware
+behavior); every other arm implements the real instruction. **The full standard SH-2 opcode set
+is implemented** — no on-chip cache, DMAC, timers, or serial are modeled (those are bus/peripheral
+concerns for the 32X integration phases, not CPU-core concerns, consistent with how VDP/YM2612/PSG
+are already kept separate from `M68000`/`Z80`).
+
+Two categories of instruction were ported *literally* from PicoDrive's C rather than reformulated,
+because their carry/overflow bookkeeping is easy to get subtly wrong: `ADDC`/`SUBC` (two separate
+overflow checks — the plain add/subtract, then whether the carry-in bit itself overflows — both
+needed; an initial single-check version of `ADDC` shipped without a test and was later found wrong
+for e.g. `R[n]=0xFFFFFFFF,R[m]=0,T=1`), `ADDV`/`SUBV`/`NEGC` (the dest/src/ans sign-bookkeeping
+pattern), `MAC.L`/`MAC.W`'s saturation logic, and `DIV1`'s Q/M/T bit manipulation (a hand
+re-derivation of `DIV1` caught one inverted comparison in its four-branch table before it ever
+shipped; `Sh2Tests.cs` also cross-checks it against an independently-transcribed reference oracle
+across 500 randomized operand/flag combinations). `DMULS`/`DMULU` and the pure-multiply term of
+`MAC.L`/`MAC.W` use native 64-bit C# arithmetic instead of PicoDrive's manual 16-bit-partial-product
+expansion — provably equivalent, not an approximation.
+
+### Interrupts
+
+`Sh2.Interrupts.cs` — a hybrid of the two existing cores' shapes: a 68000-style priority-mask
+`RaiseInterrupt(level, vectorNumber)` (only services if `level` exceeds `SR`'s I3-I0 field, and
+raises the mask to the serviced level), plus a Z80-style one-shot `RaiseNonMaskableInterrupt()`
+latch that's always taken regardless of the mask — explicitly flagged in-source as **unverified**,
+since PicoDrive itself doesn't model SH-2 NMI at all. Vector fetch is VBR-relative
+(`PC = bus.ReadLong(VBR + vector*4)`). `LDC Rm,SR`/`LDC.L @Rm+,SR` (which can change the interrupt
+mask) don't need any extra "recheck interrupts" bookkeeping the way PicoDrive's own `test_irq` flag
+does — `ServicePendingInterrupt()` already re-evaluates against the current `SR` at the top of
+every `Step()`, so a changed mask takes effect on the very next `Step()` for free.
+
+### Save state
+
+`Sh2.SaveState.cs` — all 16 `R`, `PC`, `PR`, `GBR`, `VBR`, `MACH`, `MACL`, `SR`, `TotalCycles`,
+pending-interrupt level/vector, NMI-pending flag; fixed order, no framing, matching the existing
+two cores. No delay-slot-related field is needed, precisely because the `Step()` design above never
+leaves that state observable between calls. Wired into `GenesisConsole.SaveState.cs` as of Phase 5
+(§4a.4, below).
+
+### Known gaps
+
+- On-chip cache, DMAC, on-chip timers, and serial communication are unimplemented — bus/peripheral
+  concerns deferred to the 32X integration phases.
+- `RaiseNonMaskableInterrupt()`'s vector number and exact interrupt-entry cost are recalled from
+  general SH-2 documentation, not confirmed against PicoDrive (which doesn't model SH-2 NMI).
+- Misaligned-address exceptions are unimplemented (matches this codebase's existing acceptance of
+  the 68000 core's NEGX/bus-error gap).
+- No hardware test-vector suite is known to exist for SH-2 (unlike the 68000 core's
+  SingleStepTests), so confidence here rests on PicoDrive source comparison plus this project's own
+  unit tests, not independent hardware validation.
+- Frontend support (debugger tab, disassembler) landed in Phase 5 — see §4a.4.
+
+### 4a.1 32X bus integration (Phase 2)
+
+`src/GenesisSharp.Core/Sega32X.cs` + `Sega32X.Bus.cs` — the MVP bus-integration layer: both SH-2s
+can now be released from reset by the 68000 and exchange data with it through shared communication
+registers, verified end-to-end by a synthetic test running real hand-assembled code on both CPUs
+(`GenesisConsoleSh2BusIntegrationTests.cs`) rather than a real ROM. Ground truth:
+`reference/PicoDrive/picodrive/pico/32x/memory.c` and `32x.c` (no 32X source exists in
+genesis-plus-gx) — genesis-plus-gx has never shipped 32X support, so this phase's memory map is
+sourced entirely from PicoDrive, cited per-member in `Sega32X.cs`.
+
+`GenesisConsole` now owns a `Sega32X Sega32X { get; }`, constructed unconditionally like
+`Vdp`/`Ym2612`/`Psg` — a non-32X ROM simply never writes the ADEN bit, so its two SH-2s are never
+stepped in `RunScanline()` and nothing here is observable to it. `Sega32X` holds the whole
+$A15100-$A1513F adapter/control register block as one flat `ushort[0x20]` (confirmed against
+PicoDrive's own `Pico32x.regs[0x20]`), 256KB of SH-2-side SDRAM, and each core's own boot-ROM
+buffer (2KB master / 1KB slave, matching PicoDrive's `sh2_rom_m`/`sh2_rom_s` sizes). Each SH-2 gets
+its own `Sh2.IBus` adapter (`Sega32XSh2Bus`) implementing the SH-2's CS0 (boot ROM + adapter
+registers)/CS1 (cartridge ROM, unbanked)/CS3 (SDRAM) address decode; CS2 (frame buffer) is left
+entirely unmapped this phase. The 68000 side gets two new address predicates in
+`GenesisConsole.cs` (`Is32XRegister` for the register block, `IsMarsIdRegister` for the
+`$A130EC` "MARS" hardware-presence probe), added to the same `if`-chain `IsVdpPort`/
+`IsZ80BusRequestRegister` already use.
+
+**Reset/enable gating**, confirmed against PicoDrive's own condition (`(regs[0] & (nRES|ADEN)) ==
+(nRES|ADEN)`, checked before running or interrupting either SH-2): both bits live in the same
+control byte, both SH-2s share a single reset line (no independent per-core reset exists in the
+register model), and a 0→1 transition of nRES resets both cores together. `RunScanline()` steps
+both SH-2s at a per-scanline budget of `CyclesPerScanlineM68000 * 3` (the same textbook ~3× ratio
+decided during this project's 32X planning), gated on that same condition, mirroring the Z80 bus
+arbitration code's "genuinely stopped while held, not just skipped mid-loop" shape exactly.
+
+**Explicitly deferred this phase** (named, not silently dropped — see `Sega32X.cs`'s own remarks):
+the frame buffer/VDP overlay (CS2, the 68k `$840000`/`$860000` windows, `vdp_regs`, palette) — now
+built in Phase 3 (§4a.2, below); PWM (Phase 4); DREQ/DMAC (storage-only, no transfer logic yet);
+interrupt routing (VRES/VINT/HINT/CMD/PWM) — not needed for the register-block wiring this phase
+proves; the 68k-side ROM banking window (`$900000-$9FFFFF`) — SH-2 CS1 reads the cartridge image
+directly and unbanked instead; a synthesized boot-stub/Initial-Data-Load fallback the way PicoDrive
+itself falls back to when no real 32X BIOS is supplied — real, unmodified 32X ROMs won't boot
+without this (or a real BIOS, which this project won't ship), so it's deferred to whenever
+real-ROM boot is attempted (Phase 6); and 32X-ROM auto-detection — the subsystem is always wired
+in and simply stays inert unless a ROM's own boot code sets ADEN itself.
+
+### 4a.2 32X VDP frame buffer graphics (Phase 3)
+
+`src/GenesisSharp.Core/Sega32X.Vdp.cs` — the 32X's own frame-buffer-based graphics chip: its
+double-buffered frame buffer, its 256-entry palette, its display-mode/fill/FBCR register block,
+and the compositing rule that overlays its output onto the Genesis VDP's own — Packed Pixel and
+Direct Color display modes only; Run Length is deferred (degrades to "layer off" rather than
+rendering garbage). Ground truth: `reference/PicoDrive/picodrive/pico/32x/draw.c` and `32x.c`,
+cited per-member in `Sega32X.Vdp.cs`.
+
+**The rendering hook**: `Vdp` stays 32X-agnostic, exactly like it already is about `Cartridge` —
+`Vdp.External32XPixelBlend` (a `delegate bool Try32XPixelBlend(int x, int y, bool
+isGenesisBackdrop, bool isH32, out byte r, out byte g, out byte b)`) is wired to
+`Sega32X.TryGetPixel` in `GenesisConsole`'s constructor and called from `Vdp.RenderScanline`
+right after the existing per-pixel compositing has resolved a Genesis pixel, immediately before
+it's committed to `FrameBuffer`. For any non-32X ROM, `TryGetPixel` returns false on its very
+first check (display mode off, the power-on default) — a true no-op, same safety shape as Phase
+2's always-wired-but-inert register block; the full existing test suite (which already exercises
+real non-32X ROMs via `SagaRoms/`) is the regression guard for this claim.
+
+**Compositing rule** — confirmed to be *not* a simple "32X always wins" (`draw.c:62-105`): the 32X
+pixel shows unconditionally wherever the Genesis plane resolved to its own backdrop color
+(`reg[7]&0x3f`), and otherwise only if its own priority bit (a bit baked into each palette entry
+for Packed Pixel, or bit 15 of the raw pixel word for Direct Color — inverted globally by the
+`PRI` register bit) is set; otherwise the Genesis pixel wins.
+
+**Frame-buffer addressing is not a fixed stride** — the low 512 bytes of each bank hold a
+256-entry table of per-scanline word offsets into the same bank, which real 32X software writes
+itself before drawing a frame; rendering scanline `y` reads `dram[y+8]` (the `+8` is a fixed
+V28/224-line constant, hardcoded since GenesisSharp is NTSC/224-line only) to find where that
+line's pixel data starts. H32 mode additionally offsets the Genesis x-coordinate by 4 relative to
+the 32X pixel index (confirmed directly against `draw.c:18-19,148`'s `pmd += H32_OFFSET`).
+
+**Double buffering**: FBCR's `FS` bit selects which bank rendering reads from (`DisplayBankIndex`)
+— the SH-2s' CS2 window and the 68000's `$840000`/`$860000` windows always target the *other*
+bank (`WriteBankIndex`), so software can draw the next frame without corrupting what's currently
+displayed. Writing `FS` applies immediately while blanking, otherwise it's deferred to the next
+vblank-start transition, driven by `Sega32X.UpdateBlankingState` — called once per scanline from
+`GenesisConsole.RunScanline`, which is also what keeps `VBLK` genuinely mirroring the Genesis
+VDP's own vblank window rather than running on an independent clock. `HBLK`/`nFEN` are **not**
+real hardware timing — confirmed as an admitted hack even in PicoDrive itself (its own author:
+"what's the deal with that?"), faked here identically via a free-running counter incremented on
+every FBCR read.
+
+**Known gaps this phase**: Run Length display mode; real multi-cycle autofill timing (the burst
+completes instantly on write); the exact inclusive/exclusive word-count convention for the
+autofill length register (implemented as length+1 words, a reasonable but not byte-exact-confirmed
+interpretation); which physical R/G/B channel each of the three 5-bit fields in a 5:5:5 color
+corresponds to (the source only confirms relative bit positions, never absolute channel identity
+— this core labels them R/G/B in low-to-high bit order as its own choice, not a stated hardware
+fact); 32X-side VINT/HINT interrupts (unchanged from Phase 2 — polling `FBCR` is enough for MVP
+compositing).
+
+### 4a.3 PWM audio (Phase 4)
+
+`src/GenesisSharp.Core/Sega32X.Pwm.cs` — the 32X's PWM sound chip. Despite the name, this is not
+real duty-cycle waveform synthesis: PicoDrive's own `convert_sample` treats each FIFO entry as a
+linear amplitude value and rescales it directly into a PCM-ish sample
+(`v` clamped to the current cycle-register-derived period, then `(v * mult >> 8) - 0x8000`) — this
+core does the same. Ground truth: `reference/PicoDrive/picodrive/pico/32x/pwm.c`, cited per-member
+in `Sega32X.Pwm.cs`.
+
+**No new bus wiring needed** — PWM's registers (bytes 0x30-0x3f) live inside the same
+$A15100-$A1513F/$4000-$403F block Phase 2 already wired end-to-end; the new register side effects
+(FIFO push on odd-address write, FULL/EMPTY status-bit reads, the confirmed asymmetric write
+permission — the 68000 can only ever affect the routing nibble, RTP and the IRQ-timer field are
+SH-2-exclusive) are dispatched from *inside* `Sega32X.cs`'s existing
+`WriteControlByteFrom68k`/`WriteRegisterByteFromSh2`/`ReadControlByteFor68k`/
+`ReadControlByteForSh2` for offsets ≥ 0x30.
+
+**Per-sample generation, not PicoDrive's batched resampling**: PicoDrive generates PWM into an
+internal ring buffer continuously as the SH-2 executes and resamples that buffer once per host
+audio callback. `Sega32X.GeneratePwmSample(sampleDurationSeconds)` instead produces exactly one
+output sample per call — matching how `Psg`/`Ym2612` already work — by tracking its own
+elapsed-cycle debt (in 32x-cycle units, using the *fixed* 3× SH-2:68000 hardware ratio confirmed
+distinct from whatever throttled SH-2 execution-speed multiplier drives instruction stepping
+elsewhere) and only dequeuing a FIFO entry once that debt crosses the current sample period,
+otherwise returning the previously-held value. This reproduces PicoDrive's sample-and-hold
+decimation *and* its underrun-holds-last-value behavior with no separate ring buffer needed.
+`GenesisConsole.GenerateAudioSample()` mixes its stereo output in alongside PSG/YM2612 — no
+`RunScanline` change was needed, since audio generation already runs at the right cadence.
+
+**Known gaps this phase**: PWM interrupts (`P32XI_PWM`) and RTP-triggered DREQ1/DMA auto-feed —
+both part of the interrupt/DMA subsystem Phase 2 already deferred wholesale. This is a real,
+load-bearing gap for games that rely on the interrupt as their "feed me more data" signal, but
+FIFO underrun degrades safely (holds the last sample rather than crashing or producing garbage).
+The exact bit-field meaning of routing-nibble values other than the two confirmed stereo modes
+(normal/swapped) and the four confirmed-invalid ones — treated here as mono — isn't fully resolved
+even in PicoDrive's own source.
+
+### 4a.4 Frontend integration and save states (Phase 5)
+
+Unlike Phases 2-4, this phase is about integrating with GenesisSharp's own existing frontend/
+save-state code, not more PicoDrive hardware research — ground truth here is this codebase's own
+established conventions (`Vdp.SaveState.cs`'s array-persistence idiom, `M68kDisassembler`/
+`Z80Disassembler`'s shape, `DebugForm`'s existing tab layout), cited per-section below.
+
+**Save states** — `src/GenesisSharp.Core/Sega32X.SaveState.cs`: `SaveState`/`LoadState` covering
+the entire subsystem — the adapter/control register block, SDRAM, both boot ROMs (currently always
+blank during normal play; included anyway so a future boot-stub-synthesis phase doesn't silently
+need another version bump to start persisting them), both SH-2 cores' own state (delegating to
+`Sh2.SaveState`/`Sh2.LoadState`), the VDP overlay's registers/palette/frame buffers/blanking
+bookkeeping, and the PWM chip's FIFOs/held samples/cycle debt. Wired into
+`GenesisConsole.SaveState.cs` right after `ExtPort`, alongside two new raw fields
+(`_msh2CycleDebt`/`_ssh2CycleDebt`, the SH-2 equivalents of the existing `_z80CycleDebt`) —
+`SaveStateVersion` bumped 1→2. Verified by `Sega32XSaveStateTests.cs` (5 tests): each state
+category round-trips independently (both SH-2 cores' registers, the adapter/COMM registers, the
+VDP overlay, the PWM FIFO), plus an end-to-end test that loads a save state into a *fresh*
+`GenesisConsole` and confirms 10 more frames of both video and audio output stay bit-identical to
+the original.
+
+**Disassembler** — `src/GenesisSharp.Frontend/Sh2Disassembler.cs`: mirrors `M68kDisassembler`/
+`Z80Disassembler`'s exact shape (`Decode`/`DisassembleRange`/hardware-register trailing-comment
+annotation, wrapped in the same try/catch-falls-back-to-a-raw-hex-dump pattern), reusing the
+existing `DisassembledInstruction` record and `DisassemblyLabeler`. Built directly from
+`Sh2.Decode.cs`'s own dispatch tables and each instruction's implementation in the `Sh2.*.cs`
+files — a from-scratch encoder of the *same* opcode map the core itself decodes, not an
+independent transcription of the SH-2 ISA, so it can't drift from what the core actually executes.
+Displacement operands are shown pre-scaled to bytes (e.g. `MOV.L R3,@(20,R2)` for a disp4 of 5),
+matching the official Hitachi/Renesas assembly mnemonic convention rather than the raw encoded
+nibble. PC-relative loads (`MOV.W`/`MOV.L @(disp,PC)`, `MOVA`) resolve to a concrete target address
+using the same "PC as it stands right after this instruction's own fetch, plus 2" convention
+`Sh2.DataTransfer.cs` itself uses — the address is statically known at disassembly time even though
+the loaded *value* isn't. Every opcode `Sh2.Decode.cs`'s own dispatch tables treat as
+architecturally illegal is reported as literal `ILLEGAL` text (a known fact, not a gap); a genuine
+decode-time exception falls back to a `.WORD` hex dump. No automated test file exists for it,
+matching the existing precedent that neither `M68kDisassembler` nor `Z80Disassembler` has one
+either — instead it was verified with a throwaway scratch harness (not checked in) exercising
+~30 hand-encoded opcodes spanning every dispatch group, including branch-target arithmetic and the
+hardware-register annotation.
+
+**Debug window** — `DebugForm.cs` gained a "32X" tab, same registers-box-on-top/two-column-
+disassembly-below layout as the existing CPU tab: live register dumps for both `Sega32X.MasterSh2`/
+`SlaveSh2` (all 16 `R`, PC, SR, PR, GBR, VBR, MACH, MACL, cycle count) plus the adapter's nRES/ADEN
+release state, and a labeled disassembly listing for each core starting at its current PC. Peek
+reads for disassembly go through two new `Sega32X.MasterSh2Bus`/`SlaveSh2Bus` properties — the same
+`Sega32XSh2Bus` instance each core already executes against, exposed as the public `CpuSh2.IBus`
+interface type for exactly this read-only purpose (the concrete bus class itself stays `internal`,
+the same pattern `GenesisConsole` itself uses for the 68000/Z80 disassemblers).
+
+**32X ROM indicator** — `Cartridge.Is32X`: a minimal, display-only check of the standard Genesis
+header's console-name field (16 ASCII bytes at ROM offset 0x100), true if it contains `"SEGA 32X"`
+— the documented convention real 32X titles use to identify themselves to the 32X's own boot ROM.
+`MainForm` appends `" [32X]"` to the window title when set. Purely cosmetic: nothing in
+`GenesisConsole`/`Sega32X` reads this property — the 32X subsystem is always wired in and is only
+ever activated by a ROM's own code setting ADEN/nRES itself, exactly as it was before this
+property existed. This is also the first header-parsing code anywhere in `Cartridge` — everything
+else about cartridge loading remains the same "raw headerless image" scaffolding described at the
+top of this section.
+
+**Known gaps this phase**: none within Phase 5's own defined scope — Phase 6 (validation against
+real, legally-owned 32X ROM dumps) is the only phase left in the 32X plan, and hasn't started.
 
 ---
 
@@ -917,6 +1236,20 @@ A consolidated list, pulled from §3–§9, of what to check first if a game mis
   `Vdp.ShadowHighlight.cs`.)
 - **YM2612**: LFO, SSG-EG, and channel-3 "special mode" are entirely unmodeled. The rate-to-dB
   envelope curve is a smooth exponential approximation, not the chip's exact non-linear table.
+- **SH-2 / 32X**: the SH-2 CPU core (§4a), its bus integration (§4a.1), its frame-buffer graphics
+  (§4a.2), its PWM audio (§4a.3), and its frontend/save-state integration (§4a.4) are Phases 1-5 of
+  an in-progress 32X extension — both SH-2s can be released from reset and exchange data with the
+  68000 via COMM registers, a 32X title's own Packed Pixel/Direct Color frame-buffer output
+  composites correctly with the Genesis VDP's, its PWM output is audibly mixed in, the whole
+  subsystem round-trips through save states, and the debug window has a live SH-2 register/
+  disassembly tab — but there is still no Run Length display mode, no DREQ/DMAC, no 32X-side
+  interrupt routing (including PWM's own "feed me more data" interrupt — FIFO underrun degrades
+  safely to holding the last sample rather than breaking outright, but some real games may still go
+  audibly stale without it), and no synthesized boot-stub fallback (so an unmodified real 32X ROM
+  won't boot without a real BIOS this project doesn't ship). Within the CPU core itself: no
+  cache/DMAC/timer/serial emulation; NMI's vector number and interrupt-entry cost are unverified
+  (PicoDrive doesn't model SH-2 NMI); no hardware test-vector suite is known to exist for SH-2,
+  unlike the 68000 core. Phase 6 (validation against real 32X ROM dumps) hasn't started.
 - **General**: no true whole-system single-instruction step (the frontend's "step instruction" is
   68000-only, by design — a real cross-chip single step would need sub-scanline stepping support
   that doesn't exist yet); PAL timing/60Hz-vs-50Hz is entirely unmodeled (NTSC-only).
@@ -975,6 +1308,22 @@ A free, actively-used C SDK for Genesis/Mega Drive homebrew development, by Step
 - Used as a real-world *consumer* of VDP hardware timing: SGDK's own `VDP_waitDMACompletion`
   function polls the VDP status register's DMA-busy bit, which is part of why that bit's exact
   timing behavior matters for homebrew compatibility, not just for specific commercial ROMs.
+
+**PicoDrive** — `reference/PicoDrive/picodrive/`
+An open-source Genesis/Mega Drive/32X/Sega CD/SG-1000/Master System/Pico emulator, originally built
+for ARM-based handhelds, by Gražvydas "notaz" Ignotas. The only vendored reference with real 32X
+and SH-2 support — genesis-plus-gx has never shipped either — so it is the sole ground truth for
+§4a's SH-2 CPU core. Its SH-2 interpreter (`cpu/sh2/mame/sh2.c`) is itself MAME's portable SH-2
+core, © Juergen Buchmueller, freeware for non-commercial use.
+- License: the same non-commercial, source-available shape as genesis-plus-gx's — redistributions
+  may not be sold or used commercially, and modified redistributions must include complete source.
+  See `reference/PicoDrive/picodrive/COPYING` for the full text.
+- Used to confirm/derive: every SH-2 opcode's bit pattern and dispatch grouping; delayed-branch and
+  illegal-slot-instruction semantics; DIV0S/DIV0U/DIV1's Q/M/T bit manipulation; MAC.L/MAC.W's
+  saturation logic; ADDC/SUBC/ADDV/SUBV/NEGC's carry/overflow bookkeeping; SR's flag-bit layout and
+  the FLAGS mask used by LDC/RTE; and exact per-instruction cycle costs (including PicoDrive's own
+  "timing is a guess" caveats on TRAPA/ILLEGAL, reproduced here rather than silently upgraded to
+  false confidence).
 
 ### Community hardware documentation and other emulators (cited by name, not vendored)
 

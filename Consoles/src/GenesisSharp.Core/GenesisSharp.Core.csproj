@@ -3,6 +3,7 @@
   <ItemGroup>
     <ProjectReference Include="..\GenesisSharp.Cpu68000\GenesisSharp.Cpu68000.csproj" />
     <ProjectReference Include="..\GenesisSharp.CpuZ80\GenesisSharp.CpuZ80.csproj" />
+    <ProjectReference Include="..\GenesisSharp.CpuSh2\GenesisSharp.CpuSh2.csproj" />
   </ItemGroup>
 
   <PropertyGroup>
