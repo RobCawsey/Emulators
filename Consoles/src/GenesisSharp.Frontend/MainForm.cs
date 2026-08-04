@@ -94,6 +94,36 @@ public sealed class MainForm : Form
     private ToolStripMenuItem _pauseMenuItem = null!;
     private RetroWindowChrome? _chrome;
 
+    /// <summary>68000 PC breakpoint, set from <see cref="DebugForm"/>'s breakpoint row -- split
+    /// into an armed flag plus a plain address (rather than a single <c>uint?</c>) because
+    /// <c>volatile</c> doesn't allow nullable value types. Checked on the emulation thread
+    /// against every address <c>M68000.InstructionFetching</c> reports (a pre-existing debugging
+    /// hook); a match throws <see cref="BreakpointHitException"/> to unwind out of the current
+    /// <see cref="GenesisConsole.RunFrame"/> call immediately -- a plain flag alone wouldn't stop
+    /// execution until the whole frame (thousands of instructions) finished.</summary>
+    private volatile bool _breakpointArmed;
+    private volatile uint _breakpointAddress;
+
+    /// <summary>Debug-window override for <see cref="GenesisConsole.VersionRegisterValue"/> --
+    /// null means "use whatever GenesisConsole's own default is." Stored here, not just written
+    /// directly to the live console, specifically so it survives <see cref="StartConsole"/>
+    /// creating a brand-new <see cref="GenesisConsole"/> on reload (which would otherwise reset
+    /// it back to the default via the property initializer) -- same reasoning as
+    /// <see cref="_breakpointArmed"/>/<see cref="_breakpointAddress"/> surviving reloads, and the
+    /// bug this field's addition fixes: setting an override, then reloading to re-run the boot
+    /// sequence from scratch, silently lost it before the check it was meant to influence ever
+    /// ran again.</summary>
+    private byte? _versionRegisterOverride;
+
+    /// <summary>Set by the emulation thread the moment a breakpoint fires, cleared and acted on
+    /// by <see cref="RepaintAndRefreshDebugWindow"/> on the UI thread -- <see
+    /// cref="ToolStripMenuItem.Text"/>/<see cref="DebugForm.SetPausedLabel"/> are WinForms
+    /// controls and must only ever be touched from there, never from the emulation thread that
+    /// actually detects the hit.</summary>
+    private volatile bool _breakpointHit;
+
+    private sealed class BreakpointHitException : Exception;
+
     private ToolStripMenuItem _retroMenuItem = null!;
     private bool _retroOverlayEnabled;
 
@@ -543,11 +573,22 @@ public sealed class MainForm : Form
 
         _console = new GenesisConsole(cartridge);
         _console.Reset();
+        if (_versionRegisterOverride is byte versionOverride)
+        {
+            _console.VersionRegisterValue = versionOverride;
+        }
 
         _visitedPcs.Clear();
         _ticksSinceNewPc = 0;
         _lockupDumped = false;
         _console.Cpu.InstructionFetching += pc => _visitedPcs.Add(pc);
+        _console.Cpu.InstructionFetching += pc =>
+        {
+            if (_breakpointArmed && _breakpointAddress == pc)
+            {
+                throw new BreakpointHitException();
+            }
+        };
 
         _errorMessage = null;
         _loadedRomPath = romPath;
@@ -585,7 +626,7 @@ public sealed class MainForm : Form
     {
         if (_debugForm is null)
         {
-            _debugForm = new DebugForm(TogglePause, StepFrame, StepInstruction);
+            _debugForm = new DebugForm(TogglePause, StepFrame, StepInstruction, SetBreakpoint, SetVersionRegisterOverride);
             _debugForm.SetConsole(_console);
         }
 
@@ -633,6 +674,37 @@ public sealed class MainForm : Form
         }
 
         _stepInstructionRequested = true;
+    }
+
+    /// <summary>Arms or disarms the 68000 PC breakpoint (see <see cref="_breakpointAddress"/>'s
+    /// remarks) from the debug window's breakpoint row. Safe to call from the UI thread while
+    /// the emulation thread is running -- reads/writes are plain volatile fields. Address is set
+    /// before the armed flag so the emulation thread never observes "armed" with a stale
+    /// (previous) address.</summary>
+    private void SetBreakpoint(uint? address)
+    {
+        if (address is uint value)
+        {
+            _breakpointAddress = value;
+            _breakpointArmed = true;
+        }
+        else
+        {
+            _breakpointArmed = false;
+        }
+    }
+
+    /// <summary>Sets both the stored override (so it survives the next reload -- see
+    /// <see cref="_versionRegisterOverride"/>'s remarks) and the live console's value (so it
+    /// takes effect immediately for the currently-running instance too, without needing a
+    /// reload first).</summary>
+    private void SetVersionRegisterOverride(byte value)
+    {
+        _versionRegisterOverride = value;
+        if (_console is not null)
+        {
+            _console.VersionRegisterValue = value;
+        }
     }
 
     /// <summary>The emulation thread's main loop: a fixed-timestep runner, paced against a
@@ -713,6 +785,16 @@ public sealed class MainForm : Form
         {
             _console!.RunFrame();
         }
+        catch (BreakpointHitException)
+        {
+            // Not a real error -- see _breakpointAddress's remarks. Pause exactly where the
+            // CPU was about to fetch the breakpoint's opcode; UI-thread state (menu text, debug
+            // form label) is synced from _breakpointHit by RepaintAndRefreshDebugWindow, never
+            // touched directly from this thread.
+            _paused = true;
+            _breakpointHit = true;
+            return;
+        }
         catch (Exception ex)
         {
             // Plenty of real cartridges will reach code paths this emulator doesn't support
@@ -741,6 +823,16 @@ public sealed class MainForm : Form
         try
         {
             _console!.Cpu.Step();
+        }
+        catch (BreakpointHitException)
+        {
+            // See RunOneFrame's identical catch -- not a real error. A single step can hit the
+            // armed breakpoint just as validly as a full frame can (e.g. it's still armed from
+            // an earlier test at a not-yet-reached address); stay paused rather than crash the
+            // emulation thread.
+            _paused = true;
+            _breakpointHit = true;
+            return;
         }
         catch (Exception ex)
         {
@@ -777,6 +869,13 @@ public sealed class MainForm : Form
 
         _display.Invalidate();
         _debugForm?.RefreshSnapshot();
+
+        if (_breakpointHit)
+        {
+            _breakpointHit = false;
+            _pauseMenuItem.Text = "&Resume";
+            _debugForm?.SetPausedLabel(true);
+        }
     }
 
     /// <summary>Temporary lockup-diagnosis hook — writes CPU/VDP/controller state to a file

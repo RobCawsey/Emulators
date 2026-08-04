@@ -3175,12 +3175,17 @@
     own output — actually shows up, and its PWM audio output is audibly mixed in alongside the
     PSG/YM2612. The whole subsystem also round-trips through GenesisSharp's own save states now,
     and the debug window has a live tab showing both SH-2 cores' registers and a disassembly
-    listing. What still doesn't exist: Run Length display mode, DREQ/DMAC, 32X-side interrupt
-    routing (including PWM's own "feed me more data" interrupt — underrun degrades safely to
-    holding the last sample rather than breaking outright, but some real games may still go
-    audibly stale without it), and a synthesized boot-stub fallback, so an unmodified real 32X ROM
-    still won't boot without a real BIOS this project doesn't ship. See the project's own
-    <code>ARCHITECTURE.md</code> (§4a-§4a.4) for the software design and what's planned next.
+    listing. GenesisSharp doesn't ship a real 32X BIOS (Sega's own firmware, not something this
+    project can distribute) — but it now synthesizes an equivalent boot stub, the same fallback
+    PicoDrive itself uses when no real BIOS is supplied: both cores run the real "M_OK"/"S_OK"
+    COMM-register handshake and jump into the entry point named at their ROM's own header, rather
+    than hitting a blank boot ROM and spinning on an illegal instruction forever. What still
+    doesn't exist: Run Length display mode, DREQ/DMAC, and 32X-side interrupt routing (including
+    PWM's own "feed me more data" interrupt — underrun degrades safely to holding the last sample
+    rather than breaking outright, but some real games may still go audibly stale without it) —
+    any of which could still stall or misbehave in a real title's post-boot code independent of
+    whether boot itself now succeeds. See the project's own <code>ARCHITECTURE.md</code>
+    (§4a-§4a.5) for the software design and what's planned next.
   </p>
 </section>
 

@@ -64,10 +64,20 @@ public sealed class DebugForm : Form
     private readonly Action _onPauseToggle;
     private readonly Action _onStepFrame;
     private readonly Action _onStepInstruction;
+    private readonly Action<uint?> _onSetBreakpoint;
+    private readonly Action<byte> _onSetVersionRegisterOverride;
 
     private readonly TextBox _registersText;
     private readonly TextBox _m68kDisasmText;
     private readonly TextBox _z80DisasmText;
+    private readonly TextBox _m68kPeekAddressBox;
+    private readonly TextBox _hexDumpText;
+
+    /// <summary>When set, the 68000 disassembly panel shows a fixed range starting here instead
+    /// of following the live PC -- for hunting down a caller when the "Next:" line only shows
+    /// whatever subroutine happens to be executing right now (e.g. a stack-peeked return address
+    /// that isn't the live PC). Cleared by the "Follow PC" button.</summary>
+    private uint? _m68kPeekAddress;
     private readonly TextBox _sh2RegistersText;
     private readonly TextBox _msh2DisasmText;
     private readonly TextBox _ssh2DisasmText;
@@ -81,11 +91,13 @@ public sealed class DebugForm : Form
     private int _tilesPerRow;
     private RetroWindowChrome? _chrome;
 
-    public DebugForm(Action onPauseToggle, Action onStepFrame, Action onStepInstruction)
+    public DebugForm(Action onPauseToggle, Action onStepFrame, Action onStepInstruction, Action<uint?> onSetBreakpoint, Action<byte> onSetVersionRegisterOverride)
     {
         _onPauseToggle = onPauseToggle;
         _onStepFrame = onStepFrame;
         _onStepInstruction = onStepInstruction;
+        _onSetBreakpoint = onSetBreakpoint;
+        _onSetVersionRegisterOverride = onSetVersionRegisterOverride;
 
         Text = "GenesisSharp Debug";
         StartPosition = FormStartPosition.Manual;
@@ -111,14 +123,14 @@ public sealed class DebugForm : Form
         toolbar.Controls.Add(stepInstructionButton);
 
         var registersFont = new Font(FontFamily.GenericMonospace, 10);
-        // Content is currently 20 lines (68000 header + next-instruction + 4 register rows +
-        // blank + 6 Z80 lines (header/next-instruction/main+alt register pairs/IX-IY-SP/
-        // I-R-IFF-IM) + blank + 2 VDP lines + blank + 2 audio lines) -- sized from the font's
-        // own real line height, with a few spare lines of headroom, rather than a fixed pixel
-        // guess that silently clips whatever doesn't fit once font/DPI scaling makes each line
-        // taller than expected (which is exactly what was cutting the Z80/VDP lines off below
-        // the fold, previously).
-        const int registerLineCount = 22;
+        // Content is currently 22 lines (68000 header + next-instruction + 4 register rows +
+        // stack peek + last-exception line + blank + 6 Z80 lines (header/next-instruction/
+        // main+alt register pairs/IX-IY-SP/I-R-IFF-IM) + blank + 3 VDP lines (registers + DMA
+        // state) + blank + 2 audio lines) -- sized from the font's own real line height, rather
+        // than a fixed pixel guess that silently clips whatever doesn't fit once font/DPI scaling
+        // makes each line taller than expected (which is exactly what was cutting the Z80/VDP
+        // lines off below the fold, previously).
+        const int registerLineCount = 24;
         _registersText = new TextBox
         {
             Multiline = true,
@@ -177,6 +189,161 @@ public sealed class DebugForm : Form
         };
         disasmPanel.Controls.Add(_m68kDisasmText, 0, 0);
         disasmPanel.Controls.Add(_z80DisasmText, 1, 0);
+
+        // Lets the 68000 disassembly panel show a fixed address range instead of always
+        // following the live PC -- useful for reading a subroutine at an address only known from
+        // a stack peek (a return address, say) rather than wherever execution happens to be right
+        // now. "Go" sets the override; "Follow PC" clears it back to the normal live behavior.
+        var peekRowFont = new Font(FontFamily.GenericSansSerif, 10);
+        var peekRow = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(4), BackColor = RetroTheme.Panel };
+        peekRow.Controls.Add(new Label { Text = "Peek 68000 addr ($):", Font = peekRowFont, ForeColor = RetroTheme.Text, AutoSize = true, Margin = new Padding(4, 8, 4, 0) });
+        _m68kPeekAddressBox = new TextBox { Font = peekRowFont, Width = 80, Margin = new Padding(4, 4, 4, 4) };
+        peekRow.Controls.Add(_m68kPeekAddressBox);
+        var peekGoButton = new Button { Text = "Go", AutoSize = true };
+        RetroTheme.StyleButton(peekGoButton);
+        peekGoButton.Click += (_, _) =>
+        {
+            if (uint.TryParse(_m68kPeekAddressBox.Text, System.Globalization.NumberStyles.HexNumber, null, out uint address))
+            {
+                _m68kPeekAddress = address;
+                RefreshSnapshot();
+            }
+        };
+        peekRow.Controls.Add(peekGoButton);
+        var peekFollowPcButton = new Button { Text = "Follow PC", AutoSize = true };
+        RetroTheme.StyleButton(peekFollowPcButton);
+        peekFollowPcButton.Click += (_, _) =>
+        {
+            _m68kPeekAddress = null;
+            RefreshSnapshot();
+        };
+        peekRow.Controls.Add(peekFollowPcButton);
+
+        // Raw hex-byte peek, on any of the three buses -- disassembling a data address (rather
+        // than real code) just produces plausible-looking garbage (confirmed the hard way: an
+        // SDRAM comm-handshake constant disassembled as a fake "jump table" earlier in this same
+        // investigation), so a genuine data value needs a raw dump, not a decoded instruction
+        // listing. SDRAM in particular is SH-2-only address space -- the 68000 peek above can't
+        // reach it at all -- hence the bus selector.
+        var hexRow = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(4), BackColor = RetroTheme.Panel };
+        hexRow.Controls.Add(new Label { Text = "Hex dump bus:", Font = peekRowFont, ForeColor = RetroTheme.Text, AutoSize = true, Margin = new Padding(4, 8, 4, 0) });
+        var hexBusSelector = new ComboBox
+        {
+            DropDownStyle = ComboBoxStyle.DropDownList,
+            Font = peekRowFont,
+            BackColor = RetroTheme.Panel,
+            ForeColor = RetroTheme.Text,
+            Width = 110,
+            Margin = new Padding(4, 4, 4, 4),
+        };
+        hexBusSelector.Items.AddRange(new object[] { "68000", "SH-2 Master", "SH-2 Slave" });
+        hexBusSelector.SelectedIndex = 0;
+        hexRow.Controls.Add(hexBusSelector);
+        hexRow.Controls.Add(new Label { Text = "addr ($):", Font = peekRowFont, ForeColor = RetroTheme.Text, AutoSize = true, Margin = new Padding(4, 8, 4, 0) });
+        var hexAddressBox = new TextBox { Font = peekRowFont, Width = 80, Margin = new Padding(4, 4, 4, 4) };
+        hexRow.Controls.Add(hexAddressBox);
+        var hexDumpButton = new Button { Text = "Hex Dump", AutoSize = true };
+        RetroTheme.StyleButton(hexDumpButton);
+        _hexDumpText = new TextBox
+        {
+            Font = new Font(FontFamily.GenericMonospace, 9),
+            Width = 400,
+            Margin = new Padding(4, 4, 4, 4),
+            ReadOnly = true,
+            BackColor = Color.Black,
+            ForeColor = Color.Cyan,
+        };
+        hexDumpButton.Click += (_, _) =>
+        {
+            if (_console is null || !uint.TryParse(hexAddressBox.Text, System.Globalization.NumberStyles.HexNumber, null, out uint address))
+            {
+                return;
+            }
+
+            _hexDumpText.Text = SafeDecode(() =>
+            {
+                var bytes = new List<string>();
+                for (uint i = 0; i < 32; i += 4)
+                {
+                    uint value = hexBusSelector.SelectedIndex switch
+                    {
+                        1 => _console.Sega32X.MasterSh2Bus.ReadLong(address + i),
+                        2 => _console.Sega32X.SlaveSh2Bus.ReadLong(address + i),
+                        _ => ((Cpu68000Bus)_console).ReadLong(address + i),
+                    };
+                    bytes.Add($"{address + i:X8}={value:X8}");
+                }
+
+                return string.Join("  ", bytes);
+            });
+        };
+        hexRow.Controls.Add(hexDumpButton);
+        hexRow.Controls.Add(_hexDumpText);
+
+        // 68000 PC breakpoint -- pauses emulation the instant the CPU is about to fetch the
+        // opcode at the given address, via M68000.InstructionFetching (a pre-existing debugging
+        // hook, not new). Precise to the exact instruction, unlike polling PC between whole
+        // frames/scanlines, which can easily step past the address of interest before the next
+        // check runs -- needed to catch a live call stack at the exact moment of arrival rather
+        // than guessing forward through unexplored subroutines from a frozen, already-stuck
+        // snapshot.
+        var bpRow = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(4), BackColor = RetroTheme.Panel };
+        bpRow.Controls.Add(new Label { Text = "68000 breakpoint ($):", Font = peekRowFont, ForeColor = RetroTheme.Text, AutoSize = true, Margin = new Padding(4, 8, 4, 0) });
+        var breakpointAddressBox = new TextBox { Font = peekRowFont, Width = 80, Margin = new Padding(4, 4, 4, 4) };
+        bpRow.Controls.Add(breakpointAddressBox);
+        var setBreakpointButton = new Button { Text = "Set", AutoSize = true };
+        RetroTheme.StyleButton(setBreakpointButton);
+        setBreakpointButton.Click += (_, _) =>
+        {
+            if (uint.TryParse(breakpointAddressBox.Text, System.Globalization.NumberStyles.HexNumber, null, out uint address))
+            {
+                _onSetBreakpoint(address);
+            }
+        };
+        bpRow.Controls.Add(setBreakpointButton);
+        var clearBreakpointButton = new Button { Text = "Clear", AutoSize = true };
+        RetroTheme.StyleButton(clearBreakpointButton);
+        clearBreakpointButton.Click += (_, _) => _onSetBreakpoint(null);
+        bpRow.Controls.Add(clearBreakpointButton);
+
+        // VERSION register ($A10001) live override -- GenesisConsole's own doc comment on
+        // VersionRegisterValue calls this "the least-confidently-recalled constant in the whole
+        // emulator": bit 6's NTSC/PAL polarity has conflicting evidence (genesis-plus-gx's own
+        // REGION_USA-derived value says 0=NTSC, but a real 32X title's live boot code demands
+        // the opposite for its region/hardware sanity check -- see the 32X investigation notes).
+        // Only these two specific values are meaningful (the two candidate bit-6 polarities that
+        // came out of that investigation, both otherwise-identical: overseas + no-expansion,
+        // differing only in bit 6) -- a toggle between them, not a free-form hex box, since
+        // nothing else is a real hypothesis worth typing in here. Applied immediately on click,
+        // no separate "Set" step, matching how a toggle should behave. MainForm stores the value
+        // (not just this form) specifically so it survives a ROM reload -- the whole point of
+        // testing a boot-time hardware-detection hypothesis, which by definition needs the boot
+        // sequence to actually re-run with the override already in place.
+        var versionRow = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(4), BackColor = RetroTheme.Panel };
+        versionRow.Controls.Add(new Label { Text = "VERSION reg ($A10001) bit 6:", Font = peekRowFont, ForeColor = RetroTheme.Text, AutoSize = true, Margin = new Padding(4, 8, 4, 0) });
+        var versionA0RadioButton = new RadioButton
+        {
+            Text = "0 -- $A0 (genesis-plus-gx non-32X polarity)",
+            Font = peekRowFont,
+            ForeColor = RetroTheme.Text,
+            BackColor = RetroTheme.Panel,
+            AutoSize = true,
+            Margin = new Padding(4, 6, 4, 4),
+        };
+        var versionE0RadioButton = new RadioButton
+        {
+            Text = "1 -- $E0 (32X-verified, default)",
+            Font = peekRowFont,
+            ForeColor = RetroTheme.Text,
+            BackColor = RetroTheme.Panel,
+            AutoSize = true,
+            Margin = new Padding(4, 6, 4, 4),
+            Checked = true,
+        };
+        versionA0RadioButton.Click += (_, _) => _onSetVersionRegisterOverride(0xA0);
+        versionE0RadioButton.Click += (_, _) => _onSetVersionRegisterOverride(0xE0);
+        versionRow.Controls.Add(versionA0RadioButton);
+        versionRow.Controls.Add(versionE0RadioButton);
 
         // 32X tab: same registers-box-on-top, disassembly-panel-below shape as the CPU tab,
         // just for the two SH-2 cores instead of the 68000/Z80. Content is currently 17 lines
@@ -277,6 +444,10 @@ public sealed class DebugForm : Form
         var cpuTab = new TabPage("CPU") { BackColor = RetroTheme.Background };
         cpuTab.Controls.Add(disasmPanel);
         cpuTab.Controls.Add(_registersText);
+        cpuTab.Controls.Add(peekRow);
+        cpuTab.Controls.Add(hexRow);
+        cpuTab.Controls.Add(bpRow);
+        cpuTab.Controls.Add(versionRow);
 
         var sh2Tab = new TabPage("32X") { BackColor = RetroTheme.Background };
         sh2Tab.Controls.Add(sh2DisasmPanel);
@@ -338,7 +509,9 @@ public sealed class DebugForm : Form
         int menuStripHeight = menuStrip.GetPreferredSize(Size.Empty).Height;
         int toolbarHeight = toolbar.GetPreferredSize(Size.Empty).Height;
         int paletteRowHeight = paletteRow.GetPreferredSize(Size.Empty).Height;
-        int cpuTabContentHeight = _registersText.Height + disasmFont.Height * DisasmLineCount + 16;
+        int peekRowHeight = peekRow.GetPreferredSize(Size.Empty).Height;
+        int hexRowHeight = hexRow.GetPreferredSize(Size.Empty).Height;
+        int cpuTabContentHeight = peekRowHeight + hexRowHeight + _registersText.Height + disasmFont.Height * DisasmLineCount + 16;
         int sh2TabContentHeight = _sh2RegistersText.Height + disasmFont.Height * DisasmLineCount + 16;
         int vramTabContentHeight = paletteRowHeight + _vramBitmap.Height;
         int contentHeight = menuStripHeight + toolbarHeight + tabChromeHeight + Math.Max(Math.Max(cpuTabContentHeight, sh2TabContentHeight), vramTabContentHeight);
@@ -468,10 +641,43 @@ public sealed class DebugForm : Form
     /// <summary>Called whenever <see cref="MainForm"/> swaps in a different console (a fresh
     /// ROM load) -- everything below just reads from whatever this points at, so there's
     /// nothing else to reset here.</summary>
+    /// <summary>Set from <see cref="GenesisSharp.Cpu68000.M68000.ExceptionRaised"/> -- a debugging
+    /// hook only (see that event's own remarks), wired up here purely so a real 32X ROM
+    /// unexpectedly hitting a software-detected trap (illegal instruction, CHK, TRAPV, privilege
+    /// violation, a TRAP #n) shows up directly in the debug window instead of needing to be
+    /// inferred from a frozen-looking "BRA *-2" and a hand-traced vector table. Fires on the
+    /// emulation thread; a benign race with the UI thread reading these same fields during
+    /// <see cref="RefreshSnapshot"/> is acceptable, matching how every other live property this
+    /// window reads is already handled.</summary>
+    private int? _lastExceptionVector;
+    private uint? _lastExceptionPc;
+    private int _lastExceptionCount;
+
     public void SetConsole(GenesisConsole? console)
     {
+        if (_console is not null)
+        {
+            _console.Cpu.ExceptionRaised -= OnCpuExceptionRaised;
+        }
+
         _console = console;
+        _lastExceptionVector = null;
+        _lastExceptionPc = null;
+        _lastExceptionCount = 0;
+
+        if (_console is not null)
+        {
+            _console.Cpu.ExceptionRaised += OnCpuExceptionRaised;
+        }
+
         RefreshSnapshot();
+    }
+
+    private void OnCpuExceptionRaised(int vectorNumber, uint pc)
+    {
+        _lastExceptionVector = vectorNumber;
+        _lastExceptionPc = pc;
+        _lastExceptionCount++;
     }
 
     public void SetPausedLabel(bool paused) => _pauseButton.Text = paused ? "Resume" : "Pause";
@@ -527,6 +733,27 @@ public sealed class DebugForm : Form
             lines.Add($"  A{i}-A{i + 3}: {cpu.A[i]:X8} {cpu.A[i + 1]:X8} {cpu.A[i + 2]:X8} {cpu.A[i + 3]:X8}");
         }
 
+        // Peek at the top few longwords of the 68000 stack (A7) -- a quick, no-breakpoint way to
+        // find a caller's return address when the "Next:" line only shows whatever subroutine is
+        // currently executing. Not reliable in general (a value that happens to look like a valid
+        // ROM address could just be leftover stack data, not a real return address), but useful
+        // as a first guess when hunting for who's repeatedly calling something.
+        string stackPeek = SafeDecode(() =>
+        {
+            var bus68k = (Cpu68000Bus)_console!;
+            var values = new List<string>();
+            for (uint offset = 0; offset < 0x18; offset += 4)
+            {
+                values.Add($"+{offset:X2}={bus68k.ReadLong(cpu.A[7] + offset):X8}");
+            }
+
+            return string.Join(" ", values);
+        });
+        lines.Add($"  Stack@A7: {stackPeek}");
+        lines.Add(_lastExceptionVector.HasValue
+            ? $"  LastException: vector={_lastExceptionVector} PC={_lastExceptionPc:X6} count={_lastExceptionCount}"
+            : "  LastException: (none)");
+
         lines.Add("");
         lines.Add($"Z80    PC={z80.PC:X4}  Cycles={z80.TotalCycles}  Halted={z80.Halted}");
         lines.Add($"  Next: {z80Instruction}");
@@ -537,6 +764,7 @@ public sealed class DebugForm : Form
         lines.Add("");
         lines.Add($"VDP    Scanline={vdp.CurrentScanline,3}  DisplayEnabled={vdp.DisplayEnabled}");
         lines.Add($"       Reg0={vdp.Registers[0]:X2} Reg1={vdp.Registers[1]:X2} Reg11={vdp.Registers[11]:X2} Reg12={vdp.Registers[12]:X2}");
+        lines.Add($"       DmaMode={vdp.CurrentDmaMode}  DmaLength={vdp.DmaLength:X4}  DmaSource={vdp.DmaSourceAddress:X6}  IsDmaBusy={vdp.IsDmaBusy}  DmaBusyRemainingCycles={vdp.DmaBusyRemainingCycles}  DmaTriggerCount={vdp.DmaTriggerCount}");
         lines.Add("");
         // UnderrunCount climbing steadily during normal play (not just a handful right at
         // startup) means the thread producing audio is falling behind real-time playback --
@@ -588,9 +816,10 @@ public sealed class DebugForm : Form
         var cpu = _console!.Cpu;
         var z80 = _console.SoundCpu;
 
+        uint m68kDisasmStart = _m68kPeekAddress ?? cpu.PC;
         var m68kLines = SafeDecodeLines(() =>
         {
-            var instructions = M68kDisassembler.DisassembleRange(cpu.PC, DisasmLineCount, (Cpu68000Bus)_console);
+            var instructions = M68kDisassembler.DisassembleRange(m68kDisasmStart, DisasmLineCount, (Cpu68000Bus)_console);
             return DisassemblyLabeler.FormatWithLabels(instructions, cpu.PC, a => a.ToString("X6"));
         });
         var z80Lines = SafeDecodeLines(() =>

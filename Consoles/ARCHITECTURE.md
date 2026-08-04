@@ -433,8 +433,8 @@ proves; the 68k-side ROM banking window (`$900000-$9FFFFF`) — SH-2 CS1 reads t
 directly and unbanked instead; a synthesized boot-stub/Initial-Data-Load fallback the way PicoDrive
 itself falls back to when no real 32X BIOS is supplied — real, unmodified 32X ROMs won't boot
 without this (or a real BIOS, which this project won't ship), so it's deferred to whenever
-real-ROM boot is attempted (Phase 6); and 32X-ROM auto-detection — the subsystem is always wired
-in and simply stays inert unless a ROM's own boot code sets ADEN itself.
+real-ROM boot is attempted (Phase 6; built in §4a.5, below); and 32X-ROM auto-detection — the
+subsystem is always wired in and simply stays inert unless a ROM's own boot code sets ADEN itself.
 
 ### 4a.2 32X VDP frame buffer graphics (Phase 3)
 
@@ -586,7 +586,118 @@ else about cartridge loading remains the same "raw headerless image" scaffolding
 top of this section.
 
 **Known gaps this phase**: none within Phase 5's own defined scope — Phase 6 (validation against
-real, legally-owned 32X ROM dumps) is the only phase left in the 32X plan, and hasn't started.
+real, legally-owned 32X ROM dumps) is the only phase left in the 32X plan.
+
+### 4a.5 Synthesized boot stub (Phase 6, in progress)
+
+Loading a real, unmodified 32X ROM against everything through Phase 5 hung on a perpetual illegal-
+instruction trap: both SH-2s reset to `PC=0`, which is inside `BootRomMaster`/`BootRomSlave` — and
+those start out blank, since GenesisSharp has no real 32X BIOS to put there (Sega's own firmware,
+not something this project can ship). Opcode `0x0000` decodes as illegal, the illegal-instruction
+handler's own vector (also blank) points right back at `0`, and the core spins forever. This is
+exactly the gap every earlier phase named explicitly ("no synthesized boot-stub fallback").
+
+`src/GenesisSharp.Core/Sega32X.BootStub.cs` fixes this the same way PicoDrive itself does when no
+real BIOS is supplied — ground truth: PicoDrive's `get_bios()`
+(`reference/PicoDrive/picodrive/pico/32x/memory.c:2195-2294`) for boot-ROM *content*, and
+`p32x_reset_sh2s` (`reference/PicoDrive/picodrive/pico/32x/32x.c:161-209`) for host-side setup —
+both already a synthesized fallback in PicoDrive itself, not a real Sega BIOS dump; re-encoded here
+as equivalent C#/SH-2 machine code rather than copied from PicoDrive's C source.
+
+- **Boot-ROM content**, populated once at `Sega32X` construction (not on every reset — a real boot
+  ROM is fixed silicon, and Phase 2's own tests, which inject their own hand-assembled program into
+  these same public arrays, run *after* construction and simply overwrite this default): every
+  exception vector defaults to a trap-to-self, except the reset vector, which points at a small
+  stub ported opcode-for-opcode from PicoDrive's `msh2_code`/`ssh2_code`. The master's stub writes
+  `"M_OK"` into COMM0:COMM1, then jumps to the entry point named at cartridge ROM offset `$3E0`; the
+  slave's stub *waits* for that `"M_OK"` (the real cross-CPU synchronization point), writes
+  `"S_OK"` into COMM2:COMM3, and jumps to the entry point at `$3E4` — both offsets are the
+  documented 32X ROM header convention, not something specific to PicoDrive.
+- **Host-side setup**, run every time nRES is asserted (both at power-on via `Reset()` and at any
+  later 68000-triggered nRES edge, matching PicoDrive's own call sites for `p32x_reset_sh2s`
+  exactly): each core's `GBR` is set to the adapter-register base (so the stub's GBR-relative COMM
+  reads/writes actually land there instead of on the boot ROM itself), each core's `VBR` is set from
+  the header (`$3E8`/`$3EC`), and the header-named "Initial Data Load" block is copied from
+  cartridge ROM into SDRAM (`$3D4`/`$3D8`/`$3DC` name the source/destination/size) before either
+  core starts running.
+- **A confirmed Phase 2 bug fixed as part of this work**: the SH-2-visible "no cartridge" bit
+  (`NCartBit`) was being OR'd in as *always set* — backwards. PicoDrive's own naming (`ncart_in`,
+  documented in its own source as `"!cart_in"`) confirms the "n" prefix is genuinely active-low:
+  the bit means *no* cartridge, and GenesisSharp — which always has one — must never set it. With
+  the bug, both SH-2 boot stubs would have taken their dead-end Sega-CD `"_CD_"`-wait branch instead
+  of ever reaching real game code, regardless of anything else in this file being correct.
+- **Verification**: `Sega32XBootStubTests.cs` builds a ROM with nothing but the header fields above
+  plus two tiny hand-assembled SH-2 programs at the named entry points, releases nRES/ADEN through
+  the same public 68000-side bus a real console would use (no test-injected boot code, unlike Phase
+  2's own coverage), and confirms both cores actually reach and execute their entry-point code —
+  the same path a real ROM's own boot sequence exercises.
+
+**Four more real-ROM-only bugs found and fixed testing this against an actual commercial 32X
+title** (user-supplied, legally-owned dump — the first real-ROM validation this project has had):
+
+- **The 68000-side ROM banking window (`$900000-$9FFFFF`) was entirely unmapped.** Real 32X boot
+  code reads through here (a selectable 1MB slice of the same cartridge ROM already visible at
+  `$000000-$3FFFFF`, bank chosen by the adapter register block's byte offset 5 — confirmed against
+  PicoDrive's `bank_switch_rom_68k`/`case 0x05: // bank`, `memory.c:439-444,1449-1484`) to reach ROM
+  content beyond whatever the base cartridge window exposes. Phase 2 explicitly deferred this (its
+  own synthetic test never needed it); a real title's own boot sequence does. With it unmapped, a
+  jump in here read open bus (`$FFFF`, an illegal 68000 opcode) and got stuck — directly observable
+  in the debug window as the 68000's own PC cycling through a small illegal-instruction address
+  range inside that window. `Sega32X.ReadRomBankWindowByte` (new) computes the bank-selected byte
+  straight out of the already-fully-resident cartridge image, no separate bank-switch step needed —
+  the same "no chunking" reasoning `CartridgeRom`'s own remarks already give for the SH-2 side.
+  Writes through this window are dropped, matching plain cartridge ROM's existing read-only wiring.
+- **SH-2 starvation from `RunScanline`'s once-per-scanline release check.** Even with the window
+  above mapped, a real title's own boot-handshake polling loop could still toggle nRES/ADEN off
+  again within the same scanline's ~488-cycle 68000 budget — and `RunScanline` only checked
+  `Sega32X.Sh2sReleased` once, *after* the 68000 had already run that whole budget. If the release
+  condition was false again by that one checkpoint (which a fast-enough retry loop hits on *every*
+  scanline), both SH-2s got zero cycles, forever — directly observable as the SH-2's own PC frozen
+  exactly on its reset vector while the 68000's PC kept moving. Fixed by checking
+  `Sh2sReleased`and stepping both SH-2s once per 68000 *instruction* rather than once per scanline
+  (proportional to that instruction's own cycle cost, preserving the same aggregate ~3x-of-68000
+  per-scanline SH-2 budget in total — see `RunScanline`'s own remarks). This is a change to the
+  core scanline loop every ROM runs through, 32X or not; the existing non-32X regression suite
+  (unaffected, since `Sh2sReleased` is unconditionally false for any ROM that never touches the
+  32X registers) is the safety net for that.
+- **`WriteControlByteFrom68k` did a naive full-byte overwrite of the nRES/ADEN byte ($A15101),
+  clobbering `REN` (bit 7) on every write.** Real 32X boot code polls `REN` — some titles wait for
+  it to read back set before proceeding — and on real hardware it's essentially independent of
+  nRES/ADEN, surviving writes to this byte untouched. GenesisSharp's old plain-storage write meant
+  any ordinary `MOVE.B #$03,($A15101)` to release the SH-2s also silently zeroed `REN` in the same
+  operation, hanging that poll forever — directly observable as the 68000 settling into a new small
+  loop around a `BTST #7,(...)` instruction once the two fixes above got it that far. Confirmed
+  against PicoDrive's own `p32x_reg_write8` (`memory.c:406-426`, its own comment: "writable bits
+  tested"): only `nRES`/`ADEN` (bits 1/0) are ever actually stored from a write to this byte, and
+  offset 0 is masked the same way (only `FM`, bit 7, is 68000-writable there). PicoDrive's handler
+  also forces `nRES` back to released whenever `ADEN` transitions 1→0 (a real subsystem shutdown
+  leaves the SH-2s not-held but the whole subsystem inert, the same shape as the power-on default)
+  — reproduced here too, not just the masking.
+- **A second, separate 68000-side ROM window (`$880000-$8FFFFF`) was also entirely unmapped.**
+  Distinct from the banked window above: this one always shows cartridge ROM starting from offset
+  0, completely ignoring the bank-select register — real boot code uses it specifically because
+  it's a *stable* way to reach a fixed ROM offset regardless of whatever the $900000 window
+  currently has selected. With all three of the fixes above in place, this title's own code was
+  traced (live, via a new debug-window address-peek feature — see §9) all the way to setting
+  `ADEN=1` and jumping straight into this window — which, unmapped, read open bus and sent the
+  whole boot sequence back to the start, repeatedly re-clearing VRAM/CRAM/VSRAM forever without
+  ever actually releasing the SH-2s. Confirmed against PicoDrive's own `PicoMemSetup32x` ("32X ROM
+  (unbanked...)", `memory.c:2367-2372`), which maps `Pico.rom` here directly with no bank offset
+  at all. `Sega32X.ReadRomMirrorWindowByte` (new) mirrors `ReadRomBankWindowByte`'s shape exactly,
+  just without the bank computation.
+- **Verification**: `Sega32XBootStubTests.cs` covers both ROM windows directly (bank-select writes
+  change what the banked window reads back as without affecting the mirror window at all; writes
+  through either window are dropped, matching plain ROM), the starvation fix with an adversarial
+  68000 program that toggles nRES/ADEN on-then-off in a tight loop entirely within one scanline
+  (confirming a test-injected SH-2 program still gets to run despite never seeing a *stable*
+  release), and the masked-write fix (`REN` survives writes that set/clear nRES/ADEN; clearing
+  `ADEN` forces `NRes` back to `true`).
+
+**Known gaps**: DREQ/DMAC and 32X-side interrupt routing remain unimplemented (unchanged from
+Phase 2) — some real titles' post-boot code may still stall or misbehave on those, independent of
+whether boot itself now succeeds. Real-ROM validation (Phase 6's stated goal) is in progress but not
+complete — the fixes above got a real commercial title further than address 0, not necessarily all
+the way to a playable state; further real-ROM issues may still surface.
 
 ---
 
@@ -1114,14 +1225,24 @@ mechanics.
 ### 9.5 DebugForm and the disassemblers
 
 A non-modal debug window with a CPU tab (side-by-side 68000/Z80 disassembly + full register dump,
-refreshed every UI tick) and a VRAM tab (live tile viewer against any of the 4 CRAM palette lines).
-`M68kDisassembler`/`Z80Disassembler` are **static, display-only** classes deliberately kept separate
-from the real CPUs' decode/execute logic — a bug in a disassembler can't affect emulation
-correctness, and any opcode they don't recognize falls back to a raw hex dump instead of a guessed
-mnemonic. Both annotate known memory-mapped I/O addresses (VDP ports, PSG, controller ports, the
-Z80 bank register, etc.) as trailing comments, sourced from `GenesisConsole`'s own bus
-implementation rather than general hardware lore — so if you add a new memory-mapped register to
-`GenesisConsole`, consider adding it to the disassembler's annotation table too.
+refreshed every UI tick), a 32X tab (both SH-2 cores' registers + disassembly, plus nRES/ADEN
+status — see §4a.4), and a VRAM tab (live tile viewer against any of the 4 CRAM palette lines).
+`M68kDisassembler`/`Z80Disassembler`/`Sh2Disassembler` are **static, display-only** classes
+deliberately kept separate from the real CPUs' decode/execute logic — a bug in a disassembler can't
+affect emulation correctness, and any opcode they don't recognize falls back to a raw hex dump
+instead of a guessed mnemonic. All three annotate known memory-mapped I/O addresses (VDP ports,
+PSG, controller ports, the Z80 bank register, 32X registers, etc.) as trailing comments, sourced
+from `GenesisConsole`'s/`Sega32X`'s own bus implementation rather than general hardware lore — so
+if you add a new memory-mapped register, consider adding it to the relevant disassembler's
+annotation table too.
+
+The CPU tab also has a **68000 address-peek** field (Phase 6, added during real-ROM debugging —
+see §4a.5): typing an address and clicking "Go" shows a fixed disassembly range there instead of
+following the live PC, and the register box includes a raw stack-top peek (`Stack@A7: +00=... +04=...`).
+Neither reads anything the emulator doesn't already expose publicly — they exist purely to let a
+human find a caller's address (e.g. from a stack-peeked return address) without needing a real
+breakpoint/step-until feature, which this debug window doesn't have. "Follow PC" clears the
+override back to normal live-following behavior.
 
 ### 9.6 Audio playback
 
@@ -1237,19 +1358,23 @@ A consolidated list, pulled from §3–§9, of what to check first if a game mis
 - **YM2612**: LFO, SSG-EG, and channel-3 "special mode" are entirely unmodeled. The rate-to-dB
   envelope curve is a smooth exponential approximation, not the chip's exact non-linear table.
 - **SH-2 / 32X**: the SH-2 CPU core (§4a), its bus integration (§4a.1), its frame-buffer graphics
-  (§4a.2), its PWM audio (§4a.3), and its frontend/save-state integration (§4a.4) are Phases 1-5 of
-  an in-progress 32X extension — both SH-2s can be released from reset and exchange data with the
-  68000 via COMM registers, a 32X title's own Packed Pixel/Direct Color frame-buffer output
-  composites correctly with the Genesis VDP's, its PWM output is audibly mixed in, the whole
-  subsystem round-trips through save states, and the debug window has a live SH-2 register/
-  disassembly tab — but there is still no Run Length display mode, no DREQ/DMAC, no 32X-side
-  interrupt routing (including PWM's own "feed me more data" interrupt — FIFO underrun degrades
-  safely to holding the last sample rather than breaking outright, but some real games may still go
-  audibly stale without it), and no synthesized boot-stub fallback (so an unmodified real 32X ROM
-  won't boot without a real BIOS this project doesn't ship). Within the CPU core itself: no
-  cache/DMAC/timer/serial emulation; NMI's vector number and interrupt-entry cost are unverified
-  (PicoDrive doesn't model SH-2 NMI); no hardware test-vector suite is known to exist for SH-2,
-  unlike the 68000 core. Phase 6 (validation against real 32X ROM dumps) hasn't started.
+  (§4a.2), its PWM audio (§4a.3), its frontend/save-state integration (§4a.4), and a synthesized
+  boot-stub fallback for real ROMs (§4a.5) are Phases 1-6 of an in-progress 32X extension — both
+  SH-2s can be released from reset and exchange data with the 68000 via COMM registers, a 32X
+  title's own Packed Pixel/Direct Color frame-buffer output composites correctly with the Genesis
+  VDP's, its PWM output is audibly mixed in, the whole subsystem round-trips through save states,
+  the debug window has a live SH-2 register/disassembly tab, and — as of §4a.5 — a real,
+  unmodified 32X ROM's boot sequence (the "M_OK"/"S_OK" COMM-register handshake, jumping to each
+  core's own ROM-header-named entry point) runs without needing a real Sega BIOS this project
+  can't ship. There is still no Run Length display mode, no DREQ/DMAC, no 32X-side interrupt
+  routing (including PWM's own "feed me more data" interrupt — FIFO underrun degrades safely to
+  holding the last sample rather than breaking outright, but some real games may still go audibly
+  stale without it) — either of which could still stall or misbehave post-boot in a real title
+  independent of whether boot itself now succeeds. Within the CPU core itself: no cache/DMAC/timer/
+  serial emulation; NMI's vector number and interrupt-entry cost are unverified (PicoDrive doesn't
+  model SH-2 NMI); no hardware test-vector suite is known to exist for SH-2, unlike the 68000 core.
+  Phase 6's boot-stub mechanism has synthetic test coverage (§4a.5) but has not yet been confirmed
+  against an actual commercial 32X ROM dump.
 - **General**: no true whole-system single-instruction step (the frontend's "step instruction" is
   68000-only, by design — a real cross-chip single step would need sub-scanline stepping support
   that doesn't exist yet); PAL timing/60Hz-vs-50Hz is entirely unmodeled (NTSC-only).

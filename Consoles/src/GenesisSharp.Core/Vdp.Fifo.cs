@@ -60,7 +60,15 @@ public sealed partial class Vdp
     /// busy-until cycle instead (rather than either hardcoded extreme) satisfies both: idle
     /// reads as not-busy like before, but a real transfer now reads as busy for its actual
     /// duration, matching what a polling loop like this would observe on real hardware.</summary>
-    private bool IsDmaBusy => _lastSlotClockCycles < _dmaBusyUntilCycle;
+    public bool IsDmaBusy => _lastSlotClockCycles < _dmaBusyUntilCycle;
+
+    /// <summary>Diagnostic-only: how many more 68000 cycles <see cref="IsDmaBusy"/> will stay
+    /// true, given the external-slot clock's most recent position. Not used by emulation itself
+    /// (<see cref="IsDmaBusy"/> is the only thing <see cref="ReadStatusRegister"/> needs) -- added
+    /// specifically so the debug window can show whether a game stuck polling this bit is waiting
+    /// on a plausible remaining duration or one that's clearly wrong (e.g. an absurdly large DMA
+    /// length read back garbled).</summary>
+    public long DmaBusyRemainingCycles => Math.Max(0, _dmaBusyUntilCycle - _lastSlotClockCycles);
 
     /// <summary>Running total of every stall cycle ever charged (FIFO waits plus DMA), never
     /// reset by <see cref="ConsumeStallCycles"/> — debugging hook only, not part of emulation
@@ -137,6 +145,13 @@ public sealed partial class Vdp
         _fifoEntries.Add(SlotsForTarget(target));
     }
 
+    /// <summary>Diagnostic-only: how many times <see cref="ChargeDmaStall"/> has actually fired
+    /// a new stall (i.e. <c>units &gt; 0</c>). Not used by emulation itself -- added to
+    /// distinguish "one long DMA that just needs more real time" from "something is re-triggering
+    /// DMA repeatedly, resetting the busy window before it ever expires" when a game's own polling
+    /// loop appears stuck.</summary>
+    public long DmaTriggerCount { get; private set; }
+
     /// <summary>Charges a flat stall for an entire DMA transfer up front, since this emulator
     /// runs DMA synchronously in one call rather than pacing it slot-by-slot the way real
     /// hardware (and BlastEm) do. <paramref name="units"/> is bytes for fill/VRAM-copy modes,
@@ -148,6 +163,8 @@ public sealed partial class Vdp
         {
             return;
         }
+
+        DmaTriggerCount++;
 
         int stall = (int)Math.Ceiling(units * slotsPerUnit * CyclesPerExternalSlot);
         _pendingStallCycles += stall;

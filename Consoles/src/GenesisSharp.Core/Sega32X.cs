@@ -23,10 +23,16 @@ public sealed partial class Sega32X
     private const ushort NResBit = 1 << 1;
     private const ushort AdenBit = 1 << 0;
 
-    /// <summary>SH-2-visible-only "cartridge present" bit, OR'd into the SH-2 side's read of
-    /// Regs[0] (PicoDrive: <c>Pico32x.sh2_regs[0] |= P32XS2_nCART</c>, <c>32x.c:130-132</c>, bit
-    /// position <c>P32XS2_nCART = 1&lt;&lt;8</c>, <c>pico_int.h:595</c>). Always true in
-    /// GenesisSharp, since <see cref="GenesisConsole"/> always requires a <see cref="Cartridge"/>.</summary>
+    /// <summary>SH-2-visible-only "no cartridge" bit (bit position <c>P32XS2_nCART = 1&lt;&lt;8</c>,
+    /// <c>pico_int.h:595</c>) — the "n" prefix is genuinely active-low here, confirmed by
+    /// PicoDrive's own set condition: <c>if (Pico.m.ncart_in) sh2_regs[0] |= P32XS2_nCART</c>
+    /// (<c>32x.c:131-132</c>), where <c>ncart_in</c> is itself documented as <c>"!cart_in"</c>
+    /// (<c>pico_int.h:339</c>) — i.e. the bit is set precisely when NO cartridge is present, not
+    /// when one is. Never set in GenesisSharp, since <see cref="GenesisConsole"/> always requires a
+    /// <see cref="Cartridge"/> — the opposite of a since-corrected Phase 2 bug that OR'd this bit
+    /// in unconditionally (backwards: it made every SH-2-side read claim no cartridge was present,
+    /// which is exactly what sends the synthesized boot stub's own cartridge-vs-CD branch down the
+    /// wrong path — see <see cref="Sega32X.BootStub.cs"/>).</summary>
     private const ushort NCartBit = 1 << 8;
 
     private readonly Cartridge _cartridge;
@@ -89,6 +95,7 @@ public sealed partial class Sega32X
         SlaveSh2Bus = new Sega32XSh2Bus(this, isSlave: true);
         MasterSh2 = new Sh2(MasterSh2Bus);
         SlaveSh2 = new Sh2(SlaveSh2Bus);
+        PopulateSynthesizedBootRoms();
     }
 
     /// <summary>Power-on default confirmed against PicoDrive's <c>PicoPower32x</c>
@@ -105,6 +112,7 @@ public sealed partial class Sega32X
         ResetPwm();
         MasterSh2.Reset();
         SlaveSh2.Reset();
+        SynthesizeSh2BootStateFromCartridge();
     }
 
     /// <summary>68000-side byte read of the adapter/control block ($A15100-$A1513F, offset
@@ -125,9 +133,24 @@ public sealed partial class Sega32X
         return ReadRegByte(offset);
     }
 
-    /// <summary>68000-side byte write of the adapter/control block. The 0→1 transition of nRES
-    /// (offset 1, bit1) resets both SH-2s together (see <see cref="NRes"/>'s remarks) — this is
-    /// 68000-exclusive; nothing on the SH-2 side can assert or release its own reset.</summary>
+    /// <summary>68000-side byte write of the adapter/control block. Offsets 0 and 1 are masked
+    /// writes, not plain storage — confirmed against PicoDrive's own <c>p32x_reg_write8</c>
+    /// (<c>memory.c:406-426</c>, "writable bits tested" per its own comment):
+    /// <list type="bullet">
+    /// <item>Offset 0: only <c>FM</c> (bit 7) is 68000-writable; every other bit in that byte is
+    /// discarded on write.</item>
+    /// <item>Offset 1: only <c>nRES</c>/<c>ADEN</c> (bits 1/0) are ever stored from the written
+    /// value — <c>REN</c> (bit 7) and everything else in that byte survive a write completely
+    /// untouched. A real, previously-shipped bug here (a naive full-byte overwrite) is exactly
+    /// what a real 32X title's own boot code exposed: it polls <c>REN</c>, and a write here that
+    /// clobbers it back to 0 means that poll never sees it set again, hanging forever. Disabling
+    /// <c>ADEN</c> (a 1→0 transition) additionally forces <c>nRES</c> back to released in the
+    /// stored value, confirmed against PicoDrive's own <c>d |= P32XS_nRES</c> there — a real
+    /// subsystem shutdown leaves the SH-2s not-held but the whole subsystem inert, the same
+    /// shape as the power-on default. A 0→1 transition of <c>nRES</c> (when <c>ADEN</c> isn't
+    /// also being cleared in the same write) resets both SH-2s together — this is 68000-exclusive;
+    /// nothing on the SH-2 side can assert or release its own reset.</item>
+    /// </list></summary>
     public void WriteControlByteFrom68k(uint offset, byte value)
     {
         if (offset > 0x3F)
@@ -141,19 +164,46 @@ public sealed partial class Sega32X
             return;
         }
 
-        bool wasReset = NRes;
-        WriteRegByte(offset, value);
-        if (!wasReset && NRes)
+        if (offset == 0)
         {
-            MasterSh2.Reset();
-            SlaveSh2.Reset();
+            // FmBit (0x8000) is word-relative; offset 0 is that word's high byte, so FM's
+            // position within this byte is bit 7 (0x80), not the raw word-level mask.
+            WriteRegByte(0, (byte)(value & (FmBit >> 8)));
+            return;
         }
+
+        if (offset == 1)
+        {
+            byte oldByte1 = ReadRegByte(1);
+            bool adenWasSet = (oldByte1 & AdenBit) != 0;
+            bool adenNowSet = (value & AdenBit) != 0;
+
+            if (adenWasSet && !adenNowSet)
+            {
+                value |= (byte)NResBit;
+            }
+            else if ((oldByte1 & NResBit) == 0 && (value & NResBit) != 0)
+            {
+                MasterSh2.Reset();
+                SlaveSh2.Reset();
+                SynthesizeSh2BootStateFromCartridge();
+            }
+
+            byte preserved = (byte)(oldByte1 & ~(NResBit | AdenBit));
+            byte updated = (byte)(preserved | (value & (NResBit | AdenBit)));
+            WriteRegByte(1, updated);
+            return;
+        }
+
+        WriteRegByte(offset, value);
     }
 
     /// <summary>SH-2-side byte read of the adapter/control block (same $4000-$403F window in SH-2
-    /// address space — see <see cref="Sega32XSh2Bus"/>). Offset 0 additionally OR's in
-    /// <see cref="NCartBit"/>, matching the 68k/SH-2 read-view duality PicoDrive's own
-    /// <c>p32x_sh2reg_read16</c> implements (<c>memory.c:753-755</c>).</summary>
+    /// address space — see <see cref="Sega32XSh2Bus"/>). Offset 0's <see cref="NCartBit"/> is
+    /// never set (GenesisSharp always has a <see cref="Cartridge"/> — see that field's remarks for
+    /// why this is *not* an OR-in the way it might look like it should be), matching the 68k/SH-2
+    /// read-view duality PicoDrive's own <c>p32x_sh2reg_read16</c> implements
+    /// (<c>memory.c:753-755</c>).</summary>
     internal byte ReadControlByteForSh2(uint offset)
     {
         if (offset > 0x3F)
@@ -168,7 +218,7 @@ public sealed partial class Sega32X
 
         if (offset == 0)
         {
-            return (byte)(((Regs[0] | NCartBit) >> 8) & 0xFF);
+            return (byte)((Regs[0] >> 8) & 0xFF);
         }
 
         return ReadRegByte(offset);
@@ -201,6 +251,33 @@ public sealed partial class Sega32X
     /// memory, unlike PicoDrive's chunked/bank-switched model, so no banking is needed here for
     /// this phase — see this class's known-gaps remarks).</summary>
     internal byte[] CartridgeRom => _cartridge.Rom;
+
+    /// <summary>68000-side byte read of the ROM banking window ($900000-$9FFFFF, see
+    /// <c>GenesisConsole.Is32XRomBankWindow</c>) — a selectable 1MB slice of the same cartridge
+    /// ROM already visible at $000000-$3FFFFF, bank chosen by the adapter register block's byte
+    /// offset 5 (confirmed against PicoDrive's <c>case 0x05: // bank</c>, masked to 2 bits there —
+    /// <c>memory.c:439-444</c> — giving up to 4 selectable 1MB banks, matching the Genesis's 4MB
+    /// cartridge ceiling). Unlike PicoDrive's own remapped-host-pointer implementation, this reads
+    /// straight out of <see cref="_cartridge"/>'s already-fully-resident image — no separate
+    /// bank-switch step needed, the same "no chunking, GenesisSharp already holds it all" reasoning
+    /// <see cref="CartridgeRom"/> already documents for the SH-2 side. Out-of-bounds (a bank
+    /// selection reaching past the ROM's actual size) reads as open bus, matching how plain
+    /// cartridge ROM reads already behave past the ROM's own end.</summary>
+    public byte ReadRomBankWindowByte(uint offset)
+    {
+        int bank = ReadRegByte(5) & 0x03;
+        uint romOffset = (uint)(bank << 20) + (offset & 0xFFFFF);
+        return romOffset < (uint)_cartridge.Rom.Length ? _cartridge.Rom[romOffset] : (byte)0xFF;
+    }
+
+    /// <summary>68000-side byte read of the unbanked ROM mirror ($880000-$8FFFFF, see
+    /// <c>GenesisConsole.Is32XRomMirrorWindow</c>) — always cartridge ROM starting from offset 0,
+    /// completely ignoring the bank-select register <see cref="ReadRomBankWindowByte"/> honors.
+    /// Confirmed against PicoDrive's own <c>PicoMemSetup32x</c> ("32X ROM (unbanked...)",
+    /// <c>memory.c:2367-2372</c>), which maps <c>Pico.rom</c> directly here with no bank offset.
+    /// Same open-bus-past-the-end behavior as the banked window, same reasoning.</summary>
+    public byte ReadRomMirrorWindowByte(uint offset) =>
+        offset < (uint)_cartridge.Rom.Length ? _cartridge.Rom[offset] : (byte)0xFF;
 
     private byte ReadRegByte(uint offset)
     {

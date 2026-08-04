@@ -59,10 +59,12 @@ public sealed partial class GenesisConsole : Cpu68000.IBus, CpuZ80.IBus
     private int _cpuCycleDebt;
     private int _z80CycleDebt;
 
-    /// <summary>Per-scanline SH-2 cycle budget: textbook ~3x the 68000's own
-    /// <see cref="CyclesPerScanlineM68000"/>, the same approximation already decided during this
-    /// project's 32X planning (not independently re-derived here) — see ARCHITECTURE.md §4a.</summary>
-    private const int CyclesPerScanlineSh2 = CyclesPerScanlineM68000 * 3;
+    /// <summary>SH-2:68000 clock ratio: textbook ~3x, the same approximation already decided
+    /// during this project's 32X planning (not independently re-derived here) — see
+    /// ARCHITECTURE.md §4a. Applied per-68000-instruction (see <see cref="RunScanline"/>'s own
+    /// remarks on why this is no longer a single per-scanline lump sum) rather than as a fixed
+    /// <c>CyclesPerScanlineM68000 * 3</c> total, though the two are equivalent in aggregate.</summary>
+    private const int Sh2ToM68kClockRatio = 3;
 
     private int _msh2CycleDebt;
     private int _ssh2CycleDebt;
@@ -104,12 +106,26 @@ public sealed partial class GenesisConsole : Cpu68000.IBus, CpuZ80.IBus
 
     private readonly byte[] _tmssRegister = new byte[4];
 
-    /// <summary>Bit 7: 0 = domestic (Japan), 1 = overseas. Bit 6: 0 = NTSC, 1 = PAL. Bit 5:
-    /// 0 = expansion (Mega CD) port present, 1 = not present. Bits 0-3: hardware revision.
-    /// This is the least-confidently-recalled constant in the whole emulator — sources
-    /// disagree on bits 5-7's exact polarity. Defaults to overseas/NTSC/no-expansion/rev-0, a
-    /// plain North American Genesis that no real game inspects closely.</summary>
-    private const byte VersionRegisterValue = 0xA0;
+    /// <summary>Bit 7: 0 = domestic (Japan), 1 = overseas. Bit 6: NTSC/PAL, polarity below.
+    /// Bit 5: 0 = expansion (Mega CD) port present, 1 = not present. Bits 0-3: hardware
+    /// revision. This is the least-confidently-recalled constant in the whole emulator, and bit
+    /// 6 in particular has directly conflicting evidence: genesis-plus-gx's own
+    /// <c>REGION_USA</c>-derived value computes bit 6 = 0 for NTSC (non-32X mode) — but a real
+    /// 32X title's live boot code (Pitfall: The Mayan Adventure) says otherwise for a system
+    /// running with the 32X enabled. Its region/hardware sanity check cross-references this bit
+    /// against the 32X VDP's own <c>nPAL</c> flag and, with bit 6 = 0 (the genesis-plus-gx
+    /// polarity), spun forever in a self-trap (<c>BRA *-2</c>) — confirmed via a live, verified
+    /// instruction-by-instruction trace, not a guess. Flipping bit 6 to 1 let that exact same
+    /// title clear the check and reach its own "NTSC GENESIS SYSTEMS" region-lock splash screen,
+    /// real rendered output that was never reached before. Whether real hardware's VERSION
+    /// register genuinely reports a different bit 6 once the 32X is active (plausible — the 32X
+    /// is known to intercept/modify several 68000-side registers) or this title's check is
+    /// simply unusual isn't confirmed either way, but the live behavior is unambiguous for this
+    /// title. Defaulting to the polarity that actually got a real 32X cartridge further,
+    /// pending a second title to corroborate. A settable property (not a const) so <see
+    /// cref="GenesisSharp.Frontend.DebugForm"/> can still override this live for further
+    /// experimentation without a rebuild.</summary>
+    public byte VersionRegisterValue { get; set; } = 0xE0;
 
     public Cartridge Cartridge { get; }
     public M68000 Cpu { get; }
@@ -211,8 +227,38 @@ public sealed partial class GenesisConsole : Cpu68000.IBus, CpuZ80.IBus
         {
             Vdp.SetScanlineProgress(1.0 - (double)_cpuCycleDebt / CyclesPerScanlineM68000);
             Vdp.AdvanceExternalSlotClock(Cpu.TotalCycles);
-            _cpuCycleDebt -= Cpu.Step();
+            int cpuCycles = Cpu.Step();
+            _cpuCycleDebt -= cpuCycles;
             _cpuCycleDebt -= Vdp.ConsumeStallCycles();
+
+            // Interleaved at 68000-instruction granularity rather than checked once at the end
+            // of the scanline (this loop's own -- since fixed -- shape through Phase 5): real
+            // 32X hardware runs the 68000 and both SH-2s genuinely concurrently, so a 68000
+            // boot-code loop that toggles nRES/ADEN faster than one scanline's worth of 68000
+            // cycles (confirmed happening in a real, commercial 32X title -- see ARCHITECTURE.md
+            // §4a.5) must still see the SH-2s get *some* cycles between each of its own checks.
+            // Checking Sega32X.Sh2sReleased only once per scanline let a fast-enough retry loop
+            // permanently starve the SH-2s -- by the time this method got around to stepping
+            // them, the 68000 had already toggled the release condition back off within that
+            // same scanline, every single scanline, forever. Total SH-2 cycles accrued per
+            // scanline is unchanged (summing cpuCycles*Sh2ToM68kClockRatio across every
+            // iteration this scanline still totals CyclesPerScanlineM68000*Sh2ToM68kClockRatio,
+            // the same fixed ~3x ratio as before) -- only the granularity at which that budget
+            // is handed out changed.
+            if (Sega32X.Sh2sReleased)
+            {
+                _msh2CycleDebt += cpuCycles * Sh2ToM68kClockRatio;
+                while (_msh2CycleDebt > 0)
+                {
+                    _msh2CycleDebt -= Sega32X.MasterSh2.Step();
+                }
+
+                _ssh2CycleDebt += cpuCycles * Sh2ToM68kClockRatio;
+                while (_ssh2CycleDebt > 0)
+                {
+                    _ssh2CycleDebt -= Sega32X.SlaveSh2.Step();
+                }
+            }
         }
 
         // Held or bus-requested: the Z80's clock is genuinely stopped on real hardware, so it
@@ -223,24 +269,6 @@ public sealed partial class GenesisConsole : Cpu68000.IBus, CpuZ80.IBus
             while (_z80CycleDebt > 0)
             {
                 _z80CycleDebt -= SoundCpu.Step();
-            }
-        }
-
-        // Both SH-2s are genuinely stopped (not just gated mid-loop) unless the 68000 has
-        // released them -- same shape as the Z80 arbitration above, see Sega32X.Sh2sReleased's
-        // remarks for the exact gating condition this mirrors from PicoDrive.
-        if (Sega32X.Sh2sReleased)
-        {
-            _msh2CycleDebt += CyclesPerScanlineSh2;
-            while (_msh2CycleDebt > 0)
-            {
-                _msh2CycleDebt -= Sega32X.MasterSh2.Step();
-            }
-
-            _ssh2CycleDebt += CyclesPerScanlineSh2;
-            while (_ssh2CycleDebt > 0)
-            {
-                _ssh2CycleDebt -= Sega32X.SlaveSh2.Step();
             }
         }
 
@@ -482,6 +510,40 @@ public sealed partial class GenesisConsole : Cpu68000.IBus, CpuZ80.IBus
         return address >= 0x860000 && address <= 0x87FFFF;
     }
 
+    /// <summary>The 68000-side ROM banking window ($900000-$9FFFFF) — real 32X hardware maps a
+    /// selectable 1MB slice of the SAME cartridge ROM already visible at $000000-$3FFFFF here, bank
+    /// number chosen by the adapter register block's byte offset 5 (confirmed against PicoDrive's
+    /// <c>bank_switch_rom_68k</c>/its write-dispatch <c>case 0x05: // bank</c>,
+    /// <c>reference/PicoDrive/picodrive/pico/32x/memory.c:439-444,1449-1484</c>). Real 32X boot
+    /// code reads through here to reach ROM content beyond whatever fixed portion the base
+    /// cartridge window exposes — Phase 2 explicitly deferred this (its own synthetic
+    /// bus-integration test never needed it), which is exactly what left real, unmodified 32X ROMs
+    /// unable to boot: their own init code jumping in here read open bus (an all-<c>$FFFF</c>
+    /// illegal opcode) and got stuck. See <see cref="Sega32X.ReadRomBankWindowByte"/> for the
+    /// actual bank computation — this predicate is bus-decode only.</summary>
+    private static bool Is32XRomBankWindow(uint address, out uint offset)
+    {
+        offset = address - 0x900000;
+        return address >= 0x900000 && address <= 0x9FFFFF;
+    }
+
+    /// <summary>The 68000-side unbanked ROM mirror ($880000-$8FFFFF) — always shows cartridge ROM
+    /// starting from offset 0 (up to 512KB), completely ignoring the bank-select register that
+    /// <see cref="Is32XRomBankWindow"/> honors. A separate, real gap from that banked window: real
+    /// 32X boot code uses this specifically because it's a *stable* way to reach a fixed ROM
+    /// offset regardless of whatever bank the $900000 window currently has selected. Confirmed
+    /// against PicoDrive's own <c>PicoMemSetup32x</c> ("32X ROM (unbanked...)",
+    /// <c>reference/PicoDrive/picodrive/pico/32x/memory.c:2367-2372</c>), which maps
+    /// <c>Pico.rom</c> directly here with no bank offset at all. Found via the same real-ROM
+    /// investigation as the banked window: a real title's boot code jumps through here right
+    /// after releasing the SH-2s, and with this unmapped, that jump read open bus and the whole
+    /// boot sequence looped back to the start.</summary>
+    private static bool Is32XRomMirrorWindow(uint address, out uint offset)
+    {
+        offset = address - 0x880000;
+        return address >= 0x880000 && address <= 0x8FFFFF;
+    }
+
     /// <summary>What every Cpu68000.IBus read method falls back to once none of the specific
     /// regions above (ROM, work RAM, VDP, Z80 window/registers, controllers, TMSS) match: real
     /// hardware's bus arbiter doesn't generate a bus error for addresses no chip is wired to
@@ -658,6 +720,16 @@ public sealed partial class GenesisConsole : Cpu68000.IBus, CpuZ80.IBus
             return Sega32X.ReadFrameBufferByteFor68k(fbOffset);
         }
 
+        if (Is32XRomBankWindow(address, out uint bankOffset))
+        {
+            return Sega32X.ReadRomBankWindowByte(bankOffset);
+        }
+
+        if (Is32XRomMirrorWindow(address, out uint mirrorOffset))
+        {
+            return Sega32X.ReadRomMirrorWindowByte(mirrorOffset);
+        }
+
         if (address < 0x400000 && Cartridge.Rom.Length > 0)
         {
             return Cartridge.Rom[address % (uint)Cartridge.Rom.Length];
@@ -741,6 +813,16 @@ public sealed partial class GenesisConsole : Cpu68000.IBus, CpuZ80.IBus
         if (Is32XFrameBufferWindow(address, out uint fbOffset) || Is32XFrameBufferOverwriteWindow(address, out fbOffset))
         {
             return Sega32X.ReadFrameBufferWordFor68k(fbOffset);
+        }
+
+        if (Is32XRomBankWindow(address, out uint bankOffset))
+        {
+            return (ushort)((Sega32X.ReadRomBankWindowByte(bankOffset) << 8) | Sega32X.ReadRomBankWindowByte(bankOffset + 1));
+        }
+
+        if (Is32XRomMirrorWindow(address, out uint mirrorOffset))
+        {
+            return (ushort)((Sega32X.ReadRomMirrorWindowByte(mirrorOffset) << 8) | Sega32X.ReadRomMirrorWindowByte(mirrorOffset + 1));
         }
 
         if (address < 0x400000 && Cartridge.Rom.Length > 0)
@@ -841,6 +923,18 @@ public sealed partial class GenesisConsole : Cpu68000.IBus, CpuZ80.IBus
             return;
         }
 
+        // Read-only, matching plain cartridge ROM's own write-drop convention (see ReadByte's
+        // remarks) -- real 32X boot code never writes through this window, only reads.
+        if (Is32XRomBankWindow(address, out _))
+        {
+            return;
+        }
+
+        if (Is32XRomMirrorWindow(address, out _))
+        {
+            return;
+        }
+
         // See ReadByte's remarks -- work RAM mirrors across all of $E00000-$FFFFFF.
         if (address >= 0xE00000)
         {
@@ -936,6 +1030,16 @@ public sealed partial class GenesisConsole : Cpu68000.IBus, CpuZ80.IBus
         if (Is32XFrameBufferOverwriteWindow(address, out fbOffset))
         {
             Sega32X.WriteFrameBufferWordFrom68k(fbOffset, overwrite: true, value);
+            return;
+        }
+
+        if (Is32XRomBankWindow(address, out _))
+        {
+            return;
+        }
+
+        if (Is32XRomMirrorWindow(address, out _))
+        {
             return;
         }
 
