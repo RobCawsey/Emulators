@@ -45,20 +45,21 @@ public class GenesisConsoleIoTests
         Assert.Equal(0, bus.ReadByte(0xA10002) & 0x01); // X pressed, visible through the 68000 bus
     }
 
-    /// <summary>Default value updated from 0xA0 to 0xE0 (bit 6 flipped) following a live,
-    /// verified 32X boot-sequence trace against a real commercial title (Pitfall: The Mayan
-    /// Adventure): with bit 6 = 0, its region/hardware sanity check spun forever in a self-trap;
-    /// with bit 6 = 1, it cleared the check and reached real rendered output for the first time.
-    /// See <see cref="GenesisConsole.VersionRegisterValue"/>'s own remarks for the full context
-    /// and the remaining uncertainty (one corroborating title, not an ironclad hardware fact).</summary>
+    /// <summary>0xA0 confirmed correct (bit 6 = 0 = NTSC) via a live, verified 32X boot-sequence
+    /// trace against a real commercial title (Pitfall: The Mayan Adventure). An earlier revision
+    /// of this default briefly flipped bit 6 to 0xE0 after tracing only the first of two region
+    /// checks that title performs; the real root cause turned out to be a separate bug (Sega32X's
+    /// own NPalBit defaulting backwards -- see its remarks), and once that was fixed, the second
+    /// region check confirmed 0xA0 was correct all along. See <see
+    /// cref="GenesisConsole.VersionRegisterValue"/>'s own remarks for the full story.</summary>
     [Fact]
     public void VersionRegister_ReadsTheFixedDefaultValue()
     {
         var console = new GenesisConsole(Cartridge.LoadFromBin(new byte[0x10000]));
         var bus = (Cpu68000.IBus)console;
 
-        Assert.Equal(0xE0, bus.ReadByte(0xA10000));
-        Assert.Equal(0xE0, bus.ReadByte(0xA10001)); // either byte of the word aliases the same register
+        Assert.Equal(0xA0, bus.ReadByte(0xA10000));
+        Assert.Equal(0xA0, bus.ReadByte(0xA10001)); // either byte of the word aliases the same register
     }
 
     [Fact]

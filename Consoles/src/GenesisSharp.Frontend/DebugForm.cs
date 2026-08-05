@@ -306,39 +306,37 @@ public sealed class DebugForm : Form
         clearBreakpointButton.Click += (_, _) => _onSetBreakpoint(null);
         bpRow.Controls.Add(clearBreakpointButton);
 
-        // VERSION register ($A10001) live override -- GenesisConsole's own doc comment on
-        // VersionRegisterValue calls this "the least-confidently-recalled constant in the whole
-        // emulator": bit 6's NTSC/PAL polarity has conflicting evidence (genesis-plus-gx's own
-        // REGION_USA-derived value says 0=NTSC, but a real 32X title's live boot code demands
-        // the opposite for its region/hardware sanity check -- see the 32X investigation notes).
-        // Only these two specific values are meaningful (the two candidate bit-6 polarities that
-        // came out of that investigation, both otherwise-identical: overseas + no-expansion,
-        // differing only in bit 6) -- a toggle between them, not a free-form hex box, since
-        // nothing else is a real hypothesis worth typing in here. Applied immediately on click,
-        // no separate "Set" step, matching how a toggle should behave. MainForm stores the value
-        // (not just this form) specifically so it survives a ROM reload -- the whole point of
-        // testing a boot-time hardware-detection hypothesis, which by definition needs the boot
-        // sequence to actually re-run with the override already in place.
+        // VERSION register ($A10001) live override -- GenesisConsole.VersionRegisterValue's own
+        // remarks cover the full story: bit 6 = 0 ($A0) is the confirmed-correct NTSC polarity
+        // (matches genesis-plus-gx independently, and a real 32X title's own boot code confirms
+        // it two different ways once Sega32X.Vdp.cs's NPalBit default is also correct). $E0 was
+        // an earlier, incorrect workaround for what turned out to be that separate NPalBit bug --
+        // kept here as a toggle (not removed) since it's still a generally useful override for
+        // testing a future title's own region/hardware checks, not just this one investigation.
+        // Applied immediately on click, no separate "Set" step. MainForm stores the value (not
+        // just this form) specifically so it survives a ROM reload -- the whole point of testing
+        // a boot-time hardware-detection hypothesis, which by definition needs the boot sequence
+        // to actually re-run with the override already in place.
         var versionRow = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(4), BackColor = RetroTheme.Panel };
         versionRow.Controls.Add(new Label { Text = "VERSION reg ($A10001) bit 6:", Font = peekRowFont, ForeColor = RetroTheme.Text, AutoSize = true, Margin = new Padding(4, 8, 4, 0) });
         var versionA0RadioButton = new RadioButton
         {
-            Text = "0 -- $A0 (genesis-plus-gx non-32X polarity)",
-            Font = peekRowFont,
-            ForeColor = RetroTheme.Text,
-            BackColor = RetroTheme.Panel,
-            AutoSize = true,
-            Margin = new Padding(4, 6, 4, 4),
-        };
-        var versionE0RadioButton = new RadioButton
-        {
-            Text = "1 -- $E0 (32X-verified, default)",
+            Text = "0 -- $A0 (confirmed-correct NTSC, default)",
             Font = peekRowFont,
             ForeColor = RetroTheme.Text,
             BackColor = RetroTheme.Panel,
             AutoSize = true,
             Margin = new Padding(4, 6, 4, 4),
             Checked = true,
+        };
+        var versionE0RadioButton = new RadioButton
+        {
+            Text = "1 -- $E0 (superseded workaround, for comparison)",
+            Font = peekRowFont,
+            ForeColor = RetroTheme.Text,
+            BackColor = RetroTheme.Panel,
+            AutoSize = true,
+            Margin = new Padding(4, 6, 4, 4),
         };
         versionA0RadioButton.Click += (_, _) => _onSetVersionRegisterOverride(0xA0);
         versionE0RadioButton.Click += (_, _) => _onSetVersionRegisterOverride(0xE0);

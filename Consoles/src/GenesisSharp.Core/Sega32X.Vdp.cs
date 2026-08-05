@@ -23,6 +23,22 @@ public sealed partial class Sega32X
     private const ushort NFenBit = 1 << 1;
     private const ushort FsBit = 1 << 0;
 
+    /// <summary>VdpRegs[0] bit 15 (word-level; the byte a 68000/SH-2 read of offset 0 actually
+    /// sees is that word's high byte, so this is bit 7 there). Genuinely active-low, same "n"
+    /// prefix convention as <see cref="NCartBit"/>/nRES: confirmed against PicoDrive's own
+    /// set/clear condition, <c>if (!Pico.m.pal) vdp_regs[0] |= P32XV_nPAL; else vdp_regs[0] &amp;=
+    /// ~P32XV_nPAL;</c> (<c>32x.c:134-137</c>) — the bit is SET for NTSC, CLEARED for PAL, exactly
+    /// backwards from what the name reads as at a glance if you don't clock the "n" prefix. Left
+    /// clear (the same mistake <see cref="NCartBit"/> made before it was caught) made a real 32X
+    /// title's own region/hardware sanity check treat an NTSC system as PAL — confirmed via a
+    /// live, verified boot trace, and initially misdiagnosed as a <see
+    /// cref="GenesisConsole.VersionRegisterValue"/> polarity bug instead, since both bits feed
+    /// the same check and either one being wrong looks identical from that check's own pass/fail
+    /// outcome alone. GenesisSharp is NTSC/224-line only (see <see
+    /// cref="V28LineTableOffset"/>'s remarks), so this is unconditionally set at reset — there is
+    /// no PAL mode for it to ever need clearing.</summary>
+    private const ushort NPalBit = 1 << 15;
+
     /// <summary>Fixed offset between frame-buffer line-table index 0 and the first visible
     /// scanline in 224-line (V28) mode (confirmed at <c>32x.c:258-260</c>; the 240-line/V30 case
     /// there uses 0 instead, but GenesisSharp is NTSC/224-line only, so that branch never
@@ -81,6 +97,9 @@ public sealed partial class Sega32X
         // happens on scanline 0, right after reset, since active display starts immediately)
         // would never fire, leaving VBLK/PEN incorrectly stuck set through the entire first frame.
         VdpRegs[5] = VBlkBit | PenBit;
+        // NPalBit set unconditionally -- see its own remarks: active-low, SET means NTSC, and
+        // GenesisSharp has no PAL mode to ever need it cleared.
+        VdpRegs[0] = NPalBit;
         _wasVBlank = true;
         _hasPendingFrameSelect = false;
         _blankFakeCounter = 0;
@@ -309,6 +328,25 @@ public sealed partial class Sega32X
     private void WriteVdpControlByte(uint offset, byte value)
     {
         if (offset > 0x1F)
+        {
+            return;
+        }
+
+        if (offset == 0) // VdpRegs[0]'s high byte -- NPalBit (bit 15 of the word, bit 7 here) is
+                          // its only named bit and is genuinely read-only hardware status, not
+                          // software-writable storage. Confirmed against PicoDrive's own
+                          // p32x_vdp_write8: there is no case 0x00 handler at all, so a real
+                          // 68000/SH-2 write to this byte is simply discarded outright -- and a
+                          // *word*-sized write (the common case; a real 32X title's own boot code
+                          // clears this whole register with one MOVE.W) falls through to the
+                          // case 0x01 (low-byte) handler instead via p32x_vdp_write16's own
+                          // `a |= 1` remap, which explicitly re-preserves NPalBit even though it
+                          // otherwise looks like a full-word overwrite -- i.e. this bit survives
+                          // every software write path real hardware has, not just some of them.
+                          // Found the hard way: an earlier attempt to fix a real 32X title's own
+                          // hardware-detection deadlock via a plain reset-time default (no write
+                          // protection) got silently clobbered back to 0 by this exact register's
+                          // own early-boot clear, right before the check that reads it again.
         {
             return;
         }

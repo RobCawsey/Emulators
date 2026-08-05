@@ -106,26 +106,24 @@ public sealed partial class GenesisConsole : Cpu68000.IBus, CpuZ80.IBus
 
     private readonly byte[] _tmssRegister = new byte[4];
 
-    /// <summary>Bit 7: 0 = domestic (Japan), 1 = overseas. Bit 6: NTSC/PAL, polarity below.
-    /// Bit 5: 0 = expansion (Mega CD) port present, 1 = not present. Bits 0-3: hardware
-    /// revision. This is the least-confidently-recalled constant in the whole emulator, and bit
-    /// 6 in particular has directly conflicting evidence: genesis-plus-gx's own
-    /// <c>REGION_USA</c>-derived value computes bit 6 = 0 for NTSC (non-32X mode) — but a real
-    /// 32X title's live boot code (Pitfall: The Mayan Adventure) says otherwise for a system
-    /// running with the 32X enabled. Its region/hardware sanity check cross-references this bit
-    /// against the 32X VDP's own <c>nPAL</c> flag and, with bit 6 = 0 (the genesis-plus-gx
-    /// polarity), spun forever in a self-trap (<c>BRA *-2</c>) — confirmed via a live, verified
-    /// instruction-by-instruction trace, not a guess. Flipping bit 6 to 1 let that exact same
-    /// title clear the check and reach its own "NTSC GENESIS SYSTEMS" region-lock splash screen,
-    /// real rendered output that was never reached before. Whether real hardware's VERSION
-    /// register genuinely reports a different bit 6 once the 32X is active (plausible — the 32X
-    /// is known to intercept/modify several 68000-side registers) or this title's check is
-    /// simply unusual isn't confirmed either way, but the live behavior is unambiguous for this
-    /// title. Defaulting to the polarity that actually got a real 32X cartridge further,
-    /// pending a second title to corroborate. A settable property (not a const) so <see
-    /// cref="GenesisSharp.Frontend.DebugForm"/> can still override this live for further
-    /// experimentation without a rebuild.</summary>
-    public byte VersionRegisterValue { get; set; } = 0xE0;
+    /// <summary>Bit 7: 0 = domestic (Japan), 1 = overseas. Bit 6: 0 = NTSC, 1 = PAL. Bit 5:
+    /// 0 = expansion (Mega CD) port present, 1 = not present. Bits 0-3: hardware revision. Bit
+    /// 6's polarity is confirmed correct at 0 = NTSC: it matches genesis-plus-gx's own
+    /// <c>REGION_USA</c>-derived value independently, and a real 32X title's live boot code
+    /// (Pitfall: The Mayan Adventure) confirms it two different ways once <see
+    /// cref="Sega32X.Vdp.cs"/>'s own <c>NPalBit</c> default is also correct (see that constant's
+    /// remarks) — the same title's region/hardware sanity check and a second, separate 2-bit
+    /// region-code dispatch (bits 6-7 read as a region value: 2 = USA) both pass cleanly with
+    /// this value and the corrected <c>nPAL</c> default together. A previous revision of this
+    /// value flipped bit 6 to 1 based on the first check alone, before the <c>nPAL</c> polarity
+    /// bug (the real root cause) was found — that flip happened to satisfy the first check but
+    /// broke the second, sending this exact title into its own "NTSC GENESIS SYSTEMS" region-
+    /// mismatch warning screen followed by a deliberate halt, which is what a real region
+    /// mismatch does on real hardware, not a workaround. Reverted once both checks were traced
+    /// live and shown to require the *original* polarity once the real bug was fixed. A settable
+    /// property (not a const) so <see cref="GenesisSharp.Frontend.DebugForm"/> can still override
+    /// this live for further experimentation without a rebuild.</summary>
+    public byte VersionRegisterValue { get; set; } = 0xA0;
 
     public Cartridge Cartridge { get; }
     public M68000 Cpu { get; }

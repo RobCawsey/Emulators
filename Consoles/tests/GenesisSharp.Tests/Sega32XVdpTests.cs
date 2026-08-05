@@ -147,6 +147,43 @@ public class Sega32XVdpTests
         Assert.NotEqual(0, sega32X.VdpRegs[5] & 0x2000); // PEN set
     }
 
+    /// <summary>Confirmed against PicoDrive's own set/clear condition (<c>32x.c:134-137</c>):
+    /// <c>nPAL</c> is genuinely active-low -- SET means NTSC, CLEAR means PAL, opposite of what
+    /// the name reads as without clocking the "n" prefix (same convention as nCART/nRES). Left
+    /// clear by mistake, a real 32X title's own region/hardware sanity check (which reads this
+    /// bit combined with the standard VERSION register) treated a live NTSC run as PAL -- found
+    /// via a live, verified boot-sequence trace, not a guess. GenesisSharp is NTSC/224-line only,
+    /// so this is unconditionally set, with no PAL mode to ever need it cleared.</summary>
+    [Fact]
+    public void Reset_SetsNPalBitSinceGenesisSharpIsNtscOnly()
+    {
+        var sega32X = CreateSega32X();
+
+        Assert.NotEqual(0, sega32X.VdpRegs[0] & 0x8000);
+    }
+
+    /// <summary>Regression coverage for the actual root cause behind a real 32X title's boot
+    /// deadlock: a plain reset-time default for NPalBit isn't enough, because a real 32X title's
+    /// own early-boot register clear (a word write of 0 to this exact register, part of its
+    /// generic "zero every 32X VDP register" init sequence) would otherwise clobber it right back
+    /// to 0 before the hardware-detection check that reads it again ever runs. Confirmed against
+    /// PicoDrive's own p32x_vdp_write8 (memory.c:684-692, case 0x01): there is no case 0x00 at
+    /// all, and the word-write path (memory.c:714-741) explicitly falls through offset-0 writes
+    /// to the case-0x01 handler, which re-preserves NPalBit even though it looks like a full-word
+    /// overwrite -- i.e. this bit survives every real write path, not just some of them.</summary>
+    [Fact]
+    public void WriteVdpControlByteFrom68k_OffsetZero_PreservesNPalBitEvenOnAFullWordClear()
+    {
+        var sega32X = CreateSega32X();
+
+        // A word write of 0 to VdpRegs[0] -- both bytes at offsets 0 and 1 -- exactly matching a
+        // real 32X title's own generic register-clear sequence (MOVE.W D0,128(A1) with D0 = 0).
+        sega32X.WriteVdpControlByteFrom68k(0x00, 0x00);
+        sega32X.WriteVdpControlByteFrom68k(0x01, 0x00);
+
+        Assert.NotEqual(0, sega32X.VdpRegs[0] & 0x8000);
+    }
+
     [Fact]
     public void FrameSelectSwap_AppliesImmediatelyWhileBlanking()
     {
