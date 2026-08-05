@@ -156,6 +156,7 @@ public sealed partial class GenesisConsole : Cpu68000.IBus, CpuZ80.IBus
         ExtPort.Pad.Connected = false;
         Sega32X = new Sega32X(cartridge);
         Vdp.External32XPixelBlend = Sega32X.TryGetPixel;
+        Vdp.EnteredVBlank += Sega32X.OnVerticalBlankStarted;
     }
 
     public void Reset()

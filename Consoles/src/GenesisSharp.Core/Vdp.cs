@@ -31,6 +31,15 @@ public sealed partial class Vdp
     /// <c>GenesisConsole.RequestVerticalBlankInterrupt</c>.</summary>
     public event Action? VerticalBlankStarted;
 
+    /// <summary>Fired once per frame at the exact same edge as <see cref="VerticalBlankStarted"/>,
+    /// but unconditionally — not gated by <see cref="VerticalInterruptEnabled"/>. Exists
+    /// specifically for the 32X's own VINT, a genuinely separate SH-2-facing interrupt path with
+    /// no dependency on whether the 68000 wants its own vblank interrupt at all: confirmed against
+    /// PicoDrive's own <c>p32x_start_blank</c> (<c>reference/PicoDrive/picodrive/pico/32x/32x.c:
+    /// 316-330</c>), which raises VINT with no check on the 68000's own VDP register 1 IE0 bit
+    /// anywhere in it. GenesisSharp.Core wires this to <c>Sega32X.OnVerticalBlankStarted</c>.</summary>
+    public event Action? EnteredVBlank;
+
     /// <summary>Fired every (<see cref="HInterruptCounter"/> + 1) scanlines during the active
     /// display, but only when <see cref="HorizontalInterruptEnabled"/> is set. Real hardware
     /// shares a single 68000 interrupt line (level 4, the same autovector as

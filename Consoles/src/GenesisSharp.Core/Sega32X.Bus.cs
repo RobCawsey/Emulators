@@ -110,7 +110,7 @@ internal sealed class Sega32XSh2Bus : IBus
         {
             if (decoded is >= AdapterRegLow and <= AdapterRegHigh)
             {
-                _console32X.WriteRegisterByteFromSh2(decoded - AdapterRegLow, value);
+                _console32X.WriteRegisterByteFromSh2(decoded - AdapterRegLow, value, _isSlave);
             }
             else if (decoded is >= VdpRegLow and <= VdpRegHigh)
             {

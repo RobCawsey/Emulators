@@ -195,6 +195,28 @@ public sealed partial class Sega32X
             return;
         }
 
+        if (offset == 2) // high byte of the "irq ctl" word -- ignored, always 0 (memory.c:427-428)
+        {
+            return;
+        }
+
+        if (offset == 3) // irq ctl (low byte): CMD IRQ request bits, bit 0 = request-to-master,
+                          // bit 1 = request-to-slave (memory.c:429-436). Only takes effect on an
+                          // actual bit change, and re-evaluates both cores' CMD condition live --
+                          // see Sega32X.Interrupts.cs's UpdateCmdIrq remarks.
+        {
+            byte oldBits = (byte)(Regs[1] & 0x3);
+            byte newBits = (byte)(value & 0x3);
+            if (oldBits != newBits)
+            {
+                WriteRegByte(3, newBits);
+                UpdateCmdIrq(0);
+                UpdateCmdIrq(1);
+            }
+
+            return;
+        }
+
         WriteRegByte(offset, value);
     }
 
@@ -224,15 +246,56 @@ public sealed partial class Sega32X
         return ReadRegByte(offset);
     }
 
-    /// <summary>SH-2-side byte write of the adapter/control block. Offsets 0/1 (FM/REN/nRES/ADEN)
-    /// are 68000-exclusive on real hardware — nothing in PicoDrive's SH-2-side register-write
-    /// handlers touches those bits — so writes there are silently ignored rather than applied.
-    /// Every other offset (notably COMM0-7 at 0x20-0x2f) is plain shared storage, written directly
-    /// — the same array the 68000 side reads, giving the two CPUs symmetric read/write access with
-    /// no extra plumbing needed.</summary>
-    internal void WriteRegisterByteFromSh2(uint offset, byte value)
+    /// <summary>SH-2-side byte write of the adapter/control block. Offset 0 (FM/REN) is
+    /// 68000-exclusive on real hardware — nothing in PicoDrive's SH-2-side register-write
+    /// handlers touches that byte — so writes there are silently ignored. Offset 1 is *not*
+    /// 68000-exclusive, despite meaning nRES/ADEN on that side: from the SH-2's own perspective
+    /// the same byte offset is its own per-core interrupt-enable register (confirmed
+    /// memory.c:824-839 — see <see cref="Sh2IrqMask"/>'s remarks), a real asymmetry this method
+    /// used to get wrong by discarding SH-2 writes there entirely. Offsets 0x14/0x16/0x18/0x1a/
+    /// 0x1c are the pending-interrupt-clear block (VRES/VINT/HINT/CMD/PWM respectively) — CMD
+    /// (0x1a) and VINT (0x16, a documented no-op — see the offset-0x16 case's own remarks) are
+    /// wired up so far, the other three clear silently as plain storage until their own phases
+    /// land. Every other offset (notably COMM0-7 at 0x20-0x2f) is plain shared storage,
+    /// written directly — the same array the 68000 side reads, giving the two CPUs symmetric
+    /// read/write access with no extra plumbing needed.</summary>
+    internal void WriteRegisterByteFromSh2(uint offset, byte value, bool isSlave)
     {
-        if (offset is 0 or 1 || offset > 0x3F)
+        if (offset > 0x3F)
+        {
+            return;
+        }
+
+        int core = isSlave ? 1 : 0;
+
+        if (offset == 0)
+        {
+            return;
+        }
+
+        if (offset == 1)
+        {
+            Sh2IrqMask[core] = (byte)(value & 0x0F);
+            UpdateCmdIrq(core);
+            return;
+        }
+
+        if ((offset & ~1u) == 0x1A) // CMD ack -- see AcknowledgeCmdIrq's remarks on why both
+                                    // bytes of this word-pair are treated as the same register.
+        {
+            AcknowledgeCmdIrq(core);
+            return;
+        }
+
+        if ((offset & ~1u) == 0x16) // VINT ack. On real hardware this clears a separate pending-
+                                     // interrupt bitmask (PicoDrive's own sh2irqi); this core has
+                                     // no equivalent for VINT (see OnVerticalBlankStarted's own
+                                     // remarks -- Sh2.RaiseInterrupt already self-clears once
+                                     // serviced, with no persistent "still requested" register
+                                     // state the way CMD's request bit is), so real SH-2 code
+                                     // writing here as its interrupt handler's first action is a
+                                     // correct, harmless no-op rather than something silently
+                                     // falling through to plain storage.
         {
             return;
         }

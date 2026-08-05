@@ -61,6 +61,8 @@ public sealed partial class Vdp
             {
                 VerticalBlankStarted?.Invoke();
             }
+
+            EnteredVBlank?.Invoke(); // unconditional -- see this event's own remarks (32X VINT)
         }
 
         if (CurrentScanline >= LinesPerFrame)
