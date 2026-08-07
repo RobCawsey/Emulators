@@ -221,7 +221,7 @@ public class Sh2Tests
 
         Assert.Equal(77u, cpu.R[3]); // delay slot still executed
         Assert.Equal(start + 4, cpu.PC); // plain fallthrough past the delay slot, branch not taken
-        Assert.Equal(3, cycles); // BTS not-taken (2) + MOV #imm (1)
+        Assert.Equal(2, cycles); // BTS not-taken (1) + MOV #imm (1)
     }
 
     [Fact]
@@ -239,7 +239,7 @@ public class Sh2Tests
         int cycles = cpu.Step();
 
         Assert.Equal(start + 10, cpu.PC);
-        Assert.Equal(4, cycles); // BTS taken (3) + NOP (1)
+        Assert.Equal(3, cycles); // BTS taken (2) + NOP (1)
     }
 
     [Fact]

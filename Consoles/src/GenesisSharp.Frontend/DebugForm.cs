@@ -54,6 +54,18 @@ public sealed class DebugForm : Form
         "  title -- for a non-32X ROM both cores simply sit held at\r\n" +
         "  reset and never step.\r\n" +
         "\r\n" +
+        "  Trace (Master/Slave, N steps, watch R#)\r\n" +
+        "    Only while paused. Steps the selected core N instructions\r\n" +
+        "    back-to-back (up to 200,000) and shows two views of the\r\n" +
+        "    run: every change to the chosen 'watch' register (good for\r\n" +
+        "    a suspected loop counter -- shows every value it takes for\r\n" +
+        "    the *entire* run, however long), plus the last 400\r\n" +
+        "    instructions actually executed (so whatever runs right\r\n" +
+        "    after a long-awaited loop exit is visible even if it's\r\n" +
+        "    thousands of instructions in). Actually advances that\r\n" +
+        "    core's PC/registers by N instructions, same as clicking\r\n" +
+        "    Step Instruction N times would.\r\n" +
+        "\r\n" +
         "VRAM TAB\r\n" +
         "\r\n" +
         "  A palette-line selector (0-3) and a zoomed-in view of every\r\n" +
@@ -78,9 +90,24 @@ public sealed class DebugForm : Form
     /// whatever subroutine happens to be executing right now (e.g. a stack-peeked return address
     /// that isn't the live PC). Cleared by the "Follow PC" button.</summary>
     private uint? _m68kPeekAddress;
+
+    /// <summary>Same idea as <see cref="_m68kPeekAddress"/>, for the SH-2 disassembly panels --
+    /// added specifically to read a callee's code (a function reached only via an indirect
+    /// <c>JSR @Rn</c> through a literal-pool pointer, say) without needing the live core to
+    /// actually execute it first. <see cref="_sh2PeekIsSlave"/> selects which of the two panels
+    /// the override applies to; the other keeps following its own live PC.</summary>
+    private uint? _sh2PeekAddress;
+    private bool _sh2PeekIsSlave;
     private readonly TextBox _sh2RegistersText;
     private readonly TextBox _msh2DisasmText;
     private readonly TextBox _ssh2DisasmText;
+    private readonly TextBox _sh2TraceText;
+
+    /// <summary>Tracks the pause state <see cref="SetPausedLabel"/> reports, purely so the SH-2
+    /// trace button (below) can refuse to run while the emulation thread might still be
+    /// live-stepping the same core -- there's no other consumer, unlike <see cref="_paused"/>
+    /// in <see cref="MainForm"/> itself, which this window has no direct access to.</summary>
+    private bool _isPaused;
     private readonly Button _pauseButton;
     private readonly ComboBox _paletteLineSelector;
     private readonly PictureBox _palettePreview;
@@ -348,7 +375,7 @@ public sealed class DebugForm : Form
         // (32X adapter line + blank + [master header/next/4 register rows/PR-GBR-VBR-MACH-MACL
         // row] + blank + the same 7 lines for the slave) -- sized the same font-driven way as
         // _registersText above, for the same reason (avoid silently clipping under DPI scaling).
-        const int sh2RegisterLineCount = 18;
+        const int sh2RegisterLineCount = 19;
         _sh2RegistersText = new TextBox
         {
             Multiline = true,
@@ -393,6 +420,179 @@ public sealed class DebugForm : Form
         };
         sh2DisasmPanel.Controls.Add(_msh2DisasmText, 0, 0);
         sh2DisasmPanel.Controls.Add(_ssh2DisasmText, 1, 0);
+
+        // SH-2 instruction trace -- the 68000 side gets a live-following disassembly panel above
+        // plus a PC breakpoint, but neither substitute for seeing an actual sequential run of
+        // instructions when a core is stuck cycling through a small code region: repeatedly
+        // reading the live "Next:" line one frame apart just shows scattered snapshots of
+        // wherever PC happens to be at each poll, not the real control flow in between. This
+        // steps the selected core N times back-to-back (only while paused, so it can't race the
+        // emulation thread's own stepping) and logs the PC + decoded instruction for every one --
+        // added specifically to trace a real stuck-loop investigation instruction-by-instruction
+        // rather than guessing from one-frame-apart register snapshots.
+        var sh2TraceRow = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(4), BackColor = RetroTheme.Panel };
+        sh2TraceRow.Controls.Add(new Label { Text = "Trace core:", Font = peekRowFont, ForeColor = RetroTheme.Text, AutoSize = true, Margin = new Padding(4, 8, 4, 0) });
+        var sh2TraceCoreSelector = new ComboBox
+        {
+            DropDownStyle = ComboBoxStyle.DropDownList,
+            Font = peekRowFont,
+            BackColor = RetroTheme.Panel,
+            ForeColor = RetroTheme.Text,
+            Width = 90,
+            Margin = new Padding(4, 4, 4, 4),
+        };
+        sh2TraceCoreSelector.Items.AddRange(new object[] { "Master", "Slave" });
+        sh2TraceCoreSelector.SelectedIndex = 0;
+        sh2TraceRow.Controls.Add(sh2TraceCoreSelector);
+        sh2TraceRow.Controls.Add(new Label { Text = "steps:", Font = peekRowFont, ForeColor = RetroTheme.Text, AutoSize = true, Margin = new Padding(4, 8, 4, 0) });
+        var sh2TraceCountBox = new TextBox { Font = peekRowFont, Width = 70, Text = "20000", Margin = new Padding(4, 4, 4, 4) };
+        sh2TraceRow.Controls.Add(sh2TraceCountBox);
+        sh2TraceRow.Controls.Add(new Label { Text = "watch R#:", Font = peekRowFont, ForeColor = RetroTheme.Text, AutoSize = true, Margin = new Padding(4, 8, 4, 0) });
+        var sh2TraceWatchBox = new TextBox { Font = peekRowFont, Width = 30, Text = "3", Margin = new Padding(4, 4, 4, 4) };
+        sh2TraceRow.Controls.Add(sh2TraceWatchBox);
+        sh2TraceRow.Controls.Add(new Label { Text = "or watch mem ($):", Font = peekRowFont, ForeColor = RetroTheme.Text, AutoSize = true, Margin = new Padding(4, 8, 4, 0) });
+        var sh2TraceWatchMemBox = new TextBox { Font = peekRowFont, Width = 80, Margin = new Padding(4, 4, 4, 4) };
+        sh2TraceRow.Controls.Add(sh2TraceWatchMemBox);
+        var sh2TraceButton = new Button { Text = "Trace (only while paused -- steps the core!)", AutoSize = true };
+        RetroTheme.StyleButton(sh2TraceButton);
+        sh2TraceRow.Controls.Add(sh2TraceButton);
+
+        _sh2TraceText = new TextBox
+        {
+            Multiline = true,
+            ReadOnly = true,
+            Dock = DockStyle.Top,
+            Height = disasmFont.Height * 20 + 16,
+            Font = disasmFont,
+            BackColor = Color.Black,
+            ForeColor = Color.Magenta,
+            ScrollBars = ScrollBars.Vertical,
+            WordWrap = false,
+        };
+
+        // A flat step-and-log-everything trace is only readable for a couple hundred
+        // instructions -- useless for "let this run far enough to see a rarely-taken exit
+        // branch", which can be thousands of instructions away (exactly what a stuck-loop
+        // investigation needs: does it *ever* actually exit?). So this always executes the full
+        // requested count, but keeps two separate views of it instead of one giant unreadable
+        // dump: a "watch" log (one line every time the chosen register's value changes -- the
+        // loop-counter register a stuck-loop hypothesis usually centers on) covering the *entire*
+        // run regardless of how long it is, and a ring-buffer "tail" of the last 400 instructions
+        // actually executed, which naturally captures whatever runs right after a long-awaited
+        // exit branch finally gets taken (once PC leaves the old loop's small address range for
+        // good, the tail fills with genuinely new code rather than the loop's own repetition).
+        const int TailLines = 2000;
+        sh2TraceButton.Click += (_, _) =>
+        {
+            if (_console is null || !_isPaused)
+            {
+                _sh2TraceText.Text = "(pause emulation first -- stepping while running would race the emulation thread)";
+                return;
+            }
+
+            int count = int.TryParse(sh2TraceCountBox.Text, out int parsedCount) ? Math.Clamp(parsedCount, 1, 200_000) : 20_000;
+            bool isSlave = sh2TraceCoreSelector.SelectedIndex == 1;
+            var sega32X = _console.Sega32X;
+            var core = isSlave ? sega32X.SlaveSh2 : sega32X.MasterSh2;
+            var bus = isSlave ? sega32X.SlaveSh2Bus : sega32X.MasterSh2Bus;
+
+            // Watching a specific memory address (rather than a register) answers a different
+            // question: not "what does this loop's own counter do" but "does *any* code path this
+            // core executes -- not just the one currently on screen -- ever write here at all".
+            // A register watch can only ever see what the one loop already in view does; a memory
+            // watch catches a write from anywhere, which is what a "does this ever get signaled"
+            // investigation actually needs.
+            bool watchingMemory = uint.TryParse(sh2TraceWatchMemBox.Text, System.Globalization.NumberStyles.HexNumber, null, out uint watchAddress);
+            int watchReg = int.TryParse(sh2TraceWatchBox.Text, out int parsedWatch) ? Math.Clamp(parsedWatch, 0, 15) : 3;
+
+            var watchLines = new List<string>();
+            var tail = new Queue<string>(TailLines + 1);
+            uint lastWatchValue = watchingMemory ? bus.ReadLong(watchAddress) : core.R[watchReg];
+            watchLines.Add(watchingMemory
+                ? $"[{watchAddress:X8}] starts at {lastWatchValue:X8} (PC={core.PC:X8})"
+                : $"R{watchReg} starts at {lastWatchValue:X8} (PC={core.PC:X8})");
+
+            for (int i = 0; i < count; i++)
+            {
+                uint pc = core.PC;
+                string text = SafeDecode(() => Sh2Disassembler.Decode(pc, bus).Text);
+                tail.Enqueue($"{pc:X8}: {text}");
+                if (tail.Count > TailLines)
+                {
+                    tail.Dequeue();
+                }
+
+                core.Step();
+
+                uint newWatchValue = watchingMemory ? bus.ReadLong(watchAddress) : core.R[watchReg];
+                if (newWatchValue != lastWatchValue)
+                {
+                    watchLines.Add(watchingMemory
+                        ? $"[{watchAddress:X8}] {lastWatchValue:X8} -> {newWatchValue:X8}  (after step {i}, now at PC={core.PC:X8})"
+                        : $"R{watchReg} {lastWatchValue:X8} -> {newWatchValue:X8}  (after step {i}, now at PC={core.PC:X8})");
+                    lastWatchValue = newWatchValue;
+                    if (watchLines.Count > 200)
+                    {
+                        watchLines.RemoveAt(1); // keep the "starts at" line, trim from the oldest transition
+                    }
+                }
+            }
+
+            var output = new List<string>(watchLines.Count + tail.Count + 3)
+            {
+                watchingMemory
+                    ? $"-- [{watchAddress:X8}] watch, {count} steps executed --"
+                    : $"-- R{watchReg} watch, {count} steps executed --",
+            };
+            output.AddRange(watchLines);
+            output.Add("");
+            output.Add($"-- last {tail.Count} instructions executed --");
+            output.AddRange(tail);
+
+            _sh2TraceText.Lines = output.ToArray();
+            RefreshSnapshot(); // registers/live disassembly panels now reflect the advanced PC too
+        };
+
+        // Mirrors the CPU tab's own 68000 "Peek" row (peekRow, above) for the SH-2 disassembly
+        // panels -- lets either panel show a fixed address range instead of always following its
+        // core's live PC, for reading a callee's code (reached only via an indirect JSR through a
+        // literal-pool pointer, say) without needing that core to actually execute it first.
+        var sh2PeekRow = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(4), BackColor = RetroTheme.Panel };
+        sh2PeekRow.Controls.Add(new Label { Text = "Peek SH-2 addr ($):", Font = peekRowFont, ForeColor = RetroTheme.Text, AutoSize = true, Margin = new Padding(4, 8, 4, 0) });
+        var sh2PeekAddressBox = new TextBox { Font = peekRowFont, Width = 80, Margin = new Padding(4, 4, 4, 4) };
+        sh2PeekRow.Controls.Add(sh2PeekAddressBox);
+        var sh2PeekCoreSelector = new ComboBox
+        {
+            DropDownStyle = ComboBoxStyle.DropDownList,
+            Font = peekRowFont,
+            BackColor = RetroTheme.Panel,
+            ForeColor = RetroTheme.Text,
+            Width = 90,
+            Margin = new Padding(4, 4, 4, 4),
+        };
+        sh2PeekCoreSelector.Items.AddRange(new object[] { "Master", "Slave" });
+        sh2PeekCoreSelector.SelectedIndex = 0;
+        sh2PeekRow.Controls.Add(sh2PeekCoreSelector);
+        var sh2PeekGoButton = new Button { Text = "Go", AutoSize = true };
+        RetroTheme.StyleButton(sh2PeekGoButton);
+        sh2PeekGoButton.Click += (_, _) =>
+        {
+            if (uint.TryParse(sh2PeekAddressBox.Text, System.Globalization.NumberStyles.HexNumber, null, out uint address))
+            {
+                _sh2PeekAddress = address;
+                _sh2PeekIsSlave = sh2PeekCoreSelector.SelectedIndex == 1;
+                RefreshSnapshot();
+            }
+        };
+        sh2PeekRow.Controls.Add(sh2PeekGoButton);
+        var sh2PeekFollowPcButton = new Button { Text = "Follow PC", AutoSize = true };
+        RetroTheme.StyleButton(sh2PeekFollowPcButton);
+        sh2PeekFollowPcButton.Click += (_, _) =>
+        {
+            _sh2PeekAddress = null;
+            RefreshSnapshot();
+        };
+        sh2PeekRow.Controls.Add(sh2PeekFollowPcButton);
 
         var paletteRowFont = new Font(FontFamily.GenericSansSerif, 12);
         var paletteRow = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(6), BackColor = RetroTheme.Panel };
@@ -450,6 +650,9 @@ public sealed class DebugForm : Form
         var sh2Tab = new TabPage("32X") { BackColor = RetroTheme.Background };
         sh2Tab.Controls.Add(sh2DisasmPanel);
         sh2Tab.Controls.Add(_sh2RegistersText);
+        sh2Tab.Controls.Add(sh2PeekRow);
+        sh2Tab.Controls.Add(sh2TraceRow);
+        sh2Tab.Controls.Add(_sh2TraceText);
 
         var vramTab = new TabPage("VRAM") { BackColor = RetroTheme.Background };
         vramTab.Controls.Add(_vramScroll);
@@ -510,7 +713,9 @@ public sealed class DebugForm : Form
         int peekRowHeight = peekRow.GetPreferredSize(Size.Empty).Height;
         int hexRowHeight = hexRow.GetPreferredSize(Size.Empty).Height;
         int cpuTabContentHeight = peekRowHeight + hexRowHeight + _registersText.Height + disasmFont.Height * DisasmLineCount + 16;
-        int sh2TabContentHeight = _sh2RegistersText.Height + disasmFont.Height * DisasmLineCount + 16;
+        int sh2TraceRowHeight = sh2TraceRow.GetPreferredSize(Size.Empty).Height;
+        int sh2PeekRowHeight = sh2PeekRow.GetPreferredSize(Size.Empty).Height;
+        int sh2TabContentHeight = _sh2RegistersText.Height + sh2PeekRowHeight + sh2TraceRowHeight + _sh2TraceText.Height + disasmFont.Height * DisasmLineCount + 16;
         int vramTabContentHeight = paletteRowHeight + _vramBitmap.Height;
         int contentHeight = menuStripHeight + toolbarHeight + tabChromeHeight + Math.Max(Math.Max(cpuTabContentHeight, sh2TabContentHeight), vramTabContentHeight);
         // Half the full grid width, on top of the vertical-fit sizing above -- at 128 columns
@@ -678,7 +883,11 @@ public sealed class DebugForm : Form
         _lastExceptionCount++;
     }
 
-    public void SetPausedLabel(bool paused) => _pauseButton.Text = paused ? "Resume" : "Pause";
+    public void SetPausedLabel(bool paused)
+    {
+        _pauseButton.Text = paused ? "Resume" : "Pause";
+        _isPaused = paused;
+    }
 
     /// <summary>Repaints every section from the console's current state. Cheap enough to call
     /// after every single frame/instruction step and after every real-time timer tick while
@@ -841,9 +1050,17 @@ public sealed class DebugForm : Form
         string masterInstruction = SafeDecode(() => Sh2Disassembler.Decode(master.PC, sega32X.MasterSh2Bus).Text);
         string slaveInstruction = SafeDecode(() => Sh2Disassembler.Decode(slave.PC, sega32X.SlaveSh2Bus).Text);
 
+        // Sh2IrqMask's low nibble, decoded bit-by-bit -- which of PWM/CMD/HINT/VINT each core has
+        // actually unmasked. Added specifically to stop guessing whether a given interrupt source
+        // is even enabled for a core before spending effort chasing why it isn't visibly doing
+        // anything -- e.g. HINT firing is a no-op if neither core ever set HIntMaskBit.
+        static string DecodeIrqMask(byte mask) =>
+            $"{mask:X2} (PWM={(mask & 1) != 0} CMD={(mask & 2) != 0} HINT={(mask & 4) != 0} VINT={(mask & 8) != 0})";
+
         var lines = new List<string>
         {
             $"32X    nRES={sega32X.NRes}  ADEN={sega32X.Aden}",
+            $"       Sh2IrqMask: Master={DecodeIrqMask(sega32X.Sh2IrqMask[0])}  Slave={DecodeIrqMask(sega32X.Sh2IrqMask[1])}",
             "",
             $"Master PC={master.PC:X8}  SR={master.SR:X8}  Cycles={master.TotalCycles}",
             $"  Next: {masterInstruction}",
@@ -877,14 +1094,17 @@ public sealed class DebugForm : Form
         var master = sega32X.MasterSh2;
         var slave = sega32X.SlaveSh2;
 
+        uint masterDisasmStart = (_sh2PeekAddress.HasValue && !_sh2PeekIsSlave) ? _sh2PeekAddress.Value : master.PC;
+        uint slaveDisasmStart = (_sh2PeekAddress.HasValue && _sh2PeekIsSlave) ? _sh2PeekAddress.Value : slave.PC;
+
         var masterLines = SafeDecodeLines(() =>
         {
-            var instructions = Sh2Disassembler.DisassembleRange(master.PC, DisasmLineCount, sega32X.MasterSh2Bus);
+            var instructions = Sh2Disassembler.DisassembleRange(masterDisasmStart, DisasmLineCount, sega32X.MasterSh2Bus);
             return DisassemblyLabeler.FormatWithLabels(instructions, master.PC, a => a.ToString("X8"));
         });
         var slaveLines = SafeDecodeLines(() =>
         {
-            var instructions = Sh2Disassembler.DisassembleRange(slave.PC, DisasmLineCount, sega32X.SlaveSh2Bus);
+            var instructions = Sh2Disassembler.DisassembleRange(slaveDisasmStart, DisasmLineCount, sega32X.SlaveSh2Bus);
             return DisassemblyLabeler.FormatWithLabels(instructions, slave.PC, a => a.ToString("X8"));
         });
 

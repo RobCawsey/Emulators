@@ -20,13 +20,20 @@ public class Sega32XVdpTests
     /// <summary>Writes a packed-pixel-mode frame ready to render one pixel: line table entry for
     /// <paramref name="line"/> points at word-offset 0, and the byte at that offset holds
     /// <paramref name="paletteIndex"/>.</summary>
+    /// <summary>Where these tests park their pixel data: word offset 0x100, i.e. byte offset
+    /// 0x200 -- the first byte past the 512-byte line table, so pixel data can never collide with
+    /// a table entry. Worth being deliberate about, since scanline <c>y</c> reads table entry
+    /// <c>y</c> (no offset -- see <c>Sega32X.Vdp.cs</c>'s <c>TryGetPixel</c> remarks), which puts
+    /// entry 0 and byte offset 0 at the same address.</summary>
+    private const int PixelDataWordOffset = 0x100;
+
     private static void SetUpPackedPixelLine(Sega32X sega32X, int line, byte paletteIndex)
     {
         sega32X.WriteVdpControlByteFrom68k(0x01, 0x01); // Mx = 1 (Packed Pixel)
         byte[] bank = sega32X.FrameBuffer[0]; // default DisplayBankIndex is 0 (FS=0 after reset)
-        bank[line * 2] = 0x00;
-        bank[line * 2 + 1] = 0x00; // line-table word offset = 0
-        bank[0] = paletteIndex;
+        bank[line * 2] = PixelDataWordOffset >> 8;
+        bank[line * 2 + 1] = PixelDataWordOffset & 0xFF;
+        bank[PixelDataWordOffset * 2] = paletteIndex;
     }
 
     [Fact]
@@ -54,7 +61,7 @@ public class Sega32XVdpTests
     public void TryGetPixel_PackedPixel_GenesisBackdrop_ShowsUnconditionallyRegardlessOfPriorityBit()
     {
         var sega32X = CreateSega32X();
-        SetUpPackedPixelLine(sega32X, line: 8, paletteIndex: 5); // line-table index = y(0) + V28 offset(8)
+        SetUpPackedPixelLine(sega32X, line: 0, paletteIndex: 5); // line-table index = scanline y (0)
         sega32X.Palette[5] = 0x0421; // priority bit (0x8000) clear
 
         bool result = sega32X.TryGetPixel(0, 0, isGenesisBackdrop: true, isH32: false, out byte r, out byte g, out byte b);
@@ -67,7 +74,7 @@ public class Sega32XVdpTests
     public void TryGetPixel_PackedPixel_NonBackdropWithoutPriorityBit_GenesisPixelWins()
     {
         var sega32X = CreateSega32X();
-        SetUpPackedPixelLine(sega32X, line: 8, paletteIndex: 5);
+        SetUpPackedPixelLine(sega32X, line: 0, paletteIndex: 5);
         sega32X.Palette[5] = 0x0421; // priority bit clear
 
         bool result = sega32X.TryGetPixel(0, 0, isGenesisBackdrop: false, isH32: false, out _, out _, out _);
@@ -79,7 +86,7 @@ public class Sega32XVdpTests
     public void TryGetPixel_PackedPixel_NonBackdropWithPriorityBit_32XWins()
     {
         var sega32X = CreateSega32X();
-        SetUpPackedPixelLine(sega32X, line: 8, paletteIndex: 5);
+        SetUpPackedPixelLine(sega32X, line: 0, paletteIndex: 5);
         sega32X.Palette[5] = 0x8421; // priority bit set
 
         bool result = sega32X.TryGetPixel(0, 0, isGenesisBackdrop: false, isH32: false, out _, out _, out _);
@@ -91,7 +98,7 @@ public class Sega32XVdpTests
     public void TryGetPixel_PriRegister_InvertsThePrioritySense()
     {
         var sega32X = CreateSega32X();
-        SetUpPackedPixelLine(sega32X, line: 8, paletteIndex: 5);
+        SetUpPackedPixelLine(sega32X, line: 0, paletteIndex: 5);
         sega32X.Palette[5] = 0x0421; // priority bit clear -- would normally lose to a non-backdrop Genesis pixel
         sega32X.WriteVdpControlByteFrom68k(0x01, (byte)(0x01 | 0x80)); // Mx=1, PRI bit also set
 
@@ -106,10 +113,10 @@ public class Sega32XVdpTests
         var sega32X = CreateSega32X();
         sega32X.WriteVdpControlByteFrom68k(0x01, 0x02); // Mx = 2 (Direct Color)
         byte[] bank = sega32X.FrameBuffer[0];
-        bank[8 * 2] = 0x00;
-        bank[8 * 2 + 1] = 0x00; // line-table word offset = 0
-        bank[0] = 0x84; // high byte: priority bit (0x80) set + top 2 bits of blue channel
-        bank[1] = 0x21; // low byte: rest of the raw 5:5:5 value
+        bank[0 * 2] = PixelDataWordOffset >> 8;
+        bank[0 * 2 + 1] = PixelDataWordOffset & 0xFF; // scanline 0 reads line-table entry 0
+        bank[PixelDataWordOffset * 2] = 0x84; // high byte: priority bit (0x80) set + top 2 bits of blue channel
+        bank[PixelDataWordOffset * 2 + 1] = 0x21; // low byte: rest of the raw 5:5:5 value
 
         bool result = sega32X.TryGetPixel(0, 0, isGenesisBackdrop: false, isH32: false, out byte r, out byte g, out byte b);
 
@@ -121,7 +128,7 @@ public class Sega32XVdpTests
     public void TryGetPixel_H32Mode_OffsetsBySh2AndBlanksTheLeftmostFourColumns()
     {
         var sega32X = CreateSega32X();
-        SetUpPackedPixelLine(sega32X, line: 8, paletteIndex: 5);
+        SetUpPackedPixelLine(sega32X, line: 0, paletteIndex: 5);
         sega32X.Palette[5] = 0x8421; // priority bit set, so it always shows once addressed correctly
 
         // Genesis x=0..3 have no corresponding 32X pixel in H32 mode (pixelX = x - 4 < 0).
@@ -130,6 +137,36 @@ public class Sega32XVdpTests
 
         // Genesis x=4 maps to 32X frame-buffer pixel 0, where the palette-index-5 pixel lives.
         Assert.True(sega32X.TryGetPixel(4, 0, isGenesisBackdrop: false, isH32: true, out _, out _, out _));
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(100)]
+    [InlineData(Vdp.ScreenHeight - 1)] // 223 -- the row a +8 offset pushed off the populated table
+    public void TryGetPixel_ReadsTheLineTableEntryMatchingTheScanlineWithNoOffset(int scanline)
+    {
+        var sega32X = CreateSega32X();
+        SetUpPackedPixelLine(sega32X, line: scanline, paletteIndex: 5);
+        sega32X.Palette[5] = 0x8421; // priority bit set, so it shows whenever it's addressed at all
+
+        // Only entry `scanline` is populated; every other entry is still zero. So this passes
+        // only if TryGetPixel indexes the table by the scanline itself. An earlier revision added
+        // a "V28" +8 here (misreading PicoDrive's `offs`, which is a *destination* centring
+        // offset) -- see Sega32X.Vdp.cs's TryGetPixel remarks for what that cost on a real title.
+        Assert.True(sega32X.TryGetPixel(0, scanline, isGenesisBackdrop: false, isH32: false, out _, out _, out _));
+    }
+
+    [Fact]
+    public void TryGetPixel_ScanlineWithAnUnpopulatedLineTableEntry_DoesNotBorrowAnotherRowsPixels()
+    {
+        var sega32X = CreateSega32X();
+        SetUpPackedPixelLine(sega32X, line: 0, paletteIndex: 5);
+        sega32X.Palette[5] = 0x8421;
+
+        // Scanline 8 has no table entry of its own, so it must not render scanline 0's pixels --
+        // the exact confusion a fixed +8 offset introduced, in reverse.
+        Assert.False(sega32X.TryGetPixel(0, 8, isGenesisBackdrop: false, isH32: false, out _, out _, out _));
     }
 
     [Fact]

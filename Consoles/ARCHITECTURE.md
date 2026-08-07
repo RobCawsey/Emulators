@@ -463,10 +463,24 @@ for Packed Pixel, or bit 15 of the raw pixel word for Direct Color — inverted 
 
 **Frame-buffer addressing is not a fixed stride** — the low 512 bytes of each bank hold a
 256-entry table of per-scanline word offsets into the same bank, which real 32X software writes
-itself before drawing a frame; rendering scanline `y` reads `dram[y+8]` (the `+8` is a fixed
-V28/224-line constant, hardcoded since GenesisSharp is NTSC/224-line only) to find where that
-line's pixel data starts. H32 mode additionally offsets the Genesis x-coordinate by 4 relative to
-the 32X pixel index (confirmed directly against `draw.c:18-19,148`'s `pmd += H32_OFFSET`).
+itself before drawing a frame; rendering scanline `y` reads `dram[y]` to find where that line's
+pixel data starts. The index is the scanline number itself, with no offset in either V28 or V30
+(`draw.c:206,228,251`: `dram[l + (lines_sft_offs >> 24)]`, where `l` counts visible lines from 0
+and the `>> 24` field is `sync_line`, the partial-render resume point — 0 for a whole-frame
+render).
+
+This is worth stating explicitly because the obvious-looking candidate is a trap this codebase
+fell into twice. `Pico32xRenderSync`'s `offs = 8; if (Pico.video.reg[1] & 8) offs = 0;`
+(`32x.c:257-259`) reads exactly like a V28/V30 line-table offset and is nothing of the sort — it
+feeds `Pico.est.DrawLineDest = DrawLineDestBase32x + offs * DrawLineDestIncrement32x`
+(`draw.c:290`), i.e. it is a *destination* offset centring a 224-line picture inside PicoDrive's
+240-line output buffer, and reaches the draw loops only in `lines_sft_offs`'s low byte, which they
+never read. GenesisSharp's `Vdp.FrameBuffer` is the 224-line active display alone, so the
+equivalent centring offset here is structurally zero. Using `dram[y+8]` instead cost real,
+visible corruption on a real title — see `Sega32X.Vdp.cs`'s `TryGetPixel` remarks.
+
+H32 mode additionally offsets the Genesis x-coordinate by 4 relative to the 32X pixel index
+(confirmed directly against `draw.c:18-19,148`'s `pmd += H32_OFFSET`).
 
 **Double buffering**: FBCR's `FS` bit selects which bank rendering reads from (`DisplayBankIndex`)
 — the SH-2s' CS2 window and the 68000's `$840000`/`$860000` windows always target the *other*

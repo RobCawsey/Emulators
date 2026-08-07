@@ -299,6 +299,12 @@ public sealed partial class GenesisConsole : Cpu68000.IBus, CpuZ80.IBus
             _audioBuffer.Enqueue(GenerateAudioSample());
         }
 
+        // 32X HINT -- ticked here (alongside Vdp.AdvanceScanline, not up at the top next to
+        // UpdateBlankingState) since it shares VINT's own timing model: raised at this
+        // end-of-scanline edge, only actually serviced on the SH-2's *next* Step() call, at the
+        // start of the following scanline's CPU loop. See Sega32X.AdvanceHIntCountdown's remarks.
+        Sega32X.AdvanceHIntCountdown(Vdp.CurrentScanline < Vdp.ScreenHeight);
+
         Vdp.AdvanceScanline();
     }
 

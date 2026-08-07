@@ -116,6 +116,15 @@ public sealed partial class Vdp
                 else if (!(chosen.HasValue && chosen.Value.HighPriority)) (r, g, bl) = ApplyShadow(cramValue);
             }
 
+            // Registers[1] bit 3 (Mode5Enabled's own remarks confirm this bit's real meaning: the
+            // 30-cell/240-line select) is read directly here rather than through a named property
+            // -- this project doesn't otherwise implement V30/240-line *rendering* (see
+            // Vdp.HvCounter.cs's own remarks), but the 32X's line-table addressing needs to know
+            // this bit's raw state regardless, confirmed against PicoDrive's own
+            // Pico32xRenderSync: `offs = 8; if (Pico.video.reg[1] & 8) offs = 0;` (32x.c:258-260)
+            // -- a game running its 32X layer over a 240-line-mode Genesis screen (some titles do
+            // this for full-height cutscenes/loading screens) needs the 0-offset table, not the
+            // 224-line default.
             if (External32XPixelBlend?.Invoke(x, scanline, !chosen.HasValue, !Is40CellMode, out byte r32x, out byte g32x, out byte b32x) == true)
             {
                 (r, g, bl) = (r32x, g32x, b32x);

@@ -129,20 +129,35 @@ public sealed partial class Sh2
     /// <summary>BT.S disp8 — conditional *and* delayed: unlike BT, the following instruction
     /// always executes, taken or not (see this class's own doc comment). Confirmed against
     /// PicoDrive's BTS (cpu/sh2/mame/sh2.c:443-454): when not taken, the "target" is simply the
-    /// address right after the delay slot, i.e. plain fallthrough. Cost 3 if taken, 2 if not.</summary>
+    /// address right after the delay slot, i.e. plain fallthrough.
+    ///
+    /// Own cost 2 if taken, 1 if not. A real, previously-shipped bug here charged 3/2 instead
+    /// (one cycle too many either way) — PicoDrive's own BTS/BFS only do <c>sh2->icount--</c>
+    /// inside the *taken* path (<c>mame/sh2.c:443-454</c>/<c>351-362</c>); the base 1 every
+    /// instruction gets comes from its own interpreter loop's unconditional <c>icount--</c>
+    /// (<c>sh2pico.c:169</c>), separate from any given instruction's own handler. This core has
+    /// no equivalent shared "every instruction costs at least 1" decrement anywhere else — each
+    /// <c>ExecuteXxx</c> method's return value *is* that instruction's total cost — so
+    /// PicoDrive's "base(1) [+ extra(1) if taken]" collapses to a flat 1/2 here, not 2/3.
+    /// Found via a real 32X title (Pitfall: The Mayan Adventure) whose loading-screen tile-blit
+    /// loop is dominated by BF/S — the ~1-extra-cycle-per-iteration overcharge on the single most
+    /// common instruction in that loop was enough to noticeably slow a render real hardware
+    /// finishes in one frame, spilling it across several (visible as the render looking
+    /// "still forming"/inconsistent frame-to-frame while under investigation).</summary>
     private int ExecuteBts(int disp8)
     {
         bool taken = FlagT;
         uint target = taken ? PC + (uint)(SignExtend8(disp8) * 2) + 2 : PC + 2;
-        return ExecuteDelayedBranch(target, branchCycles: taken ? 3 : 2);
+        return ExecuteDelayedBranch(target, branchCycles: taken ? 2 : 1);
     }
 
     /// <summary>BF.S disp8 — conditional and delayed, mirroring BT.S. cpu/sh2/mame/
-    /// sh2.c:351-362. Cost 3 if taken, 2 if not.</summary>
+    /// sh2.c:351-362. Own cost 2 if taken, 1 if not — see BT.S's own remarks for why (the same
+    /// fix applies here).</summary>
     private int ExecuteBfs(int disp8)
     {
         bool taken = !FlagT;
         uint target = taken ? PC + (uint)(SignExtend8(disp8) * 2) + 2 : PC + 2;
-        return ExecuteDelayedBranch(target, branchCycles: taken ? 3 : 2);
+        return ExecuteDelayedBranch(target, branchCycles: taken ? 2 : 1);
     }
 }

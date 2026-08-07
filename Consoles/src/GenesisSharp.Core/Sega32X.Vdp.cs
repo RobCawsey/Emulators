@@ -34,16 +34,9 @@ public sealed partial class Sega32X
     /// live, verified boot trace, and initially misdiagnosed as a <see
     /// cref="GenesisConsole.VersionRegisterValue"/> polarity bug instead, since both bits feed
     /// the same check and either one being wrong looks identical from that check's own pass/fail
-    /// outcome alone. GenesisSharp is NTSC/224-line only (see <see
-    /// cref="V28LineTableOffset"/>'s remarks), so this is unconditionally set at reset — there is
-    /// no PAL mode for it to ever need clearing.</summary>
+    /// outcome alone. GenesisSharp is NTSC-only, so this is unconditionally set at reset — there
+    /// is no PAL mode for it to ever need clearing.</summary>
     private const ushort NPalBit = 1 << 15;
-
-    /// <summary>Fixed offset between frame-buffer line-table index 0 and the first visible
-    /// scanline in 224-line (V28) mode (confirmed at <c>32x.c:258-260</c>; the 240-line/V30 case
-    /// there uses 0 instead, but GenesisSharp is NTSC/224-line only, so that branch never
-    /// applies).</summary>
-    private const int V28LineTableOffset = 8;
 
     /// <summary>Confirmed directly against source (<c>draw.c:18-19,148</c>: <c>pmd += H32_OFFSET</c>
     /// where <c>pmd</c> is the *Genesis*-side pointer) — for Genesis x-coordinate <c>x</c> in H32
@@ -70,7 +63,27 @@ public sealed partial class Sega32X
     public byte[][] FrameBuffer { get; } = { new byte[0x20000], new byte[0x20000] };
 
     private bool _wasVBlank;
-    private bool _hasPendingFrameSelect;
+
+    /// <summary>The last-written <c>FS</c> request, stored unconditionally on every write to
+    /// offset 0xB regardless of whether it differs from the current live <c>FS</c> bit --
+    /// confirmed against PicoDrive's own <c>Pico32x.pending_fb</c> (<c>memory.c:701-710</c>,
+    /// <c>p32x_vdp_write8 case 0x0b</c>: <c>Pico32x.pending_fb = d;</c>, no equality guard around
+    /// the store itself). Both write-time (immediate-apply-if-blanking) and the vblank-start edge
+    /// in <see cref="UpdateBlankingState"/> compare this stored value against the live FS bit
+    /// fresh each time, rather than relying on a separate "is a swap pending" flag.
+    ///
+    /// An earlier revision here only latched when the newly-written value differed from the
+    /// *current* FS bit at write time, guarded by a separate "has a swap been requested" flag that
+    /// only got set inside that same guard. That loses a real request across a same-value
+    /// rewrite: write FS=1 (differs from current FS=0, so it latches), then write FS=1 again later
+    /// in the same active-display period (equal to the *now-pending* value, but the guard compares
+    /// against the *live* FS bit, which is still 0 -- so this second write also looks like a fresh
+    /// change and re-latches redundantly; the real bug is the reverse case, writing back to the
+    /// *original* live value: write FS=1 then FS=0 again before vblank -- the second write equals
+    /// the live FS bit, so the old guard skips it entirely and the stale FS=1 request from the
+    /// first write survives to the next vblank instead of being overwritten by the "never mind,
+    /// FS=0" the game actually asked for last). PicoDrive's unconditional store never has this
+    /// problem, since it always remembers the *most recent* write, full stop.</summary>
     private bool _pendingFrameSelectValue;
 
     /// <summary>Drives the fake HBLK/nFEN pulse below — incremented every FBCR read, exactly
@@ -101,7 +114,7 @@ public sealed partial class Sega32X
         // GenesisSharp has no PAL mode to ever need it cleared.
         VdpRegs[0] = NPalBit;
         _wasVBlank = true;
-        _hasPendingFrameSelect = false;
+        _pendingFrameSelectValue = false; // matches FS=0's power-on default
         _blankFakeCounter = 0;
     }
 
@@ -116,10 +129,9 @@ public sealed partial class Sega32X
         if (isVBlank && !_wasVBlank)
         {
             VdpRegs[5] |= (ushort)(VBlkBit | PenBit);
-            if (_hasPendingFrameSelect)
+            if (_pendingFrameSelectValue != ((VdpRegs[5] & FsBit) != 0))
             {
                 ApplyFrameSelect(_pendingFrameSelectValue);
-                _hasPendingFrameSelect = false;
             }
         }
         else if (!isVBlank && _wasVBlank)
@@ -129,6 +141,8 @@ public sealed partial class Sega32X
             {
                 VdpRegs[5] &= unchecked((ushort)~PenBit);
             }
+
+            ResetHIntCountdown();
         }
 
         _wasVBlank = isVBlank;
@@ -161,7 +175,32 @@ public sealed partial class Sega32X
         }
 
         byte[] displayBank = FrameBuffer[DisplayBankIndex];
-        int lineIndex = y + V28LineTableOffset;
+
+        // The line-table index is the visible scanline number itself, with no offset of any kind.
+        // Confirmed against PicoDrive's own per-line fetch, `p32x = dram + dram[l + (lines_sft_offs
+        // >> 24)]` (draw.c:206,228,251), where `l` counts visible lines from 0 and the `>> 24`
+        // field is `Pico32x.sync_line` -- the partial-render resume point, 0 for a whole-frame
+        // render -- not a display-height adjustment.
+        //
+        // Worth spelling out, because the obvious-looking candidate is a trap this code fell into
+        // twice: `Pico32xRenderSync`'s `offs = 8; if (Pico.video.reg[1] & 8) offs = 0;`
+        // (32x.c:257-259) reads exactly like a V28/V30 line-table offset, and is nothing of the
+        // sort -- `offs` feeds `Pico.est.DrawLineDest = DrawLineDestBase32x + offs *
+        // DrawLineDestIncrement32x` (draw.c:290), i.e. it is a *destination* offset that centres a
+        // 224-line picture inside PicoDrive's 240-line output buffer. It reaches the draw loops
+        // only in `lines_sft_offs`'s low byte, which those loops never read. GenesisSharp's own
+        // FrameBuffer is the 224-line active display alone, so the equivalent centring offset here
+        // is structurally zero, in both V28 and V30.
+        //
+        // Adding 8 here instead cost real, visible corruption on a real 32X title (Pitfall: The
+        // Mayan Adventure): the game populates exactly 224 table entries, 0-223, so every visible
+        // row read its neighbour's entry and the bottom 8 rows ran off the populated region into
+        // zeros -- word offset 0, which points back at the line table itself, so those rows
+        // rendered the table's own bytes as pixel data. That showed up as a stable, full-width
+        // band of structured-looking colour noise pinned to the bottom of the frame, which is a
+        // convincing enough impression of a genuine hardware artefact (Genesis CRAM dots) to have
+        // survived a long time as one.
+        int lineIndex = y;
         if ((uint)(lineIndex * 2 + 1) >= (uint)displayBank.Length)
         {
             return false;
@@ -355,18 +394,12 @@ public sealed partial class Sega32X
                             // nFEN are status bits software never legitimately writes.
         {
             bool requestedFs = (value & FsBit) != 0;
-            if (requestedFs != ((VdpRegs[5] & FsBit) != 0))
+            _pendingFrameSelectValue = requestedFs; // stored unconditionally -- see the field's own remarks
+
+            bool blanking = (VdpRegs[5] & VBlkBit) != 0 || (VdpRegs[0] & MxMask) == 0;
+            if (blanking && requestedFs != ((VdpRegs[5] & FsBit) != 0))
             {
-                bool blanking = (VdpRegs[5] & VBlkBit) != 0 || (VdpRegs[0] & MxMask) == 0;
-                if (blanking)
-                {
-                    ApplyFrameSelect(requestedFs);
-                }
-                else
-                {
-                    _hasPendingFrameSelect = true;
-                    _pendingFrameSelectValue = requestedFs;
-                }
+                ApplyFrameSelect(requestedFs);
             }
 
             return;
@@ -386,29 +419,43 @@ public sealed partial class Sega32X
     }
 
     /// <summary>Fills the write-target bank with the fill-data register's value, starting at the
-    /// fill-start-address register, for (fill-length + 1) words — confirmed against PicoDrive
-    /// only at the level of "writing the fill-data register performs an autofill burst into
-    /// dram[FS^1]" (<c>memory.c:721-737</c>); the exact inclusive/exclusive length convention
-    /// wasn't directly quoted in this project's own research pass, so the "+1" here is a
-    /// reasonable but not byte-exact-confirmed interpretation. No multi-cycle timing is modeled —
-    /// the burst completes instantly on write, matching this area's general "fake it" treatment
-    /// (real hardware timing here is likewise not well understood — see the HBLK remarks above).</summary>
+    /// fill-start-address register, for (fill-length + 1) words. Confirmed against PicoDrive's own
+    /// <c>p32x_vdp_write16</c> (<c>memory.c:721-737</c>): <c>while (len1--) { dram[a] = d; a = (a
+    /// &amp; 0xff00) | ((a + 1) &amp; 0xff); }</c> — real autofill hardware only increments the
+    /// *low 8 bits* of the fill address, wrapping back to the start of the same 256-word row
+    /// rather than spilling into the next one. An earlier revision here incremented the full
+    /// 16-bit address instead, which is wrong precisely when a fill's start address has a nonzero
+    /// low byte and its length carries past the row boundary: real hardware wraps back and keeps
+    /// overwriting the same row, this project's own earlier version instead ran on into the
+    /// *next* row and corrupted it — a contiguous band of wrongly-filled pixels, exactly the shape
+    /// of "visual corruption in a strip of the frame" a loading-screen fill (the most common
+    /// autofill use case) would produce. Also now writes the advanced address and the fill value
+    /// back into the fill-start-address/fill-data registers themselves (<c>VdpRegs[3]</c>/
+    /// <c>[4]</c>), matching PicoDrive's own <c>vdp_regs[0x06/2] = a; vdp_regs[0x08/2] = d;</c> —
+    /// needed for chained fills whose own code reads the register back afterward. No multi-cycle
+    /// timing is modeled — the burst completes instantly on write, matching this area's general
+    /// "fake it" treatment (real hardware timing here is likewise not well understood — see the
+    /// HBLK remarks above).</summary>
     private void PerformAutofill()
     {
         byte[] bank = FrameBuffer[WriteBankIndex];
         int length = VdpRegs[2] & 0xFF;
         ushort fillValue = VdpRegs[4];
-        ushort wordOffset = VdpRegs[3];
+        ushort wordAddress = VdpRegs[3];
 
         for (int i = 0; i <= length; i++)
         {
-            int byteOffset = (ushort)(wordOffset + i) * 2;
+            int byteOffset = wordAddress * 2;
             if (byteOffset + 1 < bank.Length)
             {
                 bank[byteOffset] = (byte)(fillValue >> 8);
                 bank[byteOffset + 1] = (byte)fillValue;
             }
+
+            wordAddress = (ushort)((wordAddress & 0xFF00) | ((wordAddress + 1) & 0xFF));
         }
+
+        VdpRegs[3] = wordAddress;
     }
 
     private byte ReadPaletteByte(uint offset)

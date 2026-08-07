@@ -39,6 +39,10 @@ public sealed partial class Sega32X
     private const int CmdVector = 68;
     private const int VIntLevel = 12;
     private const int VIntVector = 70;
+    private const int HIntLevel = 10;
+    private const int HIntVector = 69;
+    private const int PwmLevel = 6;
+    private const int PwmVector = 67;
 
     /// <summary>The SH-2's own per-core interrupt-enable register -- adapter-block offset 1
     /// written from the SH-2 side, a completely different meaning from the 68000's own view of
@@ -114,5 +118,107 @@ public sealed partial class Sega32X
                 (core == 0 ? MasterSh2 : SlaveSh2).RaiseInterrupt(VIntLevel, VIntVector);
             }
         }
+    }
+
+    /// <summary>Called from <see cref="Sega32X.Pwm.cs"/>'s own sample-consumption loop once every
+    /// (IRQ-timer-nibble + 1) samples actually dequeued -- confirmed against PicoDrive's own
+    /// <c>do_pwm_irq</c> (<c>pwm.c:49-58</c>) and its caller <c>consume_fifo_do</c>
+    /// (<c>pwm.c:112-114</c>, <c>--Pico32x.pwm_irq_cnt &lt;= 0</c>). This is PWM's real
+    /// "FIFO needs feeding" signal real 32X software depends on to know *when* to push the next
+    /// batch of samples — without it, a game has no way to pace its own FIFO writes against the
+    /// PWM chip's actual consumption rate, and typically either pushes too little (audible
+    /// underrun/repeated-sample garbling — this core already reproduces underrun-holds-last-value
+    /// correctly, see <see cref="Sega32X.Pwm.AdvancePwmClock"/>'s own remarks, but only once
+    /// *something* tells it a new sample is due) or too much (overflow, silently dropping queued
+    /// audio, <see cref="Sega32X.Pwm.PwmFifoWrite"/>'s own remarks). RTP's own auto-DREQ1-trigger
+    /// side effect (<c>pwm.c:53-57</c>) is a real, separate, still-unimplemented gap (external/
+    /// DREQ-driven DMA transfers aren't modeled at all yet — see <see
+    /// cref="Sega32XSh2Bus.TryTriggerDmaChannel"/>'s own remarks on that same boundary) — named,
+    /// not silently pretended-correct.</summary>
+    internal void RaisePwmInterrupt()
+    {
+        for (int core = 0; core < 2; core++)
+        {
+            if ((Sh2IrqMask[core] & PwmMaskBit) != 0)
+            {
+                (core == 0 ? MasterSh2 : SlaveSh2).RaiseInterrupt(PwmLevel, PwmVector);
+            }
+        }
+    }
+
+    /// <summary>The SH-2-exclusive "H count" register (adapter-block offset 5 -- see the write
+    /// side's own remarks in <see cref="Sega32X.WriteRegisterByteFromSh2"/> for why this is
+    /// separate storage from the 68000's own offset-5 ROM-bank-select register, despite sharing
+    /// the same byte offset). HINT fires every (this value + 1) scanlines during active display,
+    /// confirmed against PicoDrive's own scheduling formula: <c>hint_counter += (sh2_regs[4/2] +
+    /// 1) * 488.5-ish-cycles</c> (<c>32x.c:357</c>) -- i.e. one scanline's worth of cycles per
+    /// increment of this register, the exact shape <see cref="AdvanceHIntCountdown"/> reproduces
+    /// with a plain per-scanline integer countdown instead of PicoDrive's cycle-precise
+    /// fixed-point event scheduler, the same adaptation <see cref="Vdp.Timing.cs"/>'s own
+    /// <c>_hInterruptCountdown</c> (the 68000/Z80 side's H-interrupt) already makes for the base
+    /// Genesis VDP.</summary>
+    private byte _hIntCounterReg;
+
+    /// <summary>Scanlines remaining until the next HINT fire -- shared between both cores (real
+    /// hardware has exactly one H-count register and one counter, not a per-core pair; both SH-2s
+    /// listening for HINT get interrupted off the same schedule, confirmed <c>32x.c:348-364</c>
+    /// operating on a single <c>Pico32x.hint_counter</c> with no per-core split).</summary>
+    private int _hIntCountdown;
+
+    /// <summary>Called once per scanline by <c>GenesisConsole.RunScanline</c>, mirroring how <see
+    /// cref="Vdp.AdvanceScanline"/> ticks the base Genesis H-interrupt -- decrements the shared
+    /// countdown during active display only (real hardware's HINT is scanline-paced, confirmed by
+    /// the cycles-per-increment formula in <see cref="_hIntCounterReg"/>'s own remarks; blanking
+    /// lines don't tick it, the same "active display only" simplification the base Genesis
+    /// H-interrupt already makes) and raises HINT on whichever core(s) have <see
+    /// cref="HIntMaskBit"/> set once it goes negative, then reloads from <see
+    /// cref="_hIntCounterReg"/>.
+    ///
+    /// Deliberately does *not* attempt to replicate <c>p32x_schedule_hint</c>'s own "bit 0x80"
+    /// (adapter offset 1's top bit, alongside the per-core IRQ mask living in that same byte's low
+    /// nibble) gating condition -- PicoDrive's own source calls the whole HINT mechanism "rather
+    /// rough, useless in practice" (<c>32x.c:350</c>), and that bit's exact real-hardware meaning
+    /// (it interacts with the base Genesis VDP's own vblank-phase status flag in a way not fully
+    /// pinned down by this project's own research pass) risks introducing an incorrectly-polarized
+    /// gate that silently suppresses HINT entirely -- a strictly worse failure mode than this
+    /// simpler "always tick while any core's mask wants it" version, which degrades gracefully
+    /// (inert for any ROM that never sets <see cref="HIntMaskBit"/>, the same safety shape as
+    /// every other still-simplified area of this class).</summary>
+    public void AdvanceHIntCountdown(bool isActiveDisplay)
+    {
+        bool anyCoreWantsHInt = (Sh2IrqMask[0] & HIntMaskBit) != 0 || (Sh2IrqMask[1] & HIntMaskBit) != 0;
+        if (!isActiveDisplay || !anyCoreWantsHInt)
+        {
+            return;
+        }
+
+        _hIntCountdown--;
+        if (_hIntCountdown < 0)
+        {
+            _hIntCountdown = _hIntCounterReg;
+            for (int core = 0; core < 2; core++)
+            {
+                if ((Sh2IrqMask[core] & HIntMaskBit) != 0)
+                {
+                    (core == 0 ? MasterSh2 : SlaveSh2).RaiseInterrupt(HIntLevel, HIntVector);
+                }
+            }
+        }
+    }
+
+    /// <summary>Called from <see cref="UpdateBlankingState"/> on the vblank-exit edge, matching
+    /// real hardware's own <c>p32x_end_blank</c> (<c>32x.c:332-346</c>), which likewise
+    /// (re)schedules HINT right as active display resumes -- "min 4 SH-2 cycles to pass Mars
+    /// Check" per its own comment, i.e. real hardware wants the *first* post-vblank HINT to arrive
+    /// almost immediately rather than a full <see cref="_hIntCounterReg"/>-scanlines later.
+    /// Resetting to 0 (fires on this scanline's own <see cref="AdvanceHIntCountdown"/> call, the
+    /// very next tick) reproduces that "near-immediate first fire, then every (H+1) lines
+    /// thereafter" shape without needing this project's own fixed-point sub-scanline precision.</summary>
+    private void ResetHIntCountdown() => _hIntCountdown = 0;
+
+    private void ResetHInt()
+    {
+        _hIntCounterReg = 0;
+        _hIntCountdown = 0;
     }
 }

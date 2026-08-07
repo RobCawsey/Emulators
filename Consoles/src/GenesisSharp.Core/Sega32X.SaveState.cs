@@ -19,13 +19,19 @@ public sealed partial class Sega32X
 
         MasterSh2.SaveState(writer);
         SlaveSh2.SaveState(writer);
+        writer.Write(_masterSh2Bus.PeripheralRegs);
+        writer.Write(_slaveSh2Bus.PeripheralRegs);
+
+        writer.Write(Sh2IrqMask[0]);
+        writer.Write(Sh2IrqMask[1]);
+        writer.Write(_hIntCounterReg);
+        writer.Write(_hIntCountdown);
 
         foreach (ushort r in VdpRegs) writer.Write(r);
         foreach (ushort p in Palette) writer.Write(p);
         writer.Write(FrameBuffer[0]);
         writer.Write(FrameBuffer[1]);
         writer.Write(_wasVBlank);
-        writer.Write(_hasPendingFrameSelect);
         writer.Write(_pendingFrameSelectValue);
         writer.Write(_blankFakeCounter);
 
@@ -38,6 +44,7 @@ public sealed partial class Sega32X
         writer.Write(_pwmCurrent[0]);
         writer.Write(_pwmCurrent[1]);
         writer.Write(_pwmCycleDebt);
+        writer.Write(_pwmIrqCounter);
     }
 
     public void LoadState(BinaryReader reader)
@@ -49,13 +56,19 @@ public sealed partial class Sega32X
 
         MasterSh2.LoadState(reader);
         SlaveSh2.LoadState(reader);
+        SaveStateIo.ReadExactly(reader, _masterSh2Bus.PeripheralRegs);
+        SaveStateIo.ReadExactly(reader, _slaveSh2Bus.PeripheralRegs);
+
+        Sh2IrqMask[0] = reader.ReadByte();
+        Sh2IrqMask[1] = reader.ReadByte();
+        _hIntCounterReg = reader.ReadByte();
+        _hIntCountdown = reader.ReadInt32();
 
         for (int i = 0; i < VdpRegs.Length; i++) VdpRegs[i] = reader.ReadUInt16();
         for (int i = 0; i < Palette.Length; i++) Palette[i] = reader.ReadUInt16();
         SaveStateIo.ReadExactly(reader, FrameBuffer[0]);
         SaveStateIo.ReadExactly(reader, FrameBuffer[1]);
         _wasVBlank = reader.ReadBoolean();
-        _hasPendingFrameSelect = reader.ReadBoolean();
         _pendingFrameSelectValue = reader.ReadBoolean();
         _blankFakeCounter = reader.ReadByte();
 
@@ -68,5 +81,6 @@ public sealed partial class Sega32X
         _pwmCurrent[0] = reader.ReadInt16();
         _pwmCurrent[1] = reader.ReadInt16();
         _pwmCycleDebt = reader.ReadDouble();
+        _pwmIrqCounter = reader.ReadInt32();
     }
 }

@@ -73,6 +73,13 @@ public sealed partial class Sega32X
     public CpuSh2.IBus MasterSh2Bus { get; }
     public CpuSh2.IBus SlaveSh2Bus { get; }
 
+    /// <summary>Same two bus instances as <see cref="MasterSh2Bus"/>/<see cref="SlaveSh2Bus"/>,
+    /// kept as the concrete type internally so <see cref="Reset"/> and save-state code can reach
+    /// <see cref="Sega32XSh2Bus.ResetPeripherals"/> and the on-chip peripheral register block --
+    /// members the public <see cref="CpuSh2.IBus"/> surface deliberately doesn't expose.</summary>
+    private readonly Sega32XSh2Bus _masterSh2Bus;
+    private readonly Sega32XSh2Bus _slaveSh2Bus;
+
     /// <summary>True once the 68000 has released the shared reset line (Regs[0] bit1). Both SH-2s
     /// share a single reset line — there is no independent per-core reset bit anywhere in the
     /// register model (confirmed against PicoDrive's <c>p32x_reset_sh2s</c>, which always resets
@@ -91,10 +98,14 @@ public sealed partial class Sega32X
     public Sega32X(Cartridge cartridge)
     {
         _cartridge = cartridge;
-        MasterSh2Bus = new Sega32XSh2Bus(this, isSlave: false);
-        SlaveSh2Bus = new Sega32XSh2Bus(this, isSlave: true);
+        _masterSh2Bus = new Sega32XSh2Bus(this, isSlave: false);
+        _slaveSh2Bus = new Sega32XSh2Bus(this, isSlave: true);
+        MasterSh2Bus = _masterSh2Bus;
+        SlaveSh2Bus = _slaveSh2Bus;
         MasterSh2 = new Sh2(MasterSh2Bus);
         SlaveSh2 = new Sh2(SlaveSh2Bus);
+        _masterSh2Bus.LinkCores(MasterSh2, _slaveSh2Bus, SlaveSh2);
+        _slaveSh2Bus.LinkCores(SlaveSh2, _masterSh2Bus, MasterSh2);
         PopulateSynthesizedBootRoms();
     }
 
@@ -110,6 +121,9 @@ public sealed partial class Sega32X
         Array.Clear(Sdram);
         ResetVdp();
         ResetPwm();
+        ResetHInt();
+        _masterSh2Bus.ResetPeripherals();
+        _slaveSh2Bus.ResetPeripherals();
         MasterSh2.Reset();
         SlaveSh2.Reset();
         SynthesizeSh2BootStateFromCartridge();
@@ -226,7 +240,7 @@ public sealed partial class Sega32X
     /// why this is *not* an OR-in the way it might look like it should be), matching the 68k/SH-2
     /// read-view duality PicoDrive's own <c>p32x_sh2reg_read16</c> implements
     /// (<c>memory.c:753-755</c>).</summary>
-    internal byte ReadControlByteForSh2(uint offset)
+    internal byte ReadControlByteForSh2(uint offset, bool isSlave)
     {
         if (offset > 0x3F)
         {
@@ -241,6 +255,34 @@ public sealed partial class Sega32X
         if (offset == 0)
         {
             return (byte)((Regs[0] >> 8) & 0xFF);
+        }
+
+        if (offset == 1) // The SH-2's own per-core IRQ-mask register -- must read back what this
+                          // core itself last wrote via WriteRegisterByteFromSh2 (Sh2IrqMask[core]),
+                          // *not* whatever ReadRegByte(1) would return (the 68000's own nRES/ADEN
+                          // view of this same shared byte offset -- a real, previously-unnoticed
+                          // bug: falling through to that generic path meant a real SH-2 read-
+                          // modify-write of its own mask register (read current value, OR in a
+                          // newly-enabled bit, write back) would read back nRES/ADEN garbage
+                          // instead of its actual mask, corrupting it on write-back. Confirmed
+                          // against PicoDrive's own p32x_sh2reg_read16 (memory.c:752-755), which
+                          // explicitly ORs sh2irq_mask[core] into this same word -- this project's
+                          // "bit 0x80" (HEN-ish) companion bit that word also carries isn't tracked
+                          // here (see AdvanceHIntCountdown's remarks), so this returns just the
+                          // 4-bit mask, not a bit-exact replica of that whole byte.
+        {
+            return Sh2IrqMask[isSlave ? 1 : 0];
+        }
+
+        if (offset == 4) // H count register's high byte -- always reads 0 (real hardware only
+                          // ever stores a byte's worth of value; nothing sets bits above it).
+        {
+            return 0;
+        }
+
+        if (offset == 5) // H count register, SH-2-exclusive -- see the write side's remarks.
+        {
+            return _hIntCounterReg;
         }
 
         return ReadRegByte(offset);
@@ -275,8 +317,39 @@ public sealed partial class Sega32X
 
         if (offset == 1)
         {
+            bool hadHIntBefore = (Sh2IrqMask[core] & HIntMaskBit) != 0;
             Sh2IrqMask[core] = (byte)(value & 0x0F);
             UpdateCmdIrq(core);
+            if (!hadHIntBefore && (Sh2IrqMask[core] & HIntMaskBit) != 0)
+            {
+                // A core that just unmasked HINT gets a fresh countdown rather than possibly
+                // firing on the very next scanline off of however far a *different* core's
+                // earlier unmask left the shared countdown -- see AdvanceHIntCountdown's remarks
+                // on why the countdown itself is shared, not per-core.
+                _hIntCountdown = _hIntCounterReg;
+            }
+
+            return;
+        }
+
+        if (offset == 4) // "H count" register's high byte -- confirmed ignored on real hardware
+                          // (memory.c:840-841, "case 0x04: // ignored?" -- ground truth, not a
+                          // guess). Only offset 5 (the low byte) actually holds a value.
+        {
+            return;
+        }
+
+        if (offset == 5) // H count register, SH-2-exclusive -- deliberately *not* routed to the
+                          // shared Regs[] word offset 5 already occupies (the 68000's own ROM-bank
+                          // select register, ReadRomBankWindowByte) -- offset 5 means a completely
+                          // different thing depending on which CPU is asking, the same dual-meaning
+                          // shape as offset 1's nRES/ADEN-vs-IRQ-mask split. Confirmed against
+                          // PicoDrive's own p32x_sh2reg_write8 (memory.c:842-851, "case 0x05: // H
+                          // count", writing Pico32x.sh2_regs[4/2] -- a separate array from the main
+                          // adapter regs[] block the 68000-side ROM-bank write targets). See
+                          // AdvanceHIntCountdown's remarks for how this value is used.
+        {
+            _hIntCounterReg = value;
             return;
         }
 

@@ -44,6 +44,15 @@ public sealed partial class Sega32X
     private readonly short[] _pwmCurrent = new short[2];
     private double _pwmCycleDebt;
 
+    /// <summary>Counts down once per sample actually dequeued (both channels together, matching
+    /// PicoDrive's own single shared counter -- <see cref="Sega32X.RaisePwmInterrupt"/>'s own
+    /// remarks), reloaded from <see cref="ComputePwmIrqReload"/> whenever it reaches zero. Not
+    /// reloaded eagerly on every control-register write the way PicoDrive's own
+    /// <c>p32x_pwm_ctl_changed</c> does (<c>pwm.c:25-47</c>) -- this core just recomputes the
+    /// reload value fresh from the live register each time it's actually needed, a simplification
+    /// available since nothing here needs PicoDrive's own event-scheduler integration.</summary>
+    private int _pwmIrqCounter;
+
     private void ResetPwm()
     {
         Array.Clear(_pwmFifo[0]);
@@ -52,6 +61,18 @@ public sealed partial class Sega32X
         Array.Clear(_pwmFifoHead);
         Array.Clear(_pwmCurrent);
         _pwmCycleDebt = 0;
+        _pwmIrqCounter = 0; // reloaded from the live control register the first time it's needed
+    }
+
+    /// <summary>Confirmed against PicoDrive's own <c>p32x_pwm_ctl_changed</c> (<c>pwm.c:40-42</c>):
+    /// the IRQ-timer nibble (control register bits 8-11, SH-2-exclusive -- see <see
+    /// cref="WritePwmByte"/>'s own remarks) is normalized <c>((n - 1) &amp; 0x0f) + 1</c>, mapping
+    /// the nibble's 16 possible values onto a 1-16 (not 0-15) reload range -- 0 does *not* mean
+    /// "never reload" or "reload every sample", it wraps to 16.</summary>
+    private int ComputePwmIrqReload()
+    {
+        int irqTimer = (Regs[PwmControlIndex] & 0x0F00) >> 8;
+        return ((irqTimer - 1) & 0x0F) + 1;
     }
 
     /// <summary>Advances PWM's own sample clock by <paramref name="sampleDurationSeconds"/> and
@@ -112,6 +133,16 @@ public sealed partial class Sega32X
                 }
                 // else: hold the previous _pwmCurrent[channel] -- underrun repeats the last
                 // sample rather than going silent, confirmed against consume_fifo_do, pwm.c:95-106.
+            }
+
+            // One shared counter for both channels together -- see _pwmIrqCounter's own remarks
+            // and RaisePwmInterrupt's, confirmed against consume_fifo_do (pwm.c:112-114):
+            // "if (--Pico32x.pwm_irq_cnt <= 0) { reload; do_pwm_irq(...); }", called once per
+            // period regardless of which channel(s) actually had data queued.
+            if (--_pwmIrqCounter <= 0)
+            {
+                _pwmIrqCounter = ComputePwmIrqReload();
+                RaisePwmInterrupt();
             }
         }
     }

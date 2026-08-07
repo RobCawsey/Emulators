@@ -82,6 +82,45 @@ public class Sega32XPwmTests
         Assert.Equal((short)0, right);
     }
 
+    /// <summary>32X interrupt-routing plan Phase 3: PWM's real "FIFO needs feeding" signal.
+    /// Confirmed against PicoDrive's own <c>consume_fifo_do</c> (<c>pwm.c:112-114</c>) -- fires
+    /// once every (IRQ-timer-nibble + 1) samples actually consumed, regardless of whether the
+    /// FIFO underruns. The IRQ-timer nibble (adapter offset 0x30, the control register's high
+    /// byte) is SH-2-exclusive, confirmed via <see cref="Sega32X.MasterSh2Bus"/>'s own SH-2-side
+    /// write path rather than <see cref="Sega32X.WriteControlByteFrom68k"/> (which silently drops
+    /// a 68000 write there).</summary>
+    [Fact]
+    public void GeneratePwmSample_IrqTimerElapses_RaisesPwmInterruptOnUnmaskedCoreOnly()
+    {
+        var sega32X = CreateSega32X();
+        sega32X.MasterSh2Bus.WriteByte(0x4001, 0x01); // PwmMaskBit (bit 0) on master only
+        sega32X.MasterSh2Bus.WriteByte(0x4030, 0x01); // IRQ-timer nibble = 1 -> reload fires every sample
+        SetCycleRegister(sega32X, 1); // smallest real period, easily covered by one audio-sample tick
+        SetXmd(sega32X, 0x05);
+        WriteLeftFifo(sega32X, 0x800);
+        WriteRightFifo(sega32X, 0x800);
+
+        sega32X.GeneratePwmSample(OneAudioSample);
+
+        Assert.Equal(6, sega32X.MasterSh2.PendingInterruptLevel); // PwmLevel
+        Assert.Equal(0, sega32X.SlaveSh2.PendingInterruptLevel); // never unmasked -- never raised
+    }
+
+    [Fact]
+    public void GeneratePwmSample_PwmMaskedOffOnBothCores_NeverRaisesInterrupt()
+    {
+        var sega32X = CreateSega32X(); // Sh2IrqMask stays all-zero, the power-on default
+        SetCycleRegister(sega32X, 1);
+        SetXmd(sega32X, 0x05);
+        WriteLeftFifo(sega32X, 0x800);
+        WriteRightFifo(sega32X, 0x800);
+
+        sega32X.GeneratePwmSample(OneAudioSample);
+
+        Assert.Equal(0, sega32X.MasterSh2.PendingInterruptLevel);
+        Assert.Equal(0, sega32X.SlaveSh2.PendingInterruptLevel);
+    }
+
     [Fact]
     public void GeneratePwmSample_LowFifoValue_ProducesNegativeSample()
     {

@@ -19,7 +19,18 @@ public sealed partial class GenesisConsole
     // changes incompatibly, so LoadState can fail cleanly on an old/foreign file instead of
     // reading garbage into every field after the first mismatch.
     private static readonly byte[] SaveStateMagic = { (byte)'G', (byte)'S', (byte)'S', (byte)'T' };
-    private const int SaveStateVersion = 2; // v2: added Sega32X (both SH-2s, 32X VDP, PWM) and the SH-2 cycle-debt fields
+    private const int SaveStateVersion = 5; // v5: added Sega32X's new PWM IRQ counter (_pwmIrqCounter)
+                                             // v4: added each SH-2's on-chip peripheral register block (including the
+                                             // on-chip DMAC -- see Sega32X.Bus.cs's _peripheralRegs) and Sega32X's own
+                                             // Sh2IrqMask/HINT counter/countdown, none of which were previously
+                                             // persisted at all (a real, previously-unnoticed gap: reloading a save
+                                             // state silently reset every SH-2 interrupt mask to 0, permanently
+                                             // disabling all 32X interrupt delivery post-load)
+                                             // v3: dropped Sega32X's now-removed _hasPendingFrameSelect field (see
+                                             // Sega32X.Vdp.cs's _pendingFrameSelectValue remarks -- the pending FS
+                                             // request is now stored unconditionally, matching PicoDrive, with no
+                                             // separate "is one pending" flag needed)
+                                             // v2: added Sega32X (both SH-2s, 32X VDP, PWM) and the SH-2 cycle-debt fields
 
     /// <summary>A content fingerprint for a ROM image, used to warn on <see cref="LoadState"/>
     /// if a save state was made against a different cartridge than the one currently loaded.
