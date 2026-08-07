@@ -11,10 +11,18 @@ public class Sega32XPwmTests
 {
     private const double OneAudioSample = 1.0 / 44100.0;
 
+    /// <summary>A 32X reset and its SH-2s then released, which is the state these tests want. The
+    /// core resets are not incidental: a whole-system reset leaves VRES pending at level 14 (see
+    /// <c>Sega32X.RaiseVResInterrupt</c>), and <c>Sh2.RaiseInterrupt</c> only records a request
+    /// that outranks whatever is already pending — so a leftover VRES would swallow every
+    /// lower-priority source these tests are actually about. A real ROM clears it the same way, by
+    /// releasing the cores via the nRES 0→1 edge, which resets them.</summary>
     private static Sega32X CreateSega32X()
     {
         var sega32X = new Sega32X(Cartridge.LoadFromBin(new byte[0x10000]));
         sega32X.Reset();
+        sega32X.MasterSh2.Reset();
+        sega32X.SlaveSh2.Reset();
         return sega32X;
     }
 

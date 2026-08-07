@@ -723,11 +723,63 @@ title** (user-supplied, legally-owned dump — the first real-ROM validation thi
   release), and the masked-write fix (`REN` survives writes that set/clear nRES/ADEN; clearing
   `ADEN` forces `NRes` back to `true`).
 
-**Known gaps**: DREQ/DMAC and 32X-side interrupt routing remain unimplemented (unchanged from
-Phase 2) — some real titles' post-boot code may still stall or misbehave on those, independent of
-whether boot itself now succeeds. Real-ROM validation (Phase 6's stated goal) is in progress but not
-complete — the fixes above got a real commercial title further than address 0, not necessarily all
-the way to a playable state; further real-ROM issues may still surface.
+**Known gaps**: DREQ-driven DMA (including PWM's own RTP auto-feed) remains unimplemented — some
+real titles' post-boot code may still stall or misbehave on it. Real-ROM validation (Phase 6's
+stated goal) is in progress but not complete; further real-ROM issues may still surface.
+
+### 4a.6 Interrupt routing (VRES/VINT/HINT/CMD/PWM)
+
+`Sega32X.Interrupts.cs`. All five 32X interrupt sources are **SH-2-side only** — nothing in
+PicoDrive's 32X code raises an interrupt on the 68000 from a 32X event, confirmed by an exhaustive
+search of `32x.c`/`memory.c`/`pwm.c`. The 68000 learns about SH-2 activity by polling COMM
+registers.
+
+Levels and vectors, confirmed by hand-tracing `p32x_update_irls`'s priority encoder
+(`32x.c:34-74`) against `pico_int.h:624-628`, cross-checked against `sh2_irq_cb`'s auto-vector
+formula (`32x.c:18-31`, `return 64 + pending_irl/2` — the SH-2 hardware convention for
+auto-vectored external interrupts):
+
+| Source | Pending bit | Level | Vector | Gated by `Sh2IrqMask`? |
+| --- | --- | --- | --- | --- |
+| VRES | `0x80` | 14 | 71 | **No** — never maskable |
+| VINT | `0x40` | 12 | 70 | bit 3 |
+| HINT | `0x20` | 10 | 69 | bit 2 |
+| CMD | `0x10` | 8 | 68 | bit 1 |
+| PWM | `0x08` | 6 | 67 | bit 0 |
+
+These map straight onto the SH-2 core's existing `RaiseInterrupt(level, vectorNumber)` with **no
+changes to `Sh2` itself** — that method's own doc comment anticipated exactly this.
+
+`Sh2IrqMask` is the SH-2's own view of **adapter-block offset 1**, and this is the subsystem's
+sharpest trap: the *same byte offset* means `nRES`/`ADEN` when the **68000** writes it (`$A15101`)
+and a per-core interrupt-enable register when an **SH-2** writes it (`$4001`). Not a rename of the
+same bits — a genuinely different register depending on who is asking (`memory.c:824-839`).
+
+**VRES is not the SH-2 reset line**, despite the name, and the two are separate mechanisms on real
+hardware. `p32x_reset_sh2s` (`32x.c:161-212`), tied to the software `nRES` 0→1 edge, raises no
+interrupt anywhere in its body; VRES-the-interrupt comes solely from `PicoReset32x`
+(`32x.c:240-249`), the whole-system reset path. So `Sega32X.Reset()` raises it and the `nRES` edge
+deliberately does not. It is also applied to both cores *outside* the masked expression the other
+four go through (`32x.c:79-88`), so no mask can suppress it. Ordering matters at the call site:
+`Sh2.Reset()` clears `PendingInterruptLevel`, so `Sega32X.Reset()` raises VRES last, after both
+cores are reset.
+
+CMD is a **live AND** of the 68000's request bit and the target core's mask, re-evaluated whenever
+either changes — not a one-shot latch. HINT is driven by the SH-2-exclusive "H count" register
+(adapter offset 5, again a different register from the 68000's offset-5 ROM-bank select), counted
+down per scanline rather than with PicoDrive's cycle-precise event scheduler — PicoDrive's own
+source calls its HINT handling "rather rough... useless in practice" (`32x.c:350`). PWM's counter
+is shared across both channels, decremented once per consumed sample period.
+
+**Known gap — single-slot pending model.** `Sh2.RaiseInterrupt` records one pending
+(level, vector) pair and keeps it only if the new request outranks it, whereas PicoDrive tracks
+`sh2irqi` as a *bitmask* of simultaneously-pending sources. A lower-priority request arriving while
+a higher one is pending is therefore **dropped here rather than deferred**. VRES is what makes this
+observable, since level 14 outranks everything: a core that never services it would see no further
+32X interrupts. In practice nothing hits this — a real ROM releases the cores via the `nRES` edge,
+which resets them and clears the pending VRES before any other source matters — but it is a real
+divergence, and the reason `Sega32XInterruptTests`/`Sega32XPwmTests` reset both cores in their
+setup helpers rather than testing straight off `Sega32X.Reset()`.
 
 ---
 

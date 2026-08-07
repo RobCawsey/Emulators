@@ -33,8 +33,8 @@ public sealed partial class Sega32X
     // against pico_int.h:624-628's bit positions, cross-checked against sh2_irq_cb's own
     // auto-vector formula (32x.c:18-31: "return 64 + pending_irl / 2" -- the real SH-2 hardware
     // convention for an auto-vectored external interrupt with no explicit vector asserted).
-    // VRES/HINT/PWM get their own constants (14/71, 10/69, 6/67 respectively) in the later phases
-    // that actually raise them.
+    private const int VResLevel = 14;
+    private const int VResVector = 71;
     private const int CmdLevel = 8;
     private const int CmdVector = 68;
     private const int VIntLevel = 12;
@@ -144,6 +144,38 @@ public sealed partial class Sega32X
                 (core == 0 ? MasterSh2 : SlaveSh2).RaiseInterrupt(PwmLevel, PwmVector);
             }
         }
+    }
+
+    /// <summary>The highest-priority 32X interrupt (level 14, the top of the five-source table
+    /// above), raised on <em>both</em> cores unconditionally — <see cref="Sh2IrqMask"/> does not
+    /// gate it. Confirmed against PicoDrive's <c>p32x_trigger_irq</c> (<c>32x.c:79-88</c>), where
+    /// VRES is applied in its own two statements <em>before</em>, and textually outside, the masked
+    /// expression the other four sources go through:
+    /// <code>
+    /// Pico32x.sh2irqi[0] |= mask &amp; P32XI_VRES;
+    /// Pico32x.sh2irqi[1] |= mask &amp; P32XI_VRES;
+    /// Pico32x.sh2irqi[0] |= mask &amp; (Pico32x.sh2irq_mask[0] &lt;&lt; 3);
+    /// Pico32x.sh2irqi[1] |= mask &amp; (Pico32x.sh2irq_mask[1] &lt;&lt; 3);
+    /// </code>
+    ///
+    /// Despite the name, this is <em>not</em> the SH-2 reset line and has nothing to do with the
+    /// adapter's <c>nRES</c> bit. The two are genuinely separate mechanisms on real hardware, and
+    /// conflating them is the obvious mistake here: <c>p32x_reset_sh2s</c> (<c>32x.c:161-212</c>),
+    /// the function tied to the software <c>nRES</c> 0→1 register edge that
+    /// <see cref="WriteControlByteFrom68k"/> already mirrors, never raises VRES anywhere in its
+    /// body. VRES-the-interrupt comes solely from <c>PicoReset32x</c> (<c>32x.c:240-249</c>), the
+    /// whole-system reset path — which is why the only call site here is
+    /// <see cref="Sega32X.Reset"/>, reached only from <see cref="GenesisConsole.Reset"/>, and
+    /// deliberately not the <c>nRES</c> edge.
+    ///
+    /// Call ordering matters and is not incidental: <see cref="Sh2.Reset"/> clears
+    /// <c>PendingInterruptLevel</c>, so raising this before the cores are reset would leave no
+    /// trace of it. <see cref="Sega32X.Reset"/> therefore calls this last, after both cores have
+    /// been reset and their boot state synthesized.</summary>
+    internal void RaiseVResInterrupt()
+    {
+        MasterSh2.RaiseInterrupt(VResLevel, VResVector);
+        SlaveSh2.RaiseInterrupt(VResLevel, VResVector);
     }
 
     /// <summary>The SH-2-exclusive "H count" register (adapter-block offset 5 -- see the write

@@ -247,16 +247,42 @@ rather than leaving it a dead end. Confirmed trigger: `do_pwm_irq`/`pwm.c:49-52`
 interrupt; full suite green; live re-test (lower confidence this is what Pitfall's current stall
 specifically needs, but confirms no regression to Phase 4's existing PWM audio behavior).
 
-## Phase 4 — VRES
+## Phase 4 — VRES — DONE
 
 **Goal**: close out the fifth and last source. Per the Ground Truth section above, this is a pure
 addition, not a modification — the existing nRES-edge CPU-reset handling is confirmed correct
-and untouched. Add a new call from `GenesisConsole.Reset()` (the whole-system reset path,
-`PicoReset32x`'s equivalent) that raises VRES on both cores unconditionally
-(`RaiseInterrupt(14, 71)` on each, unmasked — no `Sh2IrqMask` gating, confirmed above).
+and untouched. Add a call on the whole-system reset path (`PicoReset32x`'s equivalent) that raises
+VRES on both cores unconditionally (`RaiseInterrupt(14, 71)` on each, unmasked — no `Sh2IrqMask`
+gating, confirmed above).
 
-**Verification**: unit test confirming `GenesisConsole.Reset()` raises VRES on both SH-2 cores
-regardless of their own `Sh2IrqMask` state; full suite green.
+**Verification**: done — four new tests in `Sega32XInterruptTests.cs` (VRES raised on both cores
+at level 14; raised even with every maskable source disabled on both cores; the nRES release edge
+resets both cores *without* raising it; and the mask-clearing below). Full suite green at 606.
+Re-verified against the real ROM with `tools/GenesisSharp.DebugTools probe` — output identical to
+before the change.
+
+**Implemented in `Sega32X.Reset()`, not `GenesisConsole.Reset()`** as this plan originally
+proposed. Same call path (`GenesisConsole.Reset()` reaches it, and is the only caller — confirmed),
+but it keeps 32X interrupt state inside the 32X component rather than leaking it into the
+orchestrator, matching how every other 32X subsystem reset is already structured. It is the **last**
+statement in that method by necessity, not style: `Sh2.Reset()` clears `PendingInterruptLevel`, so
+raising VRES any earlier would leave no trace of it.
+
+**Two findings while implementing, both folded in:**
+
+- `Sega32X.Reset()` did not clear `Sh2IrqMask`, so a reset carried the previous run's per-core
+  interrupt enables into the next one. `PicoPower32x`'s whole-struct `memset(&Pico32x, 0,
+  sizeof(Pico32x))` (`32x.c:220`) does clear it — `sh2irq_mask` lives inside that struct. Fixed,
+  with its own test.
+- **The SH-2 core's single-slot pending model is a real divergence** that VRES is the first source
+  to make observable. `Sh2.RaiseInterrupt` keeps one (level, vector) pair and only replaces it with
+  a higher-priority request, whereas PicoDrive tracks `sh2irqi` as a bitmask of simultaneously
+  pending sources — so a lower-priority request arriving while a higher one is pending is dropped
+  here rather than deferred. Since VRES sits at level 14, a pending one suppresses all four other
+  sources until serviced. No real ROM hits this (the `nRES` release edge resets the cores and clears
+  it first), but it is why the interrupt/PWM test helpers now reset both cores in setup. Documented
+  as a known gap in ARCHITECTURE.md §4a.6; fixing it properly means replacing the single slot with a
+  pending bitmask in `GenesisSharp.CpuSh2`, which is out of scope for this plan.
 
 ## Explicitly out of scope for this plan
 

@@ -119,6 +119,11 @@ public sealed partial class Sega32X
         Array.Clear(Regs);
         Regs[0] = RenBit | NResBit;
         Array.Clear(Sdram);
+        // Both SH-2s' interrupt-enable registers are part of what a power-on clears, matching
+        // PicoPower32x's own whole-struct `memset(&Pico32x, 0, sizeof(Pico32x))` (32x.c:220) --
+        // sh2irq_mask lives inside that struct. Left stale, a reset would carry the previous run's
+        // per-core VINT/HINT/CMD/PWM enables straight into the next one.
+        Array.Clear(Sh2IrqMask);
         ResetVdp();
         ResetPwm();
         ResetHInt();
@@ -127,6 +132,12 @@ public sealed partial class Sega32X
         MasterSh2.Reset();
         SlaveSh2.Reset();
         SynthesizeSh2BootStateFromCartridge();
+
+        // Last, and deliberately so: Sh2.Reset clears PendingInterruptLevel, so this would be
+        // erased if it ran any earlier. See RaiseVResInterrupt's own remarks for why the whole-
+        // system reset path raises VRES while the nRES 0->1 edge (which resets both cores a few
+        // lines away, in WriteControlByteFrom68k) correctly does not.
+        RaiseVResInterrupt();
     }
 
     /// <summary>68000-side byte read of the adapter/control block ($A15100-$A1513F, offset

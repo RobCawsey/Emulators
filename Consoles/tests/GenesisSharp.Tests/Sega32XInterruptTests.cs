@@ -8,10 +8,19 @@ namespace GenesisSharp.Tests;
 /// interrupt-enable register (<c>Sega32X.Interrupts.cs</c>).</summary>
 public class Sega32XInterruptTests
 {
+    /// <summary>A 32X reset and its SH-2s then released, which is the state most of these tests
+    /// want. The core resets are not incidental: a whole-system reset leaves VRES pending at level
+    /// 14 (see <see cref="Sega32X.RaiseVResInterrupt"/>), and <see cref="Sh2.RaiseInterrupt"/> only
+    /// records a request that outranks whatever is already pending — so a leftover VRES would
+    /// swallow every lower-priority source. A real ROM clears it the same way, by releasing the
+    /// cores via the nRES 0→1 edge, which resets them. The VRES tests below deliberately do
+    /// <em>not</em> use this helper, since they need the raw post-reset state.</summary>
     private static Sega32X CreateSega32X()
     {
         var sega32X = new Sega32X(Cartridge.LoadFromBin(new byte[0x10000]));
         sega32X.Reset();
+        sega32X.MasterSh2.Reset();
+        sega32X.SlaveSh2.Reset();
         return sega32X;
     }
 
@@ -287,5 +296,79 @@ public class Sega32XInterruptTests
         Assert.True(console.Sega32X.MasterSh2.TotalCycles > 0, "master SH-2 never ran");
         Assert.Equal(VIntSentinelValue, console.Sega32X.Regs[0x12]); // COMM2, written by the VINT handler
         Assert.Equal(VIntSentinelValue, bus.ReadWord(Comm2Address68k));
+    }
+
+    /// <summary>Phase 4: a whole-system reset raises VRES on both cores at level 14, the highest of
+    /// the five 32X sources. Confirmed against PicoDrive's <c>PicoReset32x</c> (32x.c:240-249),
+    /// whose only interrupt action is <c>p32x_trigger_irq(NULL, ..., P32XI_VRES)</c>. Note the raw
+    /// <c>Sega32X.Reset()</c> here rather than this class's helper, which deliberately releases the
+    /// cores and so clears exactly what this test is checking for.</summary>
+    [Fact]
+    public void Reset_RaisesVResOnBothCoresAtTheHighestPriorityLevel()
+    {
+        var sega32X = new Sega32X(Cartridge.LoadFromBin(new byte[0x10000]));
+
+        sega32X.Reset();
+
+        Assert.Equal(14, sega32X.MasterSh2.PendingInterruptLevel);
+        Assert.Equal(14, sega32X.SlaveSh2.PendingInterruptLevel);
+    }
+
+    /// <summary>VRES is the one source <see cref="Sega32X.Sh2IrqMask"/> never gates — confirmed
+    /// against <c>p32x_trigger_irq</c> (32x.c:79-88), where VRES is applied in its own two
+    /// statements outside the masked expression the other four sources go through. Masking
+    /// everything off on both cores must not suppress it.</summary>
+    [Fact]
+    public void Reset_RaisesVResEvenWithEveryInterruptMaskedOffOnBothCores()
+    {
+        var sega32X = new Sega32X(Cartridge.LoadFromBin(new byte[0x10000]));
+        sega32X.Reset();
+        sega32X.MasterSh2.Reset();
+        sega32X.SlaveSh2.Reset();
+        sega32X.MasterSh2Bus.WriteByte(0x4001, 0x00); // every maskable source disabled...
+        sega32X.SlaveSh2Bus.WriteByte(0x4001, 0x00);
+        Assert.Equal(0, sega32X.MasterSh2.PendingInterruptLevel); // ...and nothing pending yet
+
+        sega32X.Reset();
+
+        Assert.Equal(14, sega32X.MasterSh2.PendingInterruptLevel);
+        Assert.Equal(14, sega32X.SlaveSh2.PendingInterruptLevel);
+    }
+
+    /// <summary>The distinction that makes VRES easy to get wrong: it is not the SH-2 reset line.
+    /// The adapter's own nRES 0→1 edge resets both cores (already correct before this phase) but
+    /// must <em>not</em> raise VRES — confirmed by reading <c>p32x_reset_sh2s</c> (32x.c:161-212)
+    /// in full, which triggers no interrupt anywhere in its body. Only the whole-system reset path
+    /// does.</summary>
+    [Fact]
+    public void NResReleaseEdge_ResetsBothCoresButDoesNotRaiseVRes()
+    {
+        var console = new GenesisConsole(Cartridge.LoadFromBin(new byte[0x10000]));
+        console.Reset();
+        var bus = (Cpu68000.IBus)console;
+
+        bus.WriteByte(0xA15101, 0x00); // clear nRES -- hold both cores in reset
+        bus.WriteByte(0xA15101, 0x03); // nRES 0->1 edge + ADEN: releases them
+
+        Assert.Equal(0, console.Sega32X.MasterSh2.PendingInterruptLevel);
+        Assert.Equal(0, console.Sega32X.SlaveSh2.PendingInterruptLevel);
+    }
+
+    /// <summary>A whole-system reset also clears both cores' interrupt-enable registers, matching
+    /// PicoPower32x's own <c>memset(&amp;Pico32x, 0, sizeof(Pico32x))</c> (32x.c:220) — sh2irq_mask
+    /// lives inside that struct. Left stale, a reset would carry the previous run's per-core
+    /// enables into the next one.</summary>
+    [Fact]
+    public void Reset_ClearsBothCoresInterruptEnableRegisters()
+    {
+        var sega32X = CreateSega32X();
+        sega32X.MasterSh2Bus.WriteByte(0x4001, 0x0F);
+        sega32X.SlaveSh2Bus.WriteByte(0x4001, 0x0F);
+        Assert.Equal(0x0F, sega32X.Sh2IrqMask[0]); // confirmed set before the reset under test
+
+        sega32X.Reset();
+
+        Assert.Equal(0x00, sega32X.Sh2IrqMask[0]);
+        Assert.Equal(0x00, sega32X.Sh2IrqMask[1]);
     }
 }
