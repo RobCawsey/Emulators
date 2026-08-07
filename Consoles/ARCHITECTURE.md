@@ -1312,6 +1312,34 @@ flipping every frame — after the same question had taken a long sequence of si
 through the UI to ask badly. When 32X output looks wrong, run `probe` before stepping frames by
 hand.
 
+### 9.8 Build configuration and real-time pacing
+
+**Run a Release build.** This is not the usual "Release is a bit quicker" advice — for 32X titles
+it is the difference between working and not. Measured headlessly, 600 frames = 10.0s of emulated
+time:
+
+| Title | Debug | Release |
+| --- | --- | --- |
+| Sonic (no 32X) | 10.8s — **0.92×** real time | 2.1s — 4.8× |
+| Pitfall (32X) | 32.2s — **0.31×** real time | 6.2s — 1.6× |
+
+Emulation is deterministic, so a slow build never changes what is *emulated* — but audio is
+generated on the emulation clock and drained by WASAPI in real time, and there is no frame-skip or
+audio catch-up path. At 0.31× roughly 69% of the samples the audio device asks for were never
+produced, and `GenesisAudioProvider` emits silence on underrun, so playback becomes silence
+interleaved with fragments at a very high rate. That is audibly indistinguishable from a broken
+sound chip, and was in fact misdiagnosed as one — the 32X PWM chip was investigated at length
+before a measurement showed the game never programs PWM at all during the affected scenes, and
+that the emulator's own sample output was in the same amplitude range as titles that sounded fine.
+
+Debug's ~5× penalty barely matters for a plain Genesis title (0.92× reads as full speed), which is
+what made this look 32X-specific: adding two SH-2 cores at 23MHz is roughly a 20-40× increase in
+interpreter work, so 32X is where the margin runs out first. Before attributing any speed or audio
+problem to emulation accuracy, check which configuration is running.
+
+Release headroom for 32X (1.6×) is still much thinner than for plain Genesis (4.8×), so a heavy
+32X scene can dip below real time even there — see the SH-2 interpreter throughput notes in §4a.
+
 ---
 
 ## 10. Testing strategy
