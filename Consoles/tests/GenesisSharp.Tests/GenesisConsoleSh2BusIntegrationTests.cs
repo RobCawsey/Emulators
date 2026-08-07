@@ -111,6 +111,77 @@ public class GenesisConsoleSh2BusIntegrationTests
         Assert.Equal(0, console.Sega32X.Regs[0x10]); // COMM0 never written -- SH-2 never ran
     }
 
+    /// <summary>SH-2 program that takes FM ownership of the 32X VDP registers and then flips
+    /// FBCR's <c>FS</c> bit -- the exact two-step a real title performs before drawing into the
+    /// other frame-buffer bank. Writes FM (adapter-register block offset 0, at SH-2 $4000) only
+    /// when <paramref name="claimFm"/> is set, so the same program doubles as the negative control
+    /// proving the FM gate still rejects an unclaimed write.</summary>
+    private static void WriteSh2FrameSelectProgram(byte[] bootRom, bool claimFm)
+    {
+        WriteLong(bootRom, 0x000000, 0x00000200); // initial PC
+        WriteLong(bootRom, 0x000004, 0x06001000); // initial SP (inside SDRAM)
+
+        int pc = 0x200;
+        if (claimFm)
+        {
+            WriteSh2Word(bootRom, pc, Sh2Asm.MovI(0x40, n: 1)); pc += 2;  // R1 = 0x00000040
+            WriteSh2Word(bootRom, pc, Sh2Asm.Shll8(n: 1)); pc += 2;       // R1 = 0x00004000 (adapter regs)
+            WriteSh2Word(bootRom, pc, Sh2Asm.MovI(0x80, n: 0)); pc += 2;  // R0 = FM bit (byte offset 0, bit 7)
+            WriteSh2Word(bootRom, pc, Sh2Asm.MovBS(m: 0, n: 1)); pc += 2; // MOV.B R0,@R1
+        }
+
+        WriteSh2Word(bootRom, pc, Sh2Asm.MovI(0x41, n: 1)); pc += 2;      // R1 = 0x00000041
+        WriteSh2Word(bootRom, pc, Sh2Asm.Shll8(n: 1)); pc += 2;           // R1 = 0x00004100 (32X VDP regs)
+        WriteSh2Word(bootRom, pc, Sh2Asm.MovI(0x0B, n: 2)); pc += 2;      // R2 = 0x0B (FBCR low byte)
+        WriteSh2Word(bootRom, pc, Sh2Asm.Or(m: 2, n: 1)); pc += 2;        // R1 = 0x0000410B
+        WriteSh2Word(bootRom, pc, Sh2Asm.MovI(0x01, n: 0)); pc += 2;      // R0 = FS = 1
+        WriteSh2Word(bootRom, pc, Sh2Asm.MovBS(m: 0, n: 1)); pc += 2;     // MOV.B R0,@R1
+
+        WriteSh2Word(bootRom, pc, Sh2Asm.Bra(disp12: -2)); pc += 2;       // self-loop
+        WriteSh2Word(bootRom, pc, Sh2Asm.Nop());                          // delay slot
+    }
+
+    /// <summary>An SH-2 owns the 32X VDP register block by writing FM itself -- the adapter
+    /// block's offset 0 is not 68000-exclusive. Regression test: this method used to discard SH-2
+    /// writes to offset 0 outright, which left FM stuck at 0 and made the FM gate in
+    /// <c>WriteVdpControlByteFromSh2</c> silently swallow every subsequent VDP register write that
+    /// core made -- see <c>Sega32X.WriteRegisterByteFromSh2</c>'s offset-0 remarks for what that
+    /// cost on a real title.</summary>
+    [Fact]
+    public void MasterSh2ClaimingFmCanThenFlipTheFrameSelectBit()
+    {
+        var console = new GenesisConsole(Cartridge.LoadFromBin(new byte[0x10000]));
+        WriteSh2FrameSelectProgram(console.Sega32X.BootRomMaster, claimFm: true);
+        console.Reset();
+
+        var bus = (Cpu68000.IBus)console;
+        bus.WriteByte(0xA15101, 0x03); // nRES + ADEN -> release both SH-2s
+
+        console.RunFrame();
+
+        Assert.NotEqual(0, console.Sega32X.Regs[0] & 0x8000); // FM claimed by the SH-2
+        Assert.NotEqual(0, console.Sega32X.VdpRegs[5] & 0x1); // ...so its FS write actually landed
+    }
+
+    /// <summary>The other half of the same rule: without claiming FM first, the SH-2's VDP
+    /// register writes really are dropped (the 68000 still owns the block). Guards against
+    /// "fixing" the above by removing the ownership gate altogether.</summary>
+    [Fact]
+    public void MasterSh2WithoutClaimingFmCannotFlipTheFrameSelectBit()
+    {
+        var console = new GenesisConsole(Cartridge.LoadFromBin(new byte[0x10000]));
+        WriteSh2FrameSelectProgram(console.Sega32X.BootRomMaster, claimFm: false);
+        console.Reset();
+
+        var bus = (Cpu68000.IBus)console;
+        bus.WriteByte(0xA15101, 0x03);
+
+        console.RunFrame();
+
+        Assert.Equal(0, console.Sega32X.Regs[0] & 0x8000); // FM never claimed
+        Assert.Equal(0, console.Sega32X.VdpRegs[5] & 0x1); // so FS stays put
+    }
+
     [Fact]
     public void MarsIdRegister_AlwaysReadsTheHardwarePresenceString()
     {

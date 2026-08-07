@@ -687,6 +687,22 @@ title** (user-supplied, legally-owned dump — the first real-ROM validation thi
   also forces `nRES` back to released whenever `ADEN` transitions 1→0 (a real subsystem shutdown
   leaves the SH-2s not-held but the whole subsystem inert, the same shape as the power-on default)
   — reproduced here too, not just the masking.
+- **`FM` is writable from the *SH-2* side too, and dropping that write disarms everything else
+  that core does to the 32X VDP.** Adapter-block offset 0 is not 68000-exclusive: an SH-2 writes
+  `FM` itself to take ownership of the VDP register block, the palette, and the frame buffer before
+  touching any of them. Confirmed against PicoDrive's `p32x_sh2reg_write8` (`memory.c`, `case 0x00:
+  // FM`: `r[0] &= ~P32XS_FM; r[0] |= (d << 8) & P32XS_FM;`) — only `FM` is merged in, the rest of
+  the word stays 68000-owned. `Sega32X.WriteRegisterByteFromSh2` originally discarded offset 0
+  outright, so `FM` never left 0 and the (correct, PicoDrive-matching) ownership gate in
+  `WriteVdpControlByteFromSh2` then silently swallowed every VDP register write that core made.
+  Cost, confirmed on a real title (Pitfall: The Mayan Adventure): its master SH-2 sets `FM`, flips
+  FBCR's `FS` to aim the next draw at the other frame-buffer bank, then writes that bank's line
+  table. With the `FS` write swallowed, both of the game's two line-table passes landed in the same
+  bank; the other bank kept an all-zero line table forever while still receiving pixel data, and
+  since the game flips `FS` every frame the display alternated between the finished picture and a
+  bank that could not resolve a single scanline — a hard 30Hz flicker. Worth noting as a shape, not
+  just an incident: a dropped *ownership* write is silent at the point of failure and only shows up
+  much later as unrelated-looking writes going missing.
 - **A second, separate 68000-side ROM window (`$880000-$8FFFFF`) was also entirely unmapped.**
   Distinct from the banked window above: this one always shows cartridge ROM starting from offset
   0, completely ignoring the bank-select register — real boot code uses it specifically because

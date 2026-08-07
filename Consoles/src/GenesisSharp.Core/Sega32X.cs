@@ -310,8 +310,29 @@ public sealed partial class Sega32X
 
         int core = isSlave ? 1 : 0;
 
-        if (offset == 0)
+        if (offset == 0) // FM, and *only* FM -- this is how an SH-2 takes ownership of the VDP
+                          // register block, the palette, and the frame buffer before touching any
+                          // of them, so dropping this write silently disarms every VDP write that
+                          // core makes afterwards. Confirmed against PicoDrive's own
+                          // p32x_sh2reg_write8 (memory.c, "case 0x00: // FM"):
+                          //     r[0] &= ~P32XS_FM;
+                          //     r[0] |= (d << 8) & P32XS_FM;
+                          // Every other bit of this word (REN, nRES, ADEN, and the read-only
+                          // nCART) stays 68000-owned, hence the single-bit merge rather than a
+                          // whole-byte store.
+                          //
+                          // This method previously discarded offset 0 outright. Cost, confirmed on
+                          // a real title (Pitfall: The Mayan Adventure): its master SH-2 sets FM,
+                          // then writes FBCR's FS bit to aim the next draw at the other frame-buffer
+                          // bank, then writes that bank's line table. With FM stuck at 0 the FS
+                          // write was swallowed by the (correct) FM gate in
+                          // WriteVdpControlByteFromSh2, so both of the game's two line-table passes
+                          // landed in the same bank. The other bank kept an all-zero line table
+                          // forever while still receiving pixel data, and since the game flips FS
+                          // every frame, the display alternated between the finished picture and a
+                          // bank that could not resolve a single scanline -- a hard 30Hz flicker.
         {
+            Regs[0] = (ushort)((Regs[0] & ~FmBit) | ((value << 8) & FmBit));
             return;
         }
 
