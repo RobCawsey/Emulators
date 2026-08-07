@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>GenesisSharp.DebugTools</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\GenesisSharp.Core\GenesisSharp.Core.csproj" />
+    <ProjectReference Include="..\..\src\GenesisSharp.CpuSh2\GenesisSharp.CpuSh2.csproj" />
+  </ItemGroup>
+
+  <!-- Link-compiled rather than project-referenced: GenesisSharp.Frontend targets net9.0-windows
+       (WinForms), which a plain net9.0 console tool can't reference, and dragging WinForms into a
+       command-line tool purely to reach two display-only source files would be worse. Compiling
+       the same two files here keeps the disassembly this tool prints byte-identical to what the
+       debug window shows, with zero impact on the Frontend project itself. The linked types stay
+       in their own GenesisSharp.Frontend namespace, hence the using in DisassembleCommand.cs. -->
+  <ItemGroup>
+    <Compile Include="..\..\src\GenesisSharp.Frontend\Sh2Disassembler.cs" Link="Linked\Sh2Disassembler.cs" />
+    <Compile Include="..\..\src\GenesisSharp.Frontend\DisassembledInstruction.cs" Link="Linked\DisassembledInstruction.cs" />
+  </ItemGroup>
+
+</Project>

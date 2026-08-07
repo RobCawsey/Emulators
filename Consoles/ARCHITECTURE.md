@@ -1281,6 +1281,37 @@ override back to normal live-following behavior.
 underrun. Played via `WasapiOut` at 20ms latency — WASAPI shared mode's practical floor is
 around 10ms; going lower trades underrun risk for less lag.
 
+### 9.7 Command-line debug tools (`tools/GenesisSharp.DebugTools`)
+
+Two companions to the debug window, for the questions it answers badly. Both were built while
+root-causing real bugs in a commercial 32X title and kept because the next such investigation will
+want them again. Neither is referenced by the emulator or the frontend — they're consumers, so
+nothing here can affect emulation correctness.
+
+**`disasm <rom> <sh2-address-hex> [count]`** disassembles SH-2 code straight out of a cartridge
+image with no emulator running. A 32X header's Initial Data Load descriptor (ROM `$3D4`: source,
+destination, length) tells the boot code which ROM range to copy into SDRAM, so a game's
+SDRAM-resident code is a straight copy of a known ROM range — `IdlRomBus` resolves `$06xxxxxx`
+through that descriptor, and `$02xxxxxx` straight through to the cartridge. It link-compiles the
+frontend's own `Sh2Disassembler` (the frontend targets `net9.0-windows`, so it can't be
+project-referenced from a console tool) so the output is byte-identical to the debug window's.
+Limitation worth knowing: this is the ROM's *initial* image, so anything the game decompresses or
+overwrites at runtime needs the live peek instead.
+
+**`probe <rom> [frames]`** runs a ROM headlessly and reports 32X display state once per frame,
+printing only when it changes. The load-bearing number is how many of the 224 scanlines each
+frame-buffer bank's line table can actually *resolve* — because the 32X frame buffer isn't a plain
+bitmap (see §4a.1), a bank full of pixel data but with an empty line table renders as nothing, and
+looks identical to an empty bank from a screenshot. `FS` is deliberately excluded from the
+change-detection key and reported as a flip count instead: a page-flipping title toggles it every
+frame, which would make every frame a "change" and bury the signal.
+
+That distinction is the whole point. The FM-ownership bug above (§4a) reduced to four lines of
+`probe` output — one bank stuck at `lines=0` forever while both received pixel data, with `FS`
+flipping every frame — after the same question had taken a long sequence of single-address peeks
+through the UI to ask badly. When 32X output looks wrong, run `probe` before stepping frames by
+hand.
+
 ---
 
 ## 10. Testing strategy
