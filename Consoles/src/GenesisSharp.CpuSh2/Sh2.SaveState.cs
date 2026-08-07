@@ -20,8 +20,10 @@ public sealed partial class Sh2
         writer.Write(MACL);
         writer.Write(SR);
         writer.Write(TotalCycles);
-        writer.Write(PendingInterruptLevel);
-        writer.Write(_pendingVectorNumber);
+        writer.Write(InterruptRequestLevel);
+        writer.Write(_interruptRequestVector);
+        writer.Write(InternalInterruptLevel);
+        writer.Write(_internalInterruptVector);
         writer.Write(NmiPending);
     }
 
@@ -36,8 +38,10 @@ public sealed partial class Sh2
         MACL = reader.ReadUInt32();
         SR = reader.ReadUInt32();
         TotalCycles = reader.ReadInt64();
-        PendingInterruptLevel = reader.ReadInt32();
-        _pendingVectorNumber = reader.ReadInt32();
+        InterruptRequestLevel = reader.ReadInt32();
+        _interruptRequestVector = reader.ReadInt32();
+        InternalInterruptLevel = reader.ReadInt32();
+        _internalInterruptVector = reader.ReadInt32();
         NmiPending = reader.ReadBoolean();
     }
 }

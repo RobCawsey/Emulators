@@ -24,6 +24,8 @@ public sealed partial class Sega32X
 
         writer.Write(Sh2IrqMask[0]);
         writer.Write(Sh2IrqMask[1]);
+        writer.Write(Sh2IrqPending[0]);
+        writer.Write(Sh2IrqPending[1]);
         writer.Write(_hIntCounterReg);
         writer.Write(_hIntCountdown);
 
@@ -61,6 +63,8 @@ public sealed partial class Sega32X
 
         Sh2IrqMask[0] = reader.ReadByte();
         Sh2IrqMask[1] = reader.ReadByte();
+        Sh2IrqPending[0] = reader.ReadByte();
+        Sh2IrqPending[1] = reader.ReadByte();
         _hIntCounterReg = reader.ReadByte();
         _hIntCountdown = reader.ReadInt32();
 

@@ -19,7 +19,15 @@ public sealed partial class GenesisConsole
     // changes incompatibly, so LoadState can fail cleanly on an old/foreign file instead of
     // reading garbage into every field after the first mismatch.
     private static readonly byte[] SaveStateMagic = { (byte)'G', (byte)'S', (byte)'S', (byte)'T' };
-    private const int SaveStateVersion = 5; // v5: added Sega32X's new PWM IRQ counter (_pwmIrqCounter)
+    private const int SaveStateVersion = 6; // v6: 32X interrupts became level-triggered -- added
+                                             // Sega32X's per-core asserted-source bitmask
+                                             // (Sh2IrqPending), and each SH-2's own two interrupt
+                                             // fields changed meaning from "one pending request,
+                                             // cleared on service" to "the level currently asserted
+                                             // on its IRL pins" (same layout, different semantics --
+                                             // a silent reinterpretation of an old file would
+                                             // resurrect interrupts that had already been serviced)
+                                             // v5: added Sega32X's new PWM IRQ counter (_pwmIrqCounter)
                                              // v4: added each SH-2's on-chip peripheral register block (including the
                                              // on-chip DMAC -- see Sega32X.Bus.cs's _peripheralRegs) and Sega32X's own
                                              // Sh2IrqMask/HINT counter/countdown, none of which were previously

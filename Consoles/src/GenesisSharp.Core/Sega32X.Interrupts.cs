@@ -33,16 +33,29 @@ public sealed partial class Sega32X
     // against pico_int.h:624-628's bit positions, cross-checked against sh2_irq_cb's own
     // auto-vector formula (32x.c:18-31: "return 64 + pending_irl / 2" -- the real SH-2 hardware
     // convention for an auto-vectored external interrupt with no explicit vector asserted).
-    private const int VResLevel = 14;
-    private const int VResVector = 71;
-    private const int CmdLevel = 8;
-    private const int CmdVector = 68;
-    private const int VIntLevel = 12;
-    private const int VIntVector = 70;
-    private const int HIntLevel = 10;
-    private const int HIntVector = 69;
-    private const int PwmLevel = 6;
-    private const int PwmVector = 67;
+    // Pending-source bits, one set per core, matching PicoDrive's own P32XI_* bit positions
+    // (pico_int.h:624-628) exactly -- the positions are load-bearing, not arbitrary labels, since
+    // both the level/vector derivation in UpdateInterruptRequestLevels and the mask alignment in
+    // the raise paths below depend on them (32x.c:83-84 shifts sh2irq_mask left by 3 to line its
+    // PWM/CMD/HINT/VINT enable bits up against these).
+    private const byte VResPendingBit = 0x80;
+    private const byte VIntPendingBit = 0x40;
+    private const byte HIntPendingBit = 0x20;
+    private const byte CmdPendingBit = 0x10;
+    private const byte PwmPendingBit = 0x08;
+
+    /// <summary>Which of the five 32X sources are currently <em>asserting</em> an interrupt on each
+    /// core, index 0 = master. This is the direct equivalent of PicoDrive's
+    /// <c>Pico32x.sh2irqi[2]</c> (<c>pico_int.h:651</c>), and it lives here rather than inside the
+    /// SH-2 core for the same reason it does there: these are external sources wired to the CPU's
+    /// interrupt-request pins, so which one wins is the interrupt controller's job, not the CPU's.
+    ///
+    /// Level-triggered. A bit stays set until its source stops asserting — for VRES/VINT/HINT/PWM
+    /// that means the handler writing this core's own interrupt-clear register
+    /// (<see cref="ClearPendingInterrupt"/>), and for CMD it means the live AND in
+    /// <see cref="UpdateCmdIrq"/> going false. Servicing the interrupt does <em>not</em> clear it;
+    /// see <see cref="Sh2.SetInterruptRequestLevel"/>.</summary>
+    internal readonly byte[] Sh2IrqPending = new byte[2];
 
     /// <summary>The SH-2's own per-core interrupt-enable register -- adapter-block offset 1
     /// written from the SH-2 side, a completely different meaning from the 68000's own view of
@@ -56,23 +69,82 @@ public sealed partial class Sega32X
     /// already exposed.</summary>
     public readonly byte[] Sh2IrqMask = new byte[2];
 
+    /// <summary>Recomputes both cores' asserted interrupt level from <see cref="Sh2IrqPending"/>
+    /// and drives it onto their request pins. The direct equivalent of PicoDrive's
+    /// <c>p32x_update_irls</c> (<c>32x.c:34-74</c>), which does the same job with an unrolled
+    /// binary search for the highest set bit; the levels and vectors this produces were confirmed
+    /// identical to that encoder's for all five sources.
+    ///
+    /// Both derivations fall out of the bit positions above. The level is <c>2 × bitIndex</c>
+    /// (VRES at bit 7 → 14, VINT bit 6 → 12, HINT bit 5 → 10, CMD bit 4 → 8, PWM bit 3 → 6), and
+    /// the vector is <c>64 + bitIndex</c>, which is exactly PicoDrive's
+    /// <c>64 + pending_irl / 2</c> (<c>sh2_irq_cb</c>, <c>32x.c:22</c>) — the SH-2 hardware
+    /// convention for auto-vectored external interrupts, where no vector is explicitly asserted on
+    /// the bus. Nothing pending deasserts the pins entirely (level 0).</summary>
+    private void UpdateInterruptRequestLevels()
+    {
+        for (int core = 0; core < 2; core++)
+        {
+            byte pending = Sh2IrqPending[core];
+            int level = 0;
+            int vector = 0;
+            if (pending != 0)
+            {
+                int bit = System.Numerics.BitOperations.Log2(pending); // highest set bit
+                level = bit * 2;
+                vector = 64 + bit;
+            }
+
+            (core == 0 ? MasterSh2 : SlaveSh2).SetInterruptRequestLevel(level, vector);
+        }
+    }
+
+    /// <summary>Asserts one source on one core. Idempotent — re-asserting an already-asserted
+    /// source is a harmless no-op, which is what lets the live-AND and per-scanline callers below
+    /// run unconditionally without their own guards.</summary>
+    private void AssertPendingInterrupt(int core, byte bit)
+    {
+        Sh2IrqPending[core] |= bit;
+        UpdateInterruptRequestLevels();
+    }
+
+    /// <summary>Deasserts one source on one core — the mechanism a real interrupt handler uses to
+    /// stop an interrupt re-firing, since servicing alone never clears it. Reached from the
+    /// per-core interrupt-clear register block (adapter offsets 0x14/0x16/0x18/0x1c for
+    /// VRES/VINT/HINT/PWM), confirmed against PicoDrive's own <c>p32x_sh2reg_write16</c>
+    /// (<c>memory.c:936-952</c>). CMD (0x1a) deliberately isn't routed here: it clears the
+    /// 68000's request bit instead and lets <see cref="UpdateCmdIrq"/>'s live AND fall false, the
+    /// same split PicoDrive makes.</summary>
+    private void ClearPendingInterrupt(int core, byte bit)
+    {
+        Sh2IrqPending[core] &= (byte)~bit;
+        UpdateInterruptRequestLevels();
+    }
+
     /// <summary>Re-evaluates the CMD interrupt condition for one core and requests it if both the
     /// 68000's own request bit (adapter-block offset 2/3 -- <c>Regs[1]</c>'s low byte, bit 0 =
     /// request-to-master, bit 1 = request-to-slave) and that core's own <see cref="CmdMaskBit"/>
     /// are set. A live AND, not a one-shot latch -- confirmed against PicoDrive's own
     /// <c>p32x_update_cmd_irq</c> (<c>32x.c:89-102</c>), which is called from both the 68000's
     /// own offset-3 write and the SH-2's own mask-register write for exactly this reason: either
-    /// side changing can flip the outcome. Safe to call unconditionally on every relevant write:
-    /// <c>Sh2.RaiseInterrupt</c> itself only actually raises the pending level if the new one is
-    /// higher than whatever's already pending, so re-evaluating an already-true condition is a
-    /// harmless no-op rather than something that needs its own guard here.</summary>
+    /// side changing can flip the outcome. Safe to call unconditionally on every relevant write.
+    ///
+    /// Genuinely bidirectional, unlike the other four sources: this both asserts and <em>deasserts</em>
+    /// CMD, matching PicoDrive's own if/else (<c>32x.c:91-100</c>, <c>sh2irqi[n] |= P32XI_CMD</c>
+    /// vs <c>&amp;= ~P32XI_CMD</c>). That is why CMD has no entry in the interrupt-clear register
+    /// block a handler would otherwise use — writing offset 0x1a clears the 68000's request bit and
+    /// lets this live AND fall false on its own (see <see cref="AcknowledgeCmdIrq"/>).</summary>
     private void UpdateCmdIrq(int core)
     {
         bool masked = (Sh2IrqMask[core] & CmdMaskBit) != 0;
         bool requested = (Regs[1] & (1 << core)) != 0;
         if (masked && requested)
         {
-            (core == 0 ? MasterSh2 : SlaveSh2).RaiseInterrupt(CmdLevel, CmdVector);
+            AssertPendingInterrupt(core, CmdPendingBit);
+        }
+        else
+        {
+            ClearPendingInterrupt(core, CmdPendingBit);
         }
     }
 
@@ -115,7 +187,7 @@ public sealed partial class Sega32X
         {
             if ((Sh2IrqMask[core] & VIntMaskBit) != 0)
             {
-                (core == 0 ? MasterSh2 : SlaveSh2).RaiseInterrupt(VIntLevel, VIntVector);
+                AssertPendingInterrupt(core, VIntPendingBit);
             }
         }
     }
@@ -141,7 +213,7 @@ public sealed partial class Sega32X
         {
             if ((Sh2IrqMask[core] & PwmMaskBit) != 0)
             {
-                (core == 0 ? MasterSh2 : SlaveSh2).RaiseInterrupt(PwmLevel, PwmVector);
+                AssertPendingInterrupt(core, PwmPendingBit);
             }
         }
     }
@@ -174,8 +246,8 @@ public sealed partial class Sega32X
     /// been reset and their boot state synthesized.</summary>
     internal void RaiseVResInterrupt()
     {
-        MasterSh2.RaiseInterrupt(VResLevel, VResVector);
-        SlaveSh2.RaiseInterrupt(VResLevel, VResVector);
+        AssertPendingInterrupt(0, VResPendingBit);
+        AssertPendingInterrupt(1, VResPendingBit);
     }
 
     /// <summary>The SH-2-exclusive "H count" register (adapter-block offset 5 -- see the write
@@ -232,7 +304,7 @@ public sealed partial class Sega32X
             {
                 if ((Sh2IrqMask[core] & HIntMaskBit) != 0)
                 {
-                    (core == 0 ? MasterSh2 : SlaveSh2).RaiseInterrupt(HIntLevel, HIntVector);
+                    AssertPendingInterrupt(core, HIntPendingBit);
                 }
             }
         }

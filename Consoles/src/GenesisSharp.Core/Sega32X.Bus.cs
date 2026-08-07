@@ -392,14 +392,14 @@ internal sealed class Sega32XSh2Bus : IBus
         {
             int level = otherRegs[VcrLevel] >> 4;
             int vector = otherRegs[VcrTxVector] & 0x7F;
-            _ownSh2.RaiseInterrupt(level, vector);
+            _ownSh2.RaiseInternalInterrupt(level, vector);
         }
 
         if ((otherRegs[SciScr] & ScrRie) != 0)
         {
             int level = otherRegs[VcrLevel] >> 4;
             int vector = otherRegs[VcrRxVector] & 0x7F;
-            _otherSh2.RaiseInterrupt(level, vector);
+            _otherSh2.RaiseInternalInterrupt(level, vector);
         }
     }
 

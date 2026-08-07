@@ -11,18 +11,18 @@ public class Sega32XPwmTests
 {
     private const double OneAudioSample = 1.0 / 44100.0;
 
-    /// <summary>A 32X reset and its SH-2s then released, which is the state these tests want. The
-    /// core resets are not incidental: a whole-system reset leaves VRES pending at level 14 (see
-    /// <c>Sega32X.RaiseVResInterrupt</c>), and <c>Sh2.RaiseInterrupt</c> only records a request
-    /// that outranks whatever is already pending — so a leftover VRES would swallow every
-    /// lower-priority source these tests are actually about. A real ROM clears it the same way, by
-    /// releasing the cores via the nRES 0→1 edge, which resets them.</summary>
+    /// <summary>A 32X reset with the power-on VRES then acknowledged on both cores, which is the
+    /// state these tests want. The acknowledgment is not incidental: a whole-system reset leaves
+    /// VRES asserted at level 14 (see <c>Sega32X.RaiseVResInterrupt</c>), and since the five
+    /// sources are level-triggered it stays asserted — outranking every lower-priority source these
+    /// tests are actually about — until something clears it. Writing adapter offset 0x14 is exactly
+    /// what a real VRES handler does, and the only thing that clears it.</summary>
     private static Sega32X CreateSega32X()
     {
         var sega32X = new Sega32X(Cartridge.LoadFromBin(new byte[0x10000]));
         sega32X.Reset();
-        sega32X.MasterSh2.Reset();
-        sega32X.SlaveSh2.Reset();
+        sega32X.MasterSh2Bus.WriteByte(0x4014, 0); // VRES ack, master
+        sega32X.SlaveSh2Bus.WriteByte(0x4014, 0); // VRES ack, slave
         return sega32X;
     }
 
@@ -110,8 +110,8 @@ public class Sega32XPwmTests
 
         sega32X.GeneratePwmSample(OneAudioSample);
 
-        Assert.Equal(6, sega32X.MasterSh2.PendingInterruptLevel); // PwmLevel
-        Assert.Equal(0, sega32X.SlaveSh2.PendingInterruptLevel); // never unmasked -- never raised
+        Assert.Equal(6, sega32X.MasterSh2.InterruptRequestLevel); // PwmLevel
+        Assert.Equal(0, sega32X.SlaveSh2.InterruptRequestLevel); // never unmasked -- never raised
     }
 
     [Fact]
@@ -125,8 +125,8 @@ public class Sega32XPwmTests
 
         sega32X.GeneratePwmSample(OneAudioSample);
 
-        Assert.Equal(0, sega32X.MasterSh2.PendingInterruptLevel);
-        Assert.Equal(0, sega32X.SlaveSh2.PendingInterruptLevel);
+        Assert.Equal(0, sega32X.MasterSh2.InterruptRequestLevel);
+        Assert.Equal(0, sega32X.SlaveSh2.InterruptRequestLevel);
     }
 
     [Fact]

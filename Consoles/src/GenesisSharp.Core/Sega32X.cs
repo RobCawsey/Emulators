@@ -124,6 +124,7 @@ public sealed partial class Sega32X
         // sh2irq_mask lives inside that struct. Left stale, a reset would carry the previous run's
         // per-core VINT/HINT/CMD/PWM enables straight into the next one.
         Array.Clear(Sh2IrqMask);
+        Array.Clear(Sh2IrqPending);
         ResetVdp();
         ResetPwm();
         ResetHInt();
@@ -212,6 +213,13 @@ public sealed partial class Sega32X
                 MasterSh2.Reset();
                 SlaveSh2.Reset();
                 SynthesizeSh2BootStateFromCartridge();
+
+                // Sh2.Reset() deasserts each core's interrupt-request pins, but resetting a CPU
+                // does not make an external device stop driving them -- whatever is in
+                // Sh2IrqPending is still asserting. Re-drive from that (the source of truth) so the
+                // pins reflect reality rather than a stale zero. Deliberately not a clear: nRES
+                // resets the CPUs, not the 32X's interrupt controller.
+                UpdateInterruptRequestLevels();
             }
 
             byte preserved = (byte)(oldByte1 & ~(NResBit | AdenBit));
@@ -389,6 +397,37 @@ public sealed partial class Sega32X
                                     // bytes of this word-pair are treated as the same register.
         {
             AcknowledgeCmdIrq(core);
+            return;
+        }
+
+        // The rest of the per-core interrupt-clear block. These are how a handler stops its
+        // interrupt re-firing: the five 32X sources are level-triggered, so servicing one never
+        // clears it (see Sh2.SetInterruptRequestLevel) -- only this does. Confirmed against
+        // PicoDrive's own p32x_sh2reg_write16 (memory.c:936-952), which clears exactly these four
+        // bits at exactly these four offsets, per core, and routes 0x1a differently (above).
+        // Word-pair masking matches AcknowledgeCmdIrq's, and for the same reason: real SH-2 code
+        // writes these with a word write, which Sega32XSh2Bus decomposes into two byte writes.
+        if ((offset & ~1u) == 0x14)
+        {
+            ClearPendingInterrupt(core, VResPendingBit);
+            return;
+        }
+
+        if ((offset & ~1u) == 0x16)
+        {
+            ClearPendingInterrupt(core, VIntPendingBit);
+            return;
+        }
+
+        if ((offset & ~1u) == 0x18)
+        {
+            ClearPendingInterrupt(core, HIntPendingBit);
+            return;
+        }
+
+        if ((offset & ~1u) == 0x1C)
+        {
+            ClearPendingInterrupt(core, PwmPendingBit);
             return;
         }
 

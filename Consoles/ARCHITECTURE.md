@@ -747,8 +747,32 @@ auto-vectored external interrupts):
 | CMD | `0x10` | 8 | 68 | bit 1 |
 | PWM | `0x08` | 6 | 67 | bit 0 |
 
-These map straight onto the SH-2 core's existing `RaiseInterrupt(level, vectorNumber)` with **no
-changes to `Sh2` itself** — that method's own doc comment anticipated exactly this.
+**These five are level-triggered.** `Sega32X.Sh2IrqPending[core]` is a bitmask of which sources are
+currently *asserting* (PicoDrive's own `Pico32x.sh2irqi[2]`, `pico_int.h:651`), and
+`UpdateInterruptRequestLevels` — the equivalent of `p32x_update_irls` (`32x.c:34-74`) — encodes the
+highest set bit onto that core's interrupt-request pins via `Sh2.SetInterruptRequestLevel`. Both
+derivations fall out of the bit positions: level is `2 × bitIndex`, vector is `64 + bitIndex`, the
+latter being exactly PicoDrive's `64 + pending_irl / 2`.
+
+Servicing an interrupt **does not clear it**. The handler must tell the source to stop asserting,
+by writing this core's own interrupt-clear register (offsets `0x14`/`0x16`/`0x18`/`0x1c` for
+VRES/VINT/HINT/PWM; CMD instead clears the 68000's request bit at `0x1a` and lets its live AND fall
+false). Otherwise it legitimately fires again as soon as `RTE` restores SR — real behavior, not a
+bug to design around. Re-entry *during* the handler is prevented separately, by SR's I3-I0 mask
+being raised to the serviced level. Confirmed against PicoDrive's `sh2_irq_cb` (`32x.c:18-31`),
+which clears only on its *internal* path (`sh2->pending_int_irq = 0; // auto-clear`) while the IRL
+path returns a vector and clears nothing.
+
+That split is mirrored in the CPU core, which has two separate inputs: `SetInterruptRequestLevel`
+for the external pins (level, never auto-clears) and `RaiseInternalInterrupt` for on-chip
+peripherals like the SCI and DMAC (one-shot, auto-clears when taken, and carries the peripheral's
+own vector rather than a level-derived one). Higher level wins, matching PicoDrive's
+`pending_irl > pending_int_irq`.
+
+An earlier revision instead had the CPU keep a *single* pending `(level, vector)` pair, replaced
+only by a higher-priority request — which silently **dropped** a lower-priority source asserted
+while a higher one was pending, rather than leaving it asserted underneath. That became reachable
+as soon as VRES (level 14) started being raised at all.
 
 `Sh2IrqMask` is the SH-2's own view of **adapter-block offset 1**, and this is the subsystem's
 sharpest trap: the *same byte offset* means `nRES`/`ADEN` when the **68000** writes it (`$A15101`)
@@ -771,15 +795,22 @@ down per scanline rather than with PicoDrive's cycle-precise event scheduler —
 source calls its HINT handling "rather rough... useless in practice" (`32x.c:350`). PWM's counter
 is shared across both channels, decremented once per consumed sample period.
 
-**Known gap — single-slot pending model.** `Sh2.RaiseInterrupt` records one pending
-(level, vector) pair and keeps it only if the new request outranks it, whereas PicoDrive tracks
-`sh2irqi` as a *bitmask* of simultaneously-pending sources. A lower-priority request arriving while
-a higher one is pending is therefore **dropped here rather than deferred**. VRES is what makes this
-observable, since level 14 outranks everything: a core that never services it would see no further
-32X interrupts. In practice nothing hits this — a real ROM releases the cores via the `nRES` edge,
-which resets them and clears the pending VRES before any other source matters — but it is a real
-divergence, and the reason `Sega32XInterruptTests`/`Sega32XPwmTests` reset both cores in their
-setup helpers rather than testing straight off `Sega32X.Reset()`.
+**Consequence worth knowing when writing 32X test programs**: because the sources are
+level-triggered, a program that unmasks SR without first acknowledging the VRES left asserted by
+the whole-system reset immediately takes a VRES it usually has no handler installed for — and then
+takes it again, forever. Real boot code acknowledges first; so do the hand-assembled SH-2 programs
+in `Sega32XInterruptTests`, via `WriteSh2VResAcknowledge`, with `LDC SR` deliberately last. The
+same reason has the test helpers there and in `Sega32XPwmTests` write offset `0x14` after
+`Sega32X.Reset()` rather than testing straight off it.
+
+This is also a small, real piece of evidence that the model is right: after the change, Pitfall's
+32X setup completes one frame later than before, because its boot code now genuinely services and
+acknowledges the power-on VRES first. A ROM that didn't acknowledge would have hung instead.
+
+**Still simplified**: `nRES`-edge core resets re-drive the pins from `Sh2IrqPending` rather than
+modelling the reset as an independent input, and interrupt latency is instruction-granular (no
+cycle-accurate delivery timing) — the same later-refinement stance every other 32X subsystem here
+takes where PicoDrive itself admits uncertainty.
 
 ---
 

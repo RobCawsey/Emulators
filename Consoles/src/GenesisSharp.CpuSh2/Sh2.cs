@@ -55,12 +55,20 @@ public sealed partial class Sh2
 
     public long TotalCycles { get; private set; }
 
-    /// <summary>0 = no maskable interrupt pending. 1-15 mirrors the SH-2's external IRL
-    /// priority levels, compared against SR's I3-I0 mask — see
-    /// <see cref="RaiseInterrupt"/>.</summary>
-    public int PendingInterruptLevel { get; private set; }
+    /// <summary>The level currently asserted on the SH-2's external interrupt-request (IRL) pins:
+    /// 0 = nothing asserted, 1-15 compared against SR's I3-I0 mask. This is a <em>level</em>, not
+    /// a queue — see <see cref="SetInterruptRequestLevel"/> for why servicing deliberately does
+    /// not clear it.</summary>
+    public int InterruptRequestLevel { get; private set; }
 
-    private int _pendingVectorNumber;
+    private int _interruptRequestVector;
+
+    /// <summary>0 = none pending. The on-chip peripherals' own interrupt request (SCI, DMAC,
+    /// timers) — separate from <see cref="InterruptRequestLevel"/> because it behaves differently:
+    /// see <see cref="RaiseInternalInterrupt"/>.</summary>
+    public int InternalInterruptLevel { get; private set; }
+
+    private int _internalInterruptVector;
 
     /// <summary>One-shot NMI latch — see <see cref="RaiseNonMaskableInterrupt"/>'s doc comment
     /// for why this is a best-effort stub, not a confirmed-against-PicoDrive fact the way the
@@ -96,8 +104,10 @@ public sealed partial class Sh2
         MACH = 0;
         MACL = 0;
         TotalCycles = 0;
-        PendingInterruptLevel = 0;
-        _pendingVectorNumber = 0;
+        InterruptRequestLevel = 0;
+        _interruptRequestVector = 0;
+        InternalInterruptLevel = 0;
+        _internalInterruptVector = 0;
         NmiPending = false;
         _inDelaySlot = false;
     }
