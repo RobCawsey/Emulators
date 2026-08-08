@@ -58,6 +58,17 @@ public sealed partial class GenesisConsole : Cpu68000.IBus, CpuZ80.IBus
 
     private int _cpuCycleDebt;
     private int _z80CycleDebt;
+
+    /// <summary>SH-2:68000 clock ratio: textbook ~3x, the same approximation already decided
+    /// during this project's 32X planning (not independently re-derived here) — see
+    /// ARCHITECTURE.md §4a. Applied per-68000-instruction (see <see cref="RunScanline"/>'s own
+    /// remarks on why this is no longer a single per-scanline lump sum) rather than as a fixed
+    /// <c>CyclesPerScanlineM68000 * 3</c> total, though the two are equivalent in aggregate.</summary>
+    private const int Sh2ToM68kClockRatio = 3;
+
+    private int _msh2CycleDebt;
+    private int _ssh2CycleDebt;
+
     private double _audioSampleDebt;
 
     // Produced by RunScanline (the emulation thread), drained by a frontend's audio callback
@@ -96,11 +107,23 @@ public sealed partial class GenesisConsole : Cpu68000.IBus, CpuZ80.IBus
     private readonly byte[] _tmssRegister = new byte[4];
 
     /// <summary>Bit 7: 0 = domestic (Japan), 1 = overseas. Bit 6: 0 = NTSC, 1 = PAL. Bit 5:
-    /// 0 = expansion (Mega CD) port present, 1 = not present. Bits 0-3: hardware revision.
-    /// This is the least-confidently-recalled constant in the whole emulator — sources
-    /// disagree on bits 5-7's exact polarity. Defaults to overseas/NTSC/no-expansion/rev-0, a
-    /// plain North American Genesis that no real game inspects closely.</summary>
-    private const byte VersionRegisterValue = 0xA0;
+    /// 0 = expansion (Mega CD) port present, 1 = not present. Bits 0-3: hardware revision. Bit
+    /// 6's polarity is confirmed correct at 0 = NTSC: it matches genesis-plus-gx's own
+    /// <c>REGION_USA</c>-derived value independently, and a real 32X title's live boot code
+    /// (Pitfall: The Mayan Adventure) confirms it two different ways once <see
+    /// cref="Sega32X.Vdp.cs"/>'s own <c>NPalBit</c> default is also correct (see that constant's
+    /// remarks) — the same title's region/hardware sanity check and a second, separate 2-bit
+    /// region-code dispatch (bits 6-7 read as a region value: 2 = USA) both pass cleanly with
+    /// this value and the corrected <c>nPAL</c> default together. A previous revision of this
+    /// value flipped bit 6 to 1 based on the first check alone, before the <c>nPAL</c> polarity
+    /// bug (the real root cause) was found — that flip happened to satisfy the first check but
+    /// broke the second, sending this exact title into its own "NTSC GENESIS SYSTEMS" region-
+    /// mismatch warning screen followed by a deliberate halt, which is what a real region
+    /// mismatch does on real hardware, not a workaround. Reverted once both checks were traced
+    /// live and shown to require the *original* polarity once the real bug was fixed. A settable
+    /// property (not a const) so <see cref="GenesisSharp.Frontend.DebugForm"/> can still override
+    /// this live for further experimentation without a rebuild.</summary>
+    public byte VersionRegisterValue { get; set; } = 0xA0;
 
     public Cartridge Cartridge { get; }
     public M68000 Cpu { get; }
@@ -116,6 +139,12 @@ public sealed partial class GenesisConsole : Cpu68000.IBus, CpuZ80.IBus
     /// "a 3-button pad is plugged in, nothing pressed" default.</summary>
     public ControllerPort ExtPort { get; } = new();
 
+    /// <summary>Phase 1 of an in-progress Sega 32X extension (see ARCHITECTURE.md §4a) — always
+    /// constructed, like every other chip here, but inert for any non-32X ROM: its two SH-2s are
+    /// never stepped (see <see cref="RunScanline"/>) unless a ROM's own boot code sets the ADEN
+    /// bit itself.</summary>
+    public Sega32X Sega32X { get; }
+
     public GenesisConsole(Cartridge cartridge)
     {
         Cartridge = cartridge;
@@ -125,6 +154,9 @@ public sealed partial class GenesisConsole : Cpu68000.IBus, CpuZ80.IBus
         Vdp.VerticalBlankStarted += RequestVerticalBlankInterrupt;
         Vdp.HorizontalInterruptRequested += RequestHorizontalInterrupt;
         ExtPort.Pad.Connected = false;
+        Sega32X = new Sega32X(cartridge);
+        Vdp.External32XPixelBlend = Sega32X.TryGetPixel;
+        Vdp.EnteredVBlank += Sega32X.OnVerticalBlankStarted;
     }
 
     public void Reset()
@@ -137,9 +169,12 @@ public sealed partial class GenesisConsole : Cpu68000.IBus, CpuZ80.IBus
         ControllerPort1.Reset();
         ControllerPort2.Reset();
         ExtPort.Reset();
+        Sega32X.Reset();
         Array.Clear(_tmssRegister);
         _cpuCycleDebt = 0;
         _z80CycleDebt = 0;
+        _msh2CycleDebt = 0;
+        _ssh2CycleDebt = 0;
         _audioSampleDebt = 0;
         _audioBuffer.Clear();
         AudioUnderrunCount = 0;
@@ -175,6 +210,12 @@ public sealed partial class GenesisConsole : Cpu68000.IBus, CpuZ80.IBus
     /// scanlines that takes, exactly like the real 68000 being frozen by VDP bus contention.</summary>
     private void RunScanline()
     {
+        // Drives the 32X VDP's VBLK/PEN status bits and applies any deferred frame-buffer bank
+        // swap -- run before this scanline's render so a swap landing exactly on the
+        // blanking-to-active edge is already committed by the time the first active line reads
+        // from the (possibly just-swapped) display bank.
+        Sega32X.UpdateBlankingState(Vdp.CurrentScanline >= Vdp.ScreenHeight);
+
         if (Vdp.CurrentScanline < Vdp.ScreenHeight)
         {
             Vdp.RenderScanline(Vdp.CurrentScanline);
@@ -185,8 +226,38 @@ public sealed partial class GenesisConsole : Cpu68000.IBus, CpuZ80.IBus
         {
             Vdp.SetScanlineProgress(1.0 - (double)_cpuCycleDebt / CyclesPerScanlineM68000);
             Vdp.AdvanceExternalSlotClock(Cpu.TotalCycles);
-            _cpuCycleDebt -= Cpu.Step();
+            int cpuCycles = Cpu.Step();
+            _cpuCycleDebt -= cpuCycles;
             _cpuCycleDebt -= Vdp.ConsumeStallCycles();
+
+            // Interleaved at 68000-instruction granularity rather than checked once at the end
+            // of the scanline (this loop's own -- since fixed -- shape through Phase 5): real
+            // 32X hardware runs the 68000 and both SH-2s genuinely concurrently, so a 68000
+            // boot-code loop that toggles nRES/ADEN faster than one scanline's worth of 68000
+            // cycles (confirmed happening in a real, commercial 32X title -- see ARCHITECTURE.md
+            // §4a.5) must still see the SH-2s get *some* cycles between each of its own checks.
+            // Checking Sega32X.Sh2sReleased only once per scanline let a fast-enough retry loop
+            // permanently starve the SH-2s -- by the time this method got around to stepping
+            // them, the 68000 had already toggled the release condition back off within that
+            // same scanline, every single scanline, forever. Total SH-2 cycles accrued per
+            // scanline is unchanged (summing cpuCycles*Sh2ToM68kClockRatio across every
+            // iteration this scanline still totals CyclesPerScanlineM68000*Sh2ToM68kClockRatio,
+            // the same fixed ~3x ratio as before) -- only the granularity at which that budget
+            // is handed out changed.
+            if (Sega32X.Sh2sReleased)
+            {
+                _msh2CycleDebt += cpuCycles * Sh2ToM68kClockRatio;
+                while (_msh2CycleDebt > 0)
+                {
+                    _msh2CycleDebt -= Sega32X.MasterSh2.Step();
+                }
+
+                _ssh2CycleDebt += cpuCycles * Sh2ToM68kClockRatio;
+                while (_ssh2CycleDebt > 0)
+                {
+                    _ssh2CycleDebt -= Sega32X.SlaveSh2.Step();
+                }
+            }
         }
 
         // Held or bus-requested: the Z80's clock is genuinely stopped on real hardware, so it
@@ -228,24 +299,34 @@ public sealed partial class GenesisConsole : Cpu68000.IBus, CpuZ80.IBus
             _audioBuffer.Enqueue(GenerateAudioSample());
         }
 
+        // 32X HINT -- ticked here (alongside Vdp.AdvanceScanline, not up at the top next to
+        // UpdateBlankingState) since it shares VINT's own timing model: raised at this
+        // end-of-scanline edge, only actually serviced on the SH-2's *next* Step() call, at the
+        // start of the following scanline's CPU loop. See Sega32X.AdvanceHIntCountdown's remarks.
+        Sega32X.AdvanceHIntCountdown(Vdp.CurrentScanline < Vdp.ScreenHeight);
+
         Vdp.AdvanceScanline();
     }
 
     /// <summary>Builds one stereo sample from the chips' *current* register state, mixing the
-    /// PSG (mono, duplicated to both channels) with the YM2612 (natively stereo via its own L/R
-    /// enable bits). This is the low-level building block <see cref="RunScanline"/> calls at
-    /// cycle-accurate intervals to fill <see cref="TryDequeueBufferedAudioSample"/>'s queue —
-    /// a real frontend should pull from that queue, not call this directly, since doing so
-    /// would advance the chips' internal oscillator phase a second, unsynchronized time. Public
-    /// (and self-contained: no CPU stepping needed) so it's still directly usable for isolated
-    /// chip-synthesis testing without going through a whole frame.</summary>
+    /// PSG (mono, duplicated to both channels), the YM2612 (natively stereo via its own L/R
+    /// enable bits), and the 32X's PWM chip (see <see cref="Sega32X.GeneratePwmSample"/> —
+    /// silent/zero for any non-32X ROM, since <c>xMd</c>'s power-on default is one of PWM's own
+    /// confirmed-invalid routing values). This is the low-level building block <see
+    /// cref="RunScanline"/> calls at cycle-accurate intervals to fill
+    /// <see cref="TryDequeueBufferedAudioSample"/>'s queue — a real frontend should pull from
+    /// that queue, not call this directly, since doing so would advance the chips' internal
+    /// oscillator phase a second, unsynchronized time. Public (and self-contained: no CPU
+    /// stepping needed) so it's still directly usable for isolated chip-synthesis testing without
+    /// going through a whole frame.</summary>
     public (short Left, short Right) GenerateAudioSample()
     {
         short psgSample = Psg.GenerateSample(AudioSampleRate);
         (short ymLeft, short ymRight) = Ym2612.GenerateSample(AudioSampleRate);
+        (short pwmLeft, short pwmRight) = Sega32X.GeneratePwmSample(1.0 / AudioSampleRate);
 
-        int rawLeft = psgSample + ymLeft;
-        int rawRight = psgSample + ymRight;
+        int rawLeft = psgSample + ymLeft + pwmLeft;
+        int rawRight = psgSample + ymRight + pwmRight;
         if (rawLeft is < short.MinValue or > short.MaxValue || rawRight is < short.MinValue or > short.MaxValue)
         {
             AudioClipCount++;
@@ -375,6 +456,97 @@ public sealed partial class GenesisConsole : Cpu68000.IBus, CpuZ80.IBus
     {
         offset = address - 0xA14000;
         return address >= 0xA14000 && address <= 0xA14003;
+    }
+
+    /// <summary>The 32X adapter/control register block ($A15100-$A1513F) — confirmed against
+    /// PicoDrive's own author comment (<c>reference/PicoDrive/picodrive/pico/32x/memory.c:9-25</c>)
+    /// and <c>Pico32x.regs[0x20]</c> (<c>pico_int.h:644</c>). See <see cref="Sega32X"/> and
+    /// ARCHITECTURE.md §4a for what's actually implemented behind it this phase.</summary>
+    private static bool Is32XRegister(uint address, out uint offset)
+    {
+        offset = address - 0xA15100;
+        return address >= 0xA15100 && address <= 0xA1513F;
+    }
+
+    /// <summary>"MARS" — the 32X hardware-presence probe real 32X boot code reads before
+    /// switching into 32X mode (confirmed against PicoDrive's <c>memory.c:1021-1024</c> etc.).
+    /// Always live, matching how PicoDrive's own pre-ADEN register handling is unconditional too
+    /// (see Sega32X's known-gaps remarks) — no cartridge-header-based 32X detection is added.</summary>
+    private static readonly byte[] MarsId = "MARS"u8.ToArray();
+
+    private static bool IsMarsIdRegister(uint address, out uint offset)
+    {
+        offset = address - 0xA130EC;
+        return address >= 0xA130EC && address <= 0xA130EF;
+    }
+
+    /// <summary>Phase 3 (see ARCHITECTURE.md §4a.1) — the 32X VDP's display-mode/PRI/SFT/fill/FBCR
+    /// register block ($A15180-$A1519F), confirmed against <c>Pico32x.vdp_regs[0x10]</c>
+    /// (<c>pico_int.h:645</c>).</summary>
+    private static bool Is32XVdpRegister(uint address, out uint offset)
+    {
+        offset = address - 0xA15180;
+        return address >= 0xA15180 && address <= 0xA1519F;
+    }
+
+    /// <summary>The 32X's own 256-entry palette ($A15200-$A153FF), confirmed against
+    /// <c>Pico32xMem.pal[0x100]</c> (<c>pico_int.h:693</c>).</summary>
+    private static bool Is32XPaletteRegister(uint address, out uint offset)
+    {
+        offset = address - 0xA15200;
+        return address >= 0xA15200 && address <= 0xA153FF;
+    }
+
+    /// <summary>The 32X frame buffer's plain read/write window ($840000-$85FFFF) — reads and
+    /// writes go straight to whichever bank the SH-2s currently write to (see
+    /// <see cref="Sega32X"/>'s own remarks on display-vs-write bank selection).</summary>
+    private static bool Is32XFrameBufferWindow(uint address, out uint offset)
+    {
+        offset = address - 0x840000;
+        return address >= 0x840000 && address <= 0x85FFFF;
+    }
+
+    /// <summary>The frame buffer's "overwrite" mirror ($860000-$87FFFF) — the same underlying
+    /// bank as <see cref="Is32XFrameBufferWindow"/>, but word writes mask out zero bytes/words so
+    /// the existing value shows through underneath (confirmed in Phase 2's own research pass).</summary>
+    private static bool Is32XFrameBufferOverwriteWindow(uint address, out uint offset)
+    {
+        offset = address - 0x860000;
+        return address >= 0x860000 && address <= 0x87FFFF;
+    }
+
+    /// <summary>The 68000-side ROM banking window ($900000-$9FFFFF) — real 32X hardware maps a
+    /// selectable 1MB slice of the SAME cartridge ROM already visible at $000000-$3FFFFF here, bank
+    /// number chosen by the adapter register block's byte offset 5 (confirmed against PicoDrive's
+    /// <c>bank_switch_rom_68k</c>/its write-dispatch <c>case 0x05: // bank</c>,
+    /// <c>reference/PicoDrive/picodrive/pico/32x/memory.c:439-444,1449-1484</c>). Real 32X boot
+    /// code reads through here to reach ROM content beyond whatever fixed portion the base
+    /// cartridge window exposes — Phase 2 explicitly deferred this (its own synthetic
+    /// bus-integration test never needed it), which is exactly what left real, unmodified 32X ROMs
+    /// unable to boot: their own init code jumping in here read open bus (an all-<c>$FFFF</c>
+    /// illegal opcode) and got stuck. See <see cref="Sega32X.ReadRomBankWindowByte"/> for the
+    /// actual bank computation — this predicate is bus-decode only.</summary>
+    private static bool Is32XRomBankWindow(uint address, out uint offset)
+    {
+        offset = address - 0x900000;
+        return address >= 0x900000 && address <= 0x9FFFFF;
+    }
+
+    /// <summary>The 68000-side unbanked ROM mirror ($880000-$8FFFFF) — always shows cartridge ROM
+    /// starting from offset 0 (up to 512KB), completely ignoring the bank-select register that
+    /// <see cref="Is32XRomBankWindow"/> honors. A separate, real gap from that banked window: real
+    /// 32X boot code uses this specifically because it's a *stable* way to reach a fixed ROM
+    /// offset regardless of whatever bank the $900000 window currently has selected. Confirmed
+    /// against PicoDrive's own <c>PicoMemSetup32x</c> ("32X ROM (unbanked...)",
+    /// <c>reference/PicoDrive/picodrive/pico/32x/memory.c:2367-2372</c>), which maps
+    /// <c>Pico.rom</c> directly here with no bank offset at all. Found via the same real-ROM
+    /// investigation as the banked window: a real title's boot code jumps through here right
+    /// after releasing the SH-2s, and with this unmapped, that jump read open bus and the whole
+    /// boot sequence looped back to the start.</summary>
+    private static bool Is32XRomMirrorWindow(uint address, out uint offset)
+    {
+        offset = address - 0x880000;
+        return address >= 0x880000 && address <= 0x8FFFFF;
     }
 
     /// <summary>What every Cpu68000.IBus read method falls back to once none of the specific
@@ -528,6 +700,41 @@ public sealed partial class GenesisConsole : Cpu68000.IBus, CpuZ80.IBus
             return _tmssRegister[tmssOffset];
         }
 
+        if (Is32XRegister(address, out uint reg32XOffset))
+        {
+            return Sega32X.ReadControlByteFor68k(reg32XOffset);
+        }
+
+        if (IsMarsIdRegister(address, out uint marsOffset))
+        {
+            return MarsId[marsOffset];
+        }
+
+        if (Is32XVdpRegister(address, out uint vdp32XOffset))
+        {
+            return Sega32X.ReadVdpControlByteFor68k(vdp32XOffset);
+        }
+
+        if (Is32XPaletteRegister(address, out uint pal32XOffset))
+        {
+            return Sega32X.ReadPaletteByteFor68k(pal32XOffset);
+        }
+
+        if (Is32XFrameBufferWindow(address, out uint fbOffset) || Is32XFrameBufferOverwriteWindow(address, out fbOffset))
+        {
+            return Sega32X.ReadFrameBufferByteFor68k(fbOffset);
+        }
+
+        if (Is32XRomBankWindow(address, out uint bankOffset))
+        {
+            return Sega32X.ReadRomBankWindowByte(bankOffset);
+        }
+
+        if (Is32XRomMirrorWindow(address, out uint mirrorOffset))
+        {
+            return Sega32X.ReadRomMirrorWindowByte(mirrorOffset);
+        }
+
         if (address < 0x400000 && Cartridge.Rom.Length > 0)
         {
             return Cartridge.Rom[address % (uint)Cartridge.Rom.Length];
@@ -586,6 +793,41 @@ public sealed partial class GenesisConsole : Cpu68000.IBus, CpuZ80.IBus
         if (IsTmssRegister(address, out uint tmssOffset))
         {
             return (ushort)((_tmssRegister[tmssOffset] << 8) | _tmssRegister[(tmssOffset + 1) & 3]);
+        }
+
+        if (Is32XRegister(address, out uint reg32XOffset))
+        {
+            return (ushort)((Sega32X.ReadControlByteFor68k(reg32XOffset) << 8) | Sega32X.ReadControlByteFor68k(reg32XOffset + 1));
+        }
+
+        if (IsMarsIdRegister(address, out uint marsOffset))
+        {
+            return (ushort)((MarsId[marsOffset] << 8) | MarsId[(marsOffset + 1) % 4]);
+        }
+
+        if (Is32XVdpRegister(address, out uint vdp32XOffset))
+        {
+            return (ushort)((Sega32X.ReadVdpControlByteFor68k(vdp32XOffset) << 8) | Sega32X.ReadVdpControlByteFor68k(vdp32XOffset + 1));
+        }
+
+        if (Is32XPaletteRegister(address, out uint pal32XOffset))
+        {
+            return (ushort)((Sega32X.ReadPaletteByteFor68k(pal32XOffset) << 8) | Sega32X.ReadPaletteByteFor68k(pal32XOffset + 1));
+        }
+
+        if (Is32XFrameBufferWindow(address, out uint fbOffset) || Is32XFrameBufferOverwriteWindow(address, out fbOffset))
+        {
+            return Sega32X.ReadFrameBufferWordFor68k(fbOffset);
+        }
+
+        if (Is32XRomBankWindow(address, out uint bankOffset))
+        {
+            return (ushort)((Sega32X.ReadRomBankWindowByte(bankOffset) << 8) | Sega32X.ReadRomBankWindowByte(bankOffset + 1));
+        }
+
+        if (Is32XRomMirrorWindow(address, out uint mirrorOffset))
+        {
+            return (ushort)((Sega32X.ReadRomMirrorWindowByte(mirrorOffset) << 8) | Sega32X.ReadRomMirrorWindowByte(mirrorOffset + 1));
         }
 
         if (address < 0x400000 && Cartridge.Rom.Length > 0)
@@ -651,6 +893,53 @@ public sealed partial class GenesisConsole : Cpu68000.IBus, CpuZ80.IBus
             return;
         }
 
+        if (Is32XRegister(address, out uint reg32XOffset))
+        {
+            Sega32X.WriteControlByteFrom68k(reg32XOffset, value);
+            return;
+        }
+
+        if (IsMarsIdRegister(address, out _))
+        {
+            return; // read-only hardware-presence probe
+        }
+
+        if (Is32XVdpRegister(address, out uint vdp32XOffset))
+        {
+            Sega32X.WriteVdpControlByteFrom68k(vdp32XOffset, value);
+            return;
+        }
+
+        if (Is32XPaletteRegister(address, out uint pal32XOffset))
+        {
+            Sega32X.WritePaletteByteFrom68k(pal32XOffset, value);
+            return;
+        }
+
+        if (Is32XFrameBufferWindow(address, out uint fbOffset))
+        {
+            Sega32X.WriteFrameBufferByteFrom68k(fbOffset, value);
+            return;
+        }
+
+        if (Is32XFrameBufferOverwriteWindow(address, out fbOffset))
+        {
+            Sega32X.WriteFrameBufferByteFrom68k(fbOffset, value);
+            return;
+        }
+
+        // Read-only, matching plain cartridge ROM's own write-drop convention (see ReadByte's
+        // remarks) -- real 32X boot code never writes through this window, only reads.
+        if (Is32XRomBankWindow(address, out _))
+        {
+            return;
+        }
+
+        if (Is32XRomMirrorWindow(address, out _))
+        {
+            return;
+        }
+
         // See ReadByte's remarks -- work RAM mirrors across all of $E00000-$FFFFFF.
         if (address >= 0xE00000)
         {
@@ -708,6 +997,54 @@ public sealed partial class GenesisConsole : Cpu68000.IBus, CpuZ80.IBus
         {
             _tmssRegister[tmssOffset] = (byte)(value >> 8);
             _tmssRegister[(tmssOffset + 1) & 3] = (byte)value;
+            return;
+        }
+
+        if (Is32XRegister(address, out uint reg32XOffset))
+        {
+            Sega32X.WriteControlByteFrom68k(reg32XOffset, (byte)(value >> 8));
+            Sega32X.WriteControlByteFrom68k(reg32XOffset + 1, (byte)value);
+            return;
+        }
+
+        if (IsMarsIdRegister(address, out _))
+        {
+            return; // read-only hardware-presence probe
+        }
+
+        if (Is32XVdpRegister(address, out uint vdp32XOffset))
+        {
+            Sega32X.WriteVdpControlByteFrom68k(vdp32XOffset, (byte)(value >> 8));
+            Sega32X.WriteVdpControlByteFrom68k(vdp32XOffset + 1, (byte)value);
+            return;
+        }
+
+        if (Is32XPaletteRegister(address, out uint pal32XOffset))
+        {
+            Sega32X.WritePaletteByteFrom68k(pal32XOffset, (byte)(value >> 8));
+            Sega32X.WritePaletteByteFrom68k(pal32XOffset + 1, (byte)value);
+            return;
+        }
+
+        if (Is32XFrameBufferWindow(address, out uint fbOffset))
+        {
+            Sega32X.WriteFrameBufferWordFrom68k(fbOffset, overwrite: false, value);
+            return;
+        }
+
+        if (Is32XFrameBufferOverwriteWindow(address, out fbOffset))
+        {
+            Sega32X.WriteFrameBufferWordFrom68k(fbOffset, overwrite: true, value);
+            return;
+        }
+
+        if (Is32XRomBankWindow(address, out _))
+        {
+            return;
+        }
+
+        if (Is32XRomMirrorWindow(address, out _))
+        {
             return;
         }
 

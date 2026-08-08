@@ -1,0 +1,389 @@
+using GenesisSharp.Core;
+
+namespace GenesisSharp.Tests;
+
+/// <summary>Phase 3 of the in-progress 32X extension (see ARCHITECTURE.md §4a.1): the frame
+/// buffer/palette/display-mode register block and the compositing rule wired into
+/// <see cref="Vdp.External32XPixelBlend"/>. Tests drive <see cref="Sega32X"/> directly via its
+/// public surface (arrays, byte-level register methods, <see cref="Sega32X.TryGetPixel"/>) rather
+/// than through a full <see cref="GenesisConsole"/>, mirroring how VdpTests.cs exercises
+/// <see cref="Vdp"/> standalone.</summary>
+public class Sega32XVdpTests
+{
+    private static Sega32X CreateSega32X()
+    {
+        var sega32X = new Sega32X(Cartridge.LoadFromBin(new byte[0x10000]));
+        sega32X.Reset();
+        return sega32X;
+    }
+
+    /// <summary>Writes a packed-pixel-mode frame ready to render one pixel: line table entry for
+    /// <paramref name="line"/> points at word-offset 0, and the byte at that offset holds
+    /// <paramref name="paletteIndex"/>.</summary>
+    /// <summary>Where these tests park their pixel data: word offset 0x100, i.e. byte offset
+    /// 0x200 -- the first byte past the 512-byte line table, so pixel data can never collide with
+    /// a table entry. Worth being deliberate about, since scanline <c>y</c> reads table entry
+    /// <c>y</c> (no offset -- see <c>Sega32X.Vdp.cs</c>'s <c>TryGetPixel</c> remarks), which puts
+    /// entry 0 and byte offset 0 at the same address.</summary>
+    private const int PixelDataWordOffset = 0x100;
+
+    private static void SetUpPackedPixelLine(Sega32X sega32X, int line, byte paletteIndex)
+    {
+        sega32X.WriteVdpControlByteFrom68k(0x01, 0x01); // Mx = 1 (Packed Pixel)
+        byte[] bank = sega32X.FrameBuffer[0]; // default DisplayBankIndex is 0 (FS=0 after reset)
+        bank[line * 2] = PixelDataWordOffset >> 8;
+        bank[line * 2 + 1] = PixelDataWordOffset & 0xFF;
+        bank[PixelDataWordOffset * 2] = paletteIndex;
+    }
+
+    [Fact]
+    public void TryGetPixel_DisplayModeOff_AlwaysReturnsFalse()
+    {
+        var sega32X = CreateSega32X(); // Mx = 0 is the power-on default
+
+        bool result = sega32X.TryGetPixel(0, 0, isGenesisBackdrop: true, isH32: false, out _, out _, out _);
+
+        Assert.False(result);
+    }
+
+    /// <summary>Sets up one Run Length scanline from (paletteIndex, runLength) pairs. Each pair
+    /// becomes one frame-buffer word: low byte = palette index, high byte = run length - 1
+    /// (confirmed against <c>do_line_rl</c>, draw.c:107-121).</summary>
+    private static void SetUpRunLengthLine(Sega32X sega32X, int line, params (byte PaletteIndex, int RunLength)[] runs)
+    {
+        sega32X.WriteVdpControlByteFrom68k(0x01, 0x03); // Mx = 3 (Run Length)
+        byte[] bank = sega32X.FrameBuffer[0];
+        bank[line * 2] = PixelDataWordOffset >> 8;
+        bank[line * 2 + 1] = PixelDataWordOffset & 0xFF;
+
+        int at = PixelDataWordOffset * 2;
+        foreach ((byte paletteIndex, int runLength) in runs)
+        {
+            bank[at] = (byte)(runLength - 1); // high byte
+            bank[at + 1] = paletteIndex;      // low byte
+            at += 2;
+        }
+    }
+
+    [Fact]
+    public void TryGetPixel_RunLength_ExpandsEachWordIntoItsRunOfPixels()
+    {
+        var sega32X = CreateSega32X();
+        SetUpRunLengthLine(sega32X, line: 0, (5, 3), (6, 2));
+        sega32X.Palette[5] = 0x8421; // priority set, so both show against a non-backdrop Genesis pixel
+        sega32X.Palette[6] = 0x8842;
+
+        // Run 1 covers x=0..2, run 2 covers x=3..4.
+        Assert.True(sega32X.TryGetPixel(0, 0, isGenesisBackdrop: false, isH32: false, out _, out _, out byte b0));
+        Assert.True(sega32X.TryGetPixel(2, 0, isGenesisBackdrop: false, isH32: false, out _, out _, out byte b2));
+        Assert.True(sega32X.TryGetPixel(3, 0, isGenesisBackdrop: false, isH32: false, out _, out _, out byte b3));
+        Assert.Equal(b0, b2); // same run -> identical colour
+        Assert.NotEqual(b0, b3); // next run -> a different palette entry
+    }
+
+    /// <summary>A run that would overshoot the 320-pixel line is truncated rather than wrapping
+    /// into the next one — PicoDrive's own <c>i &gt; 0</c> guard in <c>do_line_rl</c>'s inner
+    /// loop.</summary>
+    [Fact]
+    public void TryGetPixel_RunLength_TruncatesARunThatOvershootsTheLine()
+    {
+        var sega32X = CreateSega32X();
+        SetUpRunLengthLine(sega32X, line: 0, (7, 256), (7, 256)); // 512 pixels of data for a 320-pixel line
+        sega32X.Palette[7] = 0x8421;
+
+        Assert.True(sega32X.TryGetPixel(319, 0, isGenesisBackdrop: false, isH32: false, out _, out _, out _));
+        // Nothing past the line's own width is addressable, so the overshoot has nowhere to land.
+        Assert.False(sega32X.TryGetPixel(320, 0, isGenesisBackdrop: false, isH32: false, out _, out _, out _));
+    }
+
+    /// <summary>Run Length data that runs out before the line is full pads with palette index 0
+    /// rather than reading past the bank or throwing.</summary>
+    [Fact]
+    public void TryGetPixel_RunLength_PadsWithIndexZeroWhenTheDataRunsOutEarly()
+    {
+        var sega32X = CreateSega32X();
+        SetUpRunLengthLine(sega32X, line: 0, (9, 2)); // only 2 pixels of a 320-pixel line
+        sega32X.Palette[9] = 0x8421; // priority set
+        sega32X.Palette[0] = 0x0421; // priority CLEAR -- the pad colour must lose to a Genesis pixel
+
+        Assert.True(sega32X.TryGetPixel(1, 0, isGenesisBackdrop: false, isH32: false, out _, out _, out _));
+        Assert.False(sega32X.TryGetPixel(2, 0, isGenesisBackdrop: false, isH32: false, out _, out _, out _));
+    }
+
+    /// <summary>The decoded-line cache must not survive a bank swap. FS going 0→1→0 returns to a
+    /// bank whose contents were rewritten in between (while it was the write bank), which a cache
+    /// keyed on bank index alone would miss.</summary>
+    [Fact]
+    public void TryGetPixel_RunLength_DecodedLineIsInvalidatedByABankSwap()
+    {
+        var sega32X = CreateSega32X();
+        SetUpRunLengthLine(sega32X, line: 0, (5, 320));
+        sega32X.Palette[5] = 0x8421;
+        sega32X.Palette[0] = 0x0421; // priority clear
+        Assert.True(sega32X.TryGetPixel(0, 0, isGenesisBackdrop: false, isH32: false, out _, out _, out _));
+
+        // Swap to bank 1, which was never populated -- its line table is all zeros.
+        sega32X.WriteVdpControlByteFrom68k(0x0B, 0x01);
+
+        Assert.False(sega32X.TryGetPixel(0, 0, isGenesisBackdrop: false, isH32: false, out _, out _, out _));
+    }
+
+    [Fact]
+    public void TryGetPixel_PackedPixel_GenesisBackdrop_ShowsUnconditionallyRegardlessOfPriorityBit()
+    {
+        var sega32X = CreateSega32X();
+        SetUpPackedPixelLine(sega32X, line: 0, paletteIndex: 5); // line-table index = scanline y (0)
+        sega32X.Palette[5] = 0x0421; // priority bit (0x8000) clear
+
+        bool result = sega32X.TryGetPixel(0, 0, isGenesisBackdrop: true, isH32: false, out byte r, out byte g, out byte b);
+
+        Assert.True(result);
+        Assert.NotEqual((0, 0, 0), (r, g, b)); // decoded from the palette entry, not left at zero
+    }
+
+    [Fact]
+    public void TryGetPixel_PackedPixel_NonBackdropWithoutPriorityBit_GenesisPixelWins()
+    {
+        var sega32X = CreateSega32X();
+        SetUpPackedPixelLine(sega32X, line: 0, paletteIndex: 5);
+        sega32X.Palette[5] = 0x0421; // priority bit clear
+
+        bool result = sega32X.TryGetPixel(0, 0, isGenesisBackdrop: false, isH32: false, out _, out _, out _);
+
+        Assert.False(result);
+    }
+
+    [Fact]
+    public void TryGetPixel_PackedPixel_NonBackdropWithPriorityBit_32XWins()
+    {
+        var sega32X = CreateSega32X();
+        SetUpPackedPixelLine(sega32X, line: 0, paletteIndex: 5);
+        sega32X.Palette[5] = 0x8421; // priority bit set
+
+        bool result = sega32X.TryGetPixel(0, 0, isGenesisBackdrop: false, isH32: false, out _, out _, out _);
+
+        Assert.True(result);
+    }
+
+    [Fact]
+    public void TryGetPixel_PriRegister_InvertsThePrioritySense()
+    {
+        var sega32X = CreateSega32X();
+        SetUpPackedPixelLine(sega32X, line: 0, paletteIndex: 5);
+        sega32X.Palette[5] = 0x0421; // priority bit clear -- would normally lose to a non-backdrop Genesis pixel
+        sega32X.WriteVdpControlByteFrom68k(0x01, (byte)(0x01 | 0x80)); // Mx=1, PRI bit also set
+
+        bool result = sega32X.TryGetPixel(0, 0, isGenesisBackdrop: false, isH32: false, out _, out _, out _);
+
+        Assert.True(result); // PRI flipped the clear bit to "set", so the 32X pixel now wins
+    }
+
+    [Fact]
+    public void TryGetPixel_DirectColor_DecodesRawWordDirectlyNoPaletteInvolved()
+    {
+        var sega32X = CreateSega32X();
+        sega32X.WriteVdpControlByteFrom68k(0x01, 0x02); // Mx = 2 (Direct Color)
+        byte[] bank = sega32X.FrameBuffer[0];
+        bank[0 * 2] = PixelDataWordOffset >> 8;
+        bank[0 * 2 + 1] = PixelDataWordOffset & 0xFF; // scanline 0 reads line-table entry 0
+        bank[PixelDataWordOffset * 2] = 0x84; // high byte: priority bit (0x80) set + top 2 bits of blue channel
+        bank[PixelDataWordOffset * 2 + 1] = 0x21; // low byte: rest of the raw 5:5:5 value
+
+        bool result = sega32X.TryGetPixel(0, 0, isGenesisBackdrop: false, isH32: false, out byte r, out byte g, out byte b);
+
+        Assert.True(result); // priority bit was set in the raw word
+        Assert.NotEqual((0, 0, 0), (r, g, b));
+    }
+
+    [Fact]
+    public void TryGetPixel_H32Mode_OffsetsBySh2AndBlanksTheLeftmostFourColumns()
+    {
+        var sega32X = CreateSega32X();
+        SetUpPackedPixelLine(sega32X, line: 0, paletteIndex: 5);
+        sega32X.Palette[5] = 0x8421; // priority bit set, so it always shows once addressed correctly
+
+        // Genesis x=0..3 have no corresponding 32X pixel in H32 mode (pixelX = x - 4 < 0).
+        Assert.False(sega32X.TryGetPixel(0, 0, isGenesisBackdrop: false, isH32: true, out _, out _, out _));
+        Assert.False(sega32X.TryGetPixel(3, 0, isGenesisBackdrop: false, isH32: true, out _, out _, out _));
+
+        // Genesis x=4 maps to 32X frame-buffer pixel 0, where the palette-index-5 pixel lives.
+        Assert.True(sega32X.TryGetPixel(4, 0, isGenesisBackdrop: false, isH32: true, out _, out _, out _));
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(100)]
+    [InlineData(Vdp.ScreenHeight - 1)] // 223 -- the row a +8 offset pushed off the populated table
+    public void TryGetPixel_ReadsTheLineTableEntryMatchingTheScanlineWithNoOffset(int scanline)
+    {
+        var sega32X = CreateSega32X();
+        SetUpPackedPixelLine(sega32X, line: scanline, paletteIndex: 5);
+        sega32X.Palette[5] = 0x8421; // priority bit set, so it shows whenever it's addressed at all
+
+        // Only entry `scanline` is populated; every other entry is still zero. So this passes
+        // only if TryGetPixel indexes the table by the scanline itself. An earlier revision added
+        // a "V28" +8 here (misreading PicoDrive's `offs`, which is a *destination* centring
+        // offset) -- see Sega32X.Vdp.cs's TryGetPixel remarks for what that cost on a real title.
+        Assert.True(sega32X.TryGetPixel(0, scanline, isGenesisBackdrop: false, isH32: false, out _, out _, out _));
+    }
+
+    [Fact]
+    public void TryGetPixel_ScanlineWithAnUnpopulatedLineTableEntry_DoesNotBorrowAnotherRowsPixels()
+    {
+        var sega32X = CreateSega32X();
+        SetUpPackedPixelLine(sega32X, line: 0, paletteIndex: 5);
+        sega32X.Palette[5] = 0x8421;
+
+        // Scanline 8 has no table entry of its own, so it must not render scanline 0's pixels --
+        // the exact confusion a fixed +8 offset introduced, in reverse.
+        Assert.False(sega32X.TryGetPixel(0, 8, isGenesisBackdrop: false, isH32: false, out _, out _, out _));
+    }
+
+    [Fact]
+    public void UpdateBlankingState_MirrorsVblkAndPenExactlyAsPicoDriveConfirmed()
+    {
+        var sega32X = CreateSega32X();
+        sega32X.WriteVdpControlByteFrom68k(0x01, 0x01); // Mx = 1, so PEN genuinely clears on vblank-end
+
+        sega32X.UpdateBlankingState(false); // first active scanline after reset -- exits the power-on blanking state
+        Assert.Equal(0, sega32X.VdpRegs[5] & 0x8000); // VBLK clear
+        Assert.Equal(0, sega32X.VdpRegs[5] & 0x2000); // PEN clear (Mx != 0)
+
+        sega32X.UpdateBlankingState(true); // vblank starts again
+        Assert.NotEqual(0, sega32X.VdpRegs[5] & 0x8000); // VBLK set
+        Assert.NotEqual(0, sega32X.VdpRegs[5] & 0x2000); // PEN set
+    }
+
+    /// <summary>Confirmed against PicoDrive's own set/clear condition (<c>32x.c:134-137</c>):
+    /// <c>nPAL</c> is genuinely active-low -- SET means NTSC, CLEAR means PAL, opposite of what
+    /// the name reads as without clocking the "n" prefix (same convention as nCART/nRES). Left
+    /// clear by mistake, a real 32X title's own region/hardware sanity check (which reads this
+    /// bit combined with the standard VERSION register) treated a live NTSC run as PAL -- found
+    /// via a live, verified boot-sequence trace, not a guess. GenesisSharp is NTSC/224-line only,
+    /// so this is unconditionally set, with no PAL mode to ever need it cleared.</summary>
+    [Fact]
+    public void Reset_SetsNPalBitSinceGenesisSharpIsNtscOnly()
+    {
+        var sega32X = CreateSega32X();
+
+        Assert.NotEqual(0, sega32X.VdpRegs[0] & 0x8000);
+    }
+
+    /// <summary>Regression coverage for the actual root cause behind a real 32X title's boot
+    /// deadlock: a plain reset-time default for NPalBit isn't enough, because a real 32X title's
+    /// own early-boot register clear (a word write of 0 to this exact register, part of its
+    /// generic "zero every 32X VDP register" init sequence) would otherwise clobber it right back
+    /// to 0 before the hardware-detection check that reads it again ever runs. Confirmed against
+    /// PicoDrive's own p32x_vdp_write8 (memory.c:684-692, case 0x01): there is no case 0x00 at
+    /// all, and the word-write path (memory.c:714-741) explicitly falls through offset-0 writes
+    /// to the case-0x01 handler, which re-preserves NPalBit even though it looks like a full-word
+    /// overwrite -- i.e. this bit survives every real write path, not just some of them.</summary>
+    [Fact]
+    public void WriteVdpControlByteFrom68k_OffsetZero_PreservesNPalBitEvenOnAFullWordClear()
+    {
+        var sega32X = CreateSega32X();
+
+        // A word write of 0 to VdpRegs[0] -- both bytes at offsets 0 and 1 -- exactly matching a
+        // real 32X title's own generic register-clear sequence (MOVE.W D0,128(A1) with D0 = 0).
+        sega32X.WriteVdpControlByteFrom68k(0x00, 0x00);
+        sega32X.WriteVdpControlByteFrom68k(0x01, 0x00);
+
+        Assert.NotEqual(0, sega32X.VdpRegs[0] & 0x8000);
+    }
+
+    [Fact]
+    public void FrameSelectSwap_AppliesImmediatelyWhileBlanking()
+    {
+        var sega32X = CreateSega32X(); // still in the power-on blanking state (VBLK set)
+
+        sega32X.WriteVdpControlByteFrom68k(0x0B, 0x01); // request FS = 1
+
+        Assert.NotEqual(0, sega32X.VdpRegs[5] & 0x0001); // applied right away
+    }
+
+    [Fact]
+    public void FrameSelectSwap_DefersUntilVblankStartWhenNotBlanking()
+    {
+        var sega32X = CreateSega32X();
+        sega32X.WriteVdpControlByteFrom68k(0x01, 0x01); // Mx = 1, so "Mx==0" no longer forces blanking
+        sega32X.UpdateBlankingState(false); // exit blanking
+
+        sega32X.WriteVdpControlByteFrom68k(0x0B, 0x01); // request FS = 1 while not blanking
+        Assert.Equal(0, sega32X.VdpRegs[5] & 0x0001); // not yet applied
+
+        sega32X.UpdateBlankingState(true); // vblank starts -- deferred swap now applies
+        Assert.NotEqual(0, sega32X.VdpRegs[5] & 0x0001);
+    }
+
+    [Fact]
+    public void Autofill_WritingFillDataFillsTheWriteTargetBank()
+    {
+        var sega32X = CreateSega32X();
+        sega32X.WriteVdpControlByteFrom68k(0x04, 0x00);
+        sega32X.WriteVdpControlByteFrom68k(0x05, 0x02); // fill length = 2 -> 3 words filled
+        sega32X.WriteVdpControlByteFrom68k(0x06, 0x00);
+        sega32X.WriteVdpControlByteFrom68k(0x07, 0x10); // fill start address = 0x10 (word offset)
+        sega32X.WriteVdpControlByteFrom68k(0x08, 0x12);
+        sega32X.WriteVdpControlByteFrom68k(0x09, 0x34); // fill data = 0x1234 -- triggers the burst
+
+        // Default FS=0 -> display bank is 0, so the write-target (fill) bank is bank 1.
+        byte[] writeBank = sega32X.FrameBuffer[1];
+        for (int i = 0; i < 3; i++)
+        {
+            int byteOffset = (0x10 + i) * 2;
+            Assert.Equal(0x12, writeBank[byteOffset]);
+            Assert.Equal(0x34, writeBank[byteOffset + 1]);
+        }
+    }
+
+    [Fact]
+    public void PaletteWrite_GatedByFmBit_68kOwnsWhenFmClear()
+    {
+        var sega32X = CreateSega32X(); // FM clear (power-on default) -> 68000 owns
+
+        sega32X.WritePaletteByteFrom68k(0x0A, 0x77);
+
+        Assert.Equal(0x77, sega32X.ReadPaletteByteFor68k(0x0A));
+    }
+
+    [Fact]
+    public void PaletteWrite_GatedByFmBit_68kWriteIgnoredWhenSh2Owns()
+    {
+        var sega32X = CreateSega32X();
+        sega32X.WriteControlByteFrom68k(0x00, 0x80); // set FM -> SH-2 owns vdp_regs/palette now
+
+        sega32X.WritePaletteByteFrom68k(0x0A, 0x77);
+
+        Assert.Equal(0, sega32X.ReadPaletteByteFor68k(0x0A)); // write was ignored
+    }
+
+    [Fact]
+    public void FrameBuffer_ByteWriteOfZero_IsSilentlyDroppedInBothWindows()
+    {
+        var sega32X = CreateSega32X();
+        sega32X.FrameBuffer[1][0x100] = 0x42; // pre-existing value in the write-target bank
+
+        sega32X.WriteFrameBufferByteFrom68k(0x100, 0x00);
+
+        Assert.Equal(0x42, sega32X.ReadFrameBufferByteFor68k(0x100)); // zero write dropped, old value survives
+    }
+
+    [Fact]
+    public void FrameBuffer_OverwriteWordWrite_MasksOutZeroBytesButNormalWriteDoesNot()
+    {
+        var sega32X = CreateSega32X();
+        sega32X.FrameBuffer[1][0x200] = 0xAA;
+        sega32X.FrameBuffer[1][0x201] = 0xBB;
+
+        sega32X.WriteFrameBufferWordFrom68k(0x200, overwrite: true, 0x0044); // high byte 0x00 -> masked out
+
+        Assert.Equal(0xAA, sega32X.FrameBuffer[1][0x200]); // old high byte survives
+        Assert.Equal(0x44, sega32X.FrameBuffer[1][0x201]); // new low byte written
+
+        sega32X.WriteFrameBufferWordFrom68k(0x200, overwrite: false, 0x0055); // normal window: unconditional
+
+        Assert.Equal(0x00, sega32X.FrameBuffer[1][0x200]); // both bytes written even though high byte is zero
+        Assert.Equal(0x55, sega32X.FrameBuffer[1][0x201]);
+    }
+}

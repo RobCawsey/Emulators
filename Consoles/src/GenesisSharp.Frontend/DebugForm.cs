@@ -46,6 +46,26 @@ public sealed class DebugForm : Form
         "  Refreshes automatically every frame while this window is\r\n" +
         "  visible.\r\n" +
         "\r\n" +
+        "32X TAB\r\n" +
+        "\r\n" +
+        "  Live registers and a scrolling disassembly listing for both\r\n" +
+        "  SH-2 cores (master/slave), plus the adapter's nRES/ADEN\r\n" +
+        "  release state. Shown whether or not the loaded ROM is a 32X\r\n" +
+        "  title -- for a non-32X ROM both cores simply sit held at\r\n" +
+        "  reset and never step.\r\n" +
+        "\r\n" +
+        "  Trace (Master/Slave, N steps, watch R#)\r\n" +
+        "    Only while paused. Steps the selected core N instructions\r\n" +
+        "    back-to-back (up to 200,000) and shows two views of the\r\n" +
+        "    run: every change to the chosen 'watch' register (good for\r\n" +
+        "    a suspected loop counter -- shows every value it takes for\r\n" +
+        "    the *entire* run, however long), plus the last 400\r\n" +
+        "    instructions actually executed (so whatever runs right\r\n" +
+        "    after a long-awaited loop exit is visible even if it's\r\n" +
+        "    thousands of instructions in). Actually advances that\r\n" +
+        "    core's PC/registers by N instructions, same as clicking\r\n" +
+        "    Step Instruction N times would.\r\n" +
+        "\r\n" +
         "VRAM TAB\r\n" +
         "\r\n" +
         "  A palette-line selector (0-3) and a zoomed-in view of every\r\n" +
@@ -56,10 +76,38 @@ public sealed class DebugForm : Form
     private readonly Action _onPauseToggle;
     private readonly Action _onStepFrame;
     private readonly Action _onStepInstruction;
+    private readonly Action<uint?> _onSetBreakpoint;
+    private readonly Action<byte> _onSetVersionRegisterOverride;
 
     private readonly TextBox _registersText;
     private readonly TextBox _m68kDisasmText;
     private readonly TextBox _z80DisasmText;
+    private readonly TextBox _m68kPeekAddressBox;
+    private readonly TextBox _hexDumpText;
+
+    /// <summary>When set, the 68000 disassembly panel shows a fixed range starting here instead
+    /// of following the live PC -- for hunting down a caller when the "Next:" line only shows
+    /// whatever subroutine happens to be executing right now (e.g. a stack-peeked return address
+    /// that isn't the live PC). Cleared by the "Follow PC" button.</summary>
+    private uint? _m68kPeekAddress;
+
+    /// <summary>Same idea as <see cref="_m68kPeekAddress"/>, for the SH-2 disassembly panels --
+    /// added specifically to read a callee's code (a function reached only via an indirect
+    /// <c>JSR @Rn</c> through a literal-pool pointer, say) without needing the live core to
+    /// actually execute it first. <see cref="_sh2PeekIsSlave"/> selects which of the two panels
+    /// the override applies to; the other keeps following its own live PC.</summary>
+    private uint? _sh2PeekAddress;
+    private bool _sh2PeekIsSlave;
+    private readonly TextBox _sh2RegistersText;
+    private readonly TextBox _msh2DisasmText;
+    private readonly TextBox _ssh2DisasmText;
+    private readonly TextBox _sh2TraceText;
+
+    /// <summary>Tracks the pause state <see cref="SetPausedLabel"/> reports, purely so the SH-2
+    /// trace button (below) can refuse to run while the emulation thread might still be
+    /// live-stepping the same core -- there's no other consumer, unlike <see cref="_paused"/>
+    /// in <see cref="MainForm"/> itself, which this window has no direct access to.</summary>
+    private bool _isPaused;
     private readonly Button _pauseButton;
     private readonly ComboBox _paletteLineSelector;
     private readonly PictureBox _palettePreview;
@@ -70,11 +118,13 @@ public sealed class DebugForm : Form
     private int _tilesPerRow;
     private RetroWindowChrome? _chrome;
 
-    public DebugForm(Action onPauseToggle, Action onStepFrame, Action onStepInstruction)
+    public DebugForm(Action onPauseToggle, Action onStepFrame, Action onStepInstruction, Action<uint?> onSetBreakpoint, Action<byte> onSetVersionRegisterOverride)
     {
         _onPauseToggle = onPauseToggle;
         _onStepFrame = onStepFrame;
         _onStepInstruction = onStepInstruction;
+        _onSetBreakpoint = onSetBreakpoint;
+        _onSetVersionRegisterOverride = onSetVersionRegisterOverride;
 
         Text = "GenesisSharp Debug";
         StartPosition = FormStartPosition.Manual;
@@ -100,14 +150,14 @@ public sealed class DebugForm : Form
         toolbar.Controls.Add(stepInstructionButton);
 
         var registersFont = new Font(FontFamily.GenericMonospace, 10);
-        // Content is currently 20 lines (68000 header + next-instruction + 4 register rows +
-        // blank + 6 Z80 lines (header/next-instruction/main+alt register pairs/IX-IY-SP/
-        // I-R-IFF-IM) + blank + 2 VDP lines + blank + 2 audio lines) -- sized from the font's
-        // own real line height, with a few spare lines of headroom, rather than a fixed pixel
-        // guess that silently clips whatever doesn't fit once font/DPI scaling makes each line
-        // taller than expected (which is exactly what was cutting the Z80/VDP lines off below
-        // the fold, previously).
-        const int registerLineCount = 22;
+        // Content is currently 22 lines (68000 header + next-instruction + 4 register rows +
+        // stack peek + last-exception line + blank + 6 Z80 lines (header/next-instruction/
+        // main+alt register pairs/IX-IY-SP/I-R-IFF-IM) + blank + 3 VDP lines (registers + DMA
+        // state) + blank + 2 audio lines) -- sized from the font's own real line height, rather
+        // than a fixed pixel guess that silently clips whatever doesn't fit once font/DPI scaling
+        // makes each line taller than expected (which is exactly what was cutting the Z80/VDP
+        // lines off below the fold, previously).
+        const int registerLineCount = 24;
         _registersText = new TextBox
         {
             Multiline = true,
@@ -167,6 +217,383 @@ public sealed class DebugForm : Form
         disasmPanel.Controls.Add(_m68kDisasmText, 0, 0);
         disasmPanel.Controls.Add(_z80DisasmText, 1, 0);
 
+        // Lets the 68000 disassembly panel show a fixed address range instead of always
+        // following the live PC -- useful for reading a subroutine at an address only known from
+        // a stack peek (a return address, say) rather than wherever execution happens to be right
+        // now. "Go" sets the override; "Follow PC" clears it back to the normal live behavior.
+        var peekRowFont = new Font(FontFamily.GenericSansSerif, 10);
+        var peekRow = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(4), BackColor = RetroTheme.Panel };
+        peekRow.Controls.Add(new Label { Text = "Peek 68000 addr ($):", Font = peekRowFont, ForeColor = RetroTheme.Text, AutoSize = true, Margin = new Padding(4, 8, 4, 0) });
+        _m68kPeekAddressBox = new TextBox { Font = peekRowFont, Width = 80, Margin = new Padding(4, 4, 4, 4) };
+        peekRow.Controls.Add(_m68kPeekAddressBox);
+        var peekGoButton = new Button { Text = "Go", AutoSize = true };
+        RetroTheme.StyleButton(peekGoButton);
+        peekGoButton.Click += (_, _) =>
+        {
+            if (uint.TryParse(_m68kPeekAddressBox.Text, System.Globalization.NumberStyles.HexNumber, null, out uint address))
+            {
+                _m68kPeekAddress = address;
+                RefreshSnapshot();
+            }
+        };
+        peekRow.Controls.Add(peekGoButton);
+        var peekFollowPcButton = new Button { Text = "Follow PC", AutoSize = true };
+        RetroTheme.StyleButton(peekFollowPcButton);
+        peekFollowPcButton.Click += (_, _) =>
+        {
+            _m68kPeekAddress = null;
+            RefreshSnapshot();
+        };
+        peekRow.Controls.Add(peekFollowPcButton);
+
+        // Raw hex-byte peek, on any of the three buses -- disassembling a data address (rather
+        // than real code) just produces plausible-looking garbage (confirmed the hard way: an
+        // SDRAM comm-handshake constant disassembled as a fake "jump table" earlier in this same
+        // investigation), so a genuine data value needs a raw dump, not a decoded instruction
+        // listing. SDRAM in particular is SH-2-only address space -- the 68000 peek above can't
+        // reach it at all -- hence the bus selector.
+        var hexRow = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(4), BackColor = RetroTheme.Panel };
+        hexRow.Controls.Add(new Label { Text = "Hex dump bus:", Font = peekRowFont, ForeColor = RetroTheme.Text, AutoSize = true, Margin = new Padding(4, 8, 4, 0) });
+        var hexBusSelector = new ComboBox
+        {
+            DropDownStyle = ComboBoxStyle.DropDownList,
+            Font = peekRowFont,
+            BackColor = RetroTheme.Panel,
+            ForeColor = RetroTheme.Text,
+            Width = 110,
+            Margin = new Padding(4, 4, 4, 4),
+        };
+        hexBusSelector.Items.AddRange(new object[] { "68000", "SH-2 Master", "SH-2 Slave" });
+        hexBusSelector.SelectedIndex = 0;
+        hexRow.Controls.Add(hexBusSelector);
+        hexRow.Controls.Add(new Label { Text = "addr ($):", Font = peekRowFont, ForeColor = RetroTheme.Text, AutoSize = true, Margin = new Padding(4, 8, 4, 0) });
+        var hexAddressBox = new TextBox { Font = peekRowFont, Width = 80, Margin = new Padding(4, 4, 4, 4) };
+        hexRow.Controls.Add(hexAddressBox);
+        var hexDumpButton = new Button { Text = "Hex Dump", AutoSize = true };
+        RetroTheme.StyleButton(hexDumpButton);
+        _hexDumpText = new TextBox
+        {
+            Font = new Font(FontFamily.GenericMonospace, 9),
+            Width = 400,
+            Margin = new Padding(4, 4, 4, 4),
+            ReadOnly = true,
+            BackColor = Color.Black,
+            ForeColor = Color.Cyan,
+        };
+        hexDumpButton.Click += (_, _) =>
+        {
+            if (_console is null || !uint.TryParse(hexAddressBox.Text, System.Globalization.NumberStyles.HexNumber, null, out uint address))
+            {
+                return;
+            }
+
+            _hexDumpText.Text = SafeDecode(() =>
+            {
+                var bytes = new List<string>();
+                for (uint i = 0; i < 32; i += 4)
+                {
+                    uint value = hexBusSelector.SelectedIndex switch
+                    {
+                        1 => _console.Sega32X.MasterSh2Bus.ReadLong(address + i),
+                        2 => _console.Sega32X.SlaveSh2Bus.ReadLong(address + i),
+                        _ => ((Cpu68000Bus)_console).ReadLong(address + i),
+                    };
+                    bytes.Add($"{address + i:X8}={value:X8}");
+                }
+
+                return string.Join("  ", bytes);
+            });
+        };
+        hexRow.Controls.Add(hexDumpButton);
+        hexRow.Controls.Add(_hexDumpText);
+
+        // 68000 PC breakpoint -- pauses emulation the instant the CPU is about to fetch the
+        // opcode at the given address, via M68000.InstructionFetching (a pre-existing debugging
+        // hook, not new). Precise to the exact instruction, unlike polling PC between whole
+        // frames/scanlines, which can easily step past the address of interest before the next
+        // check runs -- needed to catch a live call stack at the exact moment of arrival rather
+        // than guessing forward through unexplored subroutines from a frozen, already-stuck
+        // snapshot.
+        var bpRow = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(4), BackColor = RetroTheme.Panel };
+        bpRow.Controls.Add(new Label { Text = "68000 breakpoint ($):", Font = peekRowFont, ForeColor = RetroTheme.Text, AutoSize = true, Margin = new Padding(4, 8, 4, 0) });
+        var breakpointAddressBox = new TextBox { Font = peekRowFont, Width = 80, Margin = new Padding(4, 4, 4, 4) };
+        bpRow.Controls.Add(breakpointAddressBox);
+        var setBreakpointButton = new Button { Text = "Set", AutoSize = true };
+        RetroTheme.StyleButton(setBreakpointButton);
+        setBreakpointButton.Click += (_, _) =>
+        {
+            if (uint.TryParse(breakpointAddressBox.Text, System.Globalization.NumberStyles.HexNumber, null, out uint address))
+            {
+                _onSetBreakpoint(address);
+            }
+        };
+        bpRow.Controls.Add(setBreakpointButton);
+        var clearBreakpointButton = new Button { Text = "Clear", AutoSize = true };
+        RetroTheme.StyleButton(clearBreakpointButton);
+        clearBreakpointButton.Click += (_, _) => _onSetBreakpoint(null);
+        bpRow.Controls.Add(clearBreakpointButton);
+
+        // VERSION register ($A10001) live override -- GenesisConsole.VersionRegisterValue's own
+        // remarks cover the full story: bit 6 = 0 ($A0) is the confirmed-correct NTSC polarity
+        // (matches genesis-plus-gx independently, and a real 32X title's own boot code confirms
+        // it two different ways once Sega32X.Vdp.cs's NPalBit default is also correct). $E0 was
+        // an earlier, incorrect workaround for what turned out to be that separate NPalBit bug --
+        // kept here as a toggle (not removed) since it's still a generally useful override for
+        // testing a future title's own region/hardware checks, not just this one investigation.
+        // Applied immediately on click, no separate "Set" step. MainForm stores the value (not
+        // just this form) specifically so it survives a ROM reload -- the whole point of testing
+        // a boot-time hardware-detection hypothesis, which by definition needs the boot sequence
+        // to actually re-run with the override already in place.
+        var versionRow = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(4), BackColor = RetroTheme.Panel };
+        versionRow.Controls.Add(new Label { Text = "VERSION reg ($A10001) bit 6:", Font = peekRowFont, ForeColor = RetroTheme.Text, AutoSize = true, Margin = new Padding(4, 8, 4, 0) });
+        var versionA0RadioButton = new RadioButton
+        {
+            Text = "0 -- $A0 (confirmed-correct NTSC, default)",
+            Font = peekRowFont,
+            ForeColor = RetroTheme.Text,
+            BackColor = RetroTheme.Panel,
+            AutoSize = true,
+            Margin = new Padding(4, 6, 4, 4),
+            Checked = true,
+        };
+        var versionE0RadioButton = new RadioButton
+        {
+            Text = "1 -- $E0 (superseded workaround, for comparison)",
+            Font = peekRowFont,
+            ForeColor = RetroTheme.Text,
+            BackColor = RetroTheme.Panel,
+            AutoSize = true,
+            Margin = new Padding(4, 6, 4, 4),
+        };
+        versionA0RadioButton.Click += (_, _) => _onSetVersionRegisterOverride(0xA0);
+        versionE0RadioButton.Click += (_, _) => _onSetVersionRegisterOverride(0xE0);
+        versionRow.Controls.Add(versionA0RadioButton);
+        versionRow.Controls.Add(versionE0RadioButton);
+
+        // 32X tab: same registers-box-on-top, disassembly-panel-below shape as the CPU tab,
+        // just for the two SH-2 cores instead of the 68000/Z80. Content is currently 17 lines
+        // (32X adapter line + blank + [master header/next/4 register rows/PR-GBR-VBR-MACH-MACL
+        // row] + blank + the same 7 lines for the slave) -- sized the same font-driven way as
+        // _registersText above, for the same reason (avoid silently clipping under DPI scaling).
+        const int sh2RegisterLineCount = 19;
+        _sh2RegistersText = new TextBox
+        {
+            Multiline = true,
+            ReadOnly = true,
+            Dock = DockStyle.Top,
+            Height = registersFont.Height * sh2RegisterLineCount + 16,
+            Font = registersFont,
+            BackColor = Color.Black,
+            ForeColor = Color.Lime,
+            ScrollBars = ScrollBars.Vertical,
+        };
+        var sh2DisasmPanel = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 2,
+            RowCount = 1,
+        };
+        sh2DisasmPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50f));
+        sh2DisasmPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50f));
+        sh2DisasmPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
+        _msh2DisasmText = new TextBox
+        {
+            Multiline = true,
+            ReadOnly = true,
+            Dock = DockStyle.Fill,
+            Font = disasmFont,
+            BackColor = Color.Black,
+            ForeColor = Color.Cyan,
+            ScrollBars = ScrollBars.Vertical,
+            WordWrap = false,
+        };
+        _ssh2DisasmText = new TextBox
+        {
+            Multiline = true,
+            ReadOnly = true,
+            Dock = DockStyle.Fill,
+            Font = disasmFont,
+            BackColor = Color.Black,
+            ForeColor = Color.Yellow,
+            ScrollBars = ScrollBars.Vertical,
+            WordWrap = false,
+        };
+        sh2DisasmPanel.Controls.Add(_msh2DisasmText, 0, 0);
+        sh2DisasmPanel.Controls.Add(_ssh2DisasmText, 1, 0);
+
+        // SH-2 instruction trace -- the 68000 side gets a live-following disassembly panel above
+        // plus a PC breakpoint, but neither substitute for seeing an actual sequential run of
+        // instructions when a core is stuck cycling through a small code region: repeatedly
+        // reading the live "Next:" line one frame apart just shows scattered snapshots of
+        // wherever PC happens to be at each poll, not the real control flow in between. This
+        // steps the selected core N times back-to-back (only while paused, so it can't race the
+        // emulation thread's own stepping) and logs the PC + decoded instruction for every one --
+        // added specifically to trace a real stuck-loop investigation instruction-by-instruction
+        // rather than guessing from one-frame-apart register snapshots.
+        var sh2TraceRow = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(4), BackColor = RetroTheme.Panel };
+        sh2TraceRow.Controls.Add(new Label { Text = "Trace core:", Font = peekRowFont, ForeColor = RetroTheme.Text, AutoSize = true, Margin = new Padding(4, 8, 4, 0) });
+        var sh2TraceCoreSelector = new ComboBox
+        {
+            DropDownStyle = ComboBoxStyle.DropDownList,
+            Font = peekRowFont,
+            BackColor = RetroTheme.Panel,
+            ForeColor = RetroTheme.Text,
+            Width = 90,
+            Margin = new Padding(4, 4, 4, 4),
+        };
+        sh2TraceCoreSelector.Items.AddRange(new object[] { "Master", "Slave" });
+        sh2TraceCoreSelector.SelectedIndex = 0;
+        sh2TraceRow.Controls.Add(sh2TraceCoreSelector);
+        sh2TraceRow.Controls.Add(new Label { Text = "steps:", Font = peekRowFont, ForeColor = RetroTheme.Text, AutoSize = true, Margin = new Padding(4, 8, 4, 0) });
+        var sh2TraceCountBox = new TextBox { Font = peekRowFont, Width = 70, Text = "20000", Margin = new Padding(4, 4, 4, 4) };
+        sh2TraceRow.Controls.Add(sh2TraceCountBox);
+        sh2TraceRow.Controls.Add(new Label { Text = "watch R#:", Font = peekRowFont, ForeColor = RetroTheme.Text, AutoSize = true, Margin = new Padding(4, 8, 4, 0) });
+        var sh2TraceWatchBox = new TextBox { Font = peekRowFont, Width = 30, Text = "3", Margin = new Padding(4, 4, 4, 4) };
+        sh2TraceRow.Controls.Add(sh2TraceWatchBox);
+        sh2TraceRow.Controls.Add(new Label { Text = "or watch mem ($):", Font = peekRowFont, ForeColor = RetroTheme.Text, AutoSize = true, Margin = new Padding(4, 8, 4, 0) });
+        var sh2TraceWatchMemBox = new TextBox { Font = peekRowFont, Width = 80, Margin = new Padding(4, 4, 4, 4) };
+        sh2TraceRow.Controls.Add(sh2TraceWatchMemBox);
+        var sh2TraceButton = new Button { Text = "Trace (only while paused -- steps the core!)", AutoSize = true };
+        RetroTheme.StyleButton(sh2TraceButton);
+        sh2TraceRow.Controls.Add(sh2TraceButton);
+
+        _sh2TraceText = new TextBox
+        {
+            Multiline = true,
+            ReadOnly = true,
+            Dock = DockStyle.Top,
+            Height = disasmFont.Height * 20 + 16,
+            Font = disasmFont,
+            BackColor = Color.Black,
+            ForeColor = Color.Magenta,
+            ScrollBars = ScrollBars.Vertical,
+            WordWrap = false,
+        };
+
+        // A flat step-and-log-everything trace is only readable for a couple hundred
+        // instructions -- useless for "let this run far enough to see a rarely-taken exit
+        // branch", which can be thousands of instructions away (exactly what a stuck-loop
+        // investigation needs: does it *ever* actually exit?). So this always executes the full
+        // requested count, but keeps two separate views of it instead of one giant unreadable
+        // dump: a "watch" log (one line every time the chosen register's value changes -- the
+        // loop-counter register a stuck-loop hypothesis usually centers on) covering the *entire*
+        // run regardless of how long it is, and a ring-buffer "tail" of the last 400 instructions
+        // actually executed, which naturally captures whatever runs right after a long-awaited
+        // exit branch finally gets taken (once PC leaves the old loop's small address range for
+        // good, the tail fills with genuinely new code rather than the loop's own repetition).
+        const int TailLines = 2000;
+        sh2TraceButton.Click += (_, _) =>
+        {
+            if (_console is null || !_isPaused)
+            {
+                _sh2TraceText.Text = "(pause emulation first -- stepping while running would race the emulation thread)";
+                return;
+            }
+
+            int count = int.TryParse(sh2TraceCountBox.Text, out int parsedCount) ? Math.Clamp(parsedCount, 1, 200_000) : 20_000;
+            bool isSlave = sh2TraceCoreSelector.SelectedIndex == 1;
+            var sega32X = _console.Sega32X;
+            var core = isSlave ? sega32X.SlaveSh2 : sega32X.MasterSh2;
+            var bus = isSlave ? sega32X.SlaveSh2Bus : sega32X.MasterSh2Bus;
+
+            // Watching a specific memory address (rather than a register) answers a different
+            // question: not "what does this loop's own counter do" but "does *any* code path this
+            // core executes -- not just the one currently on screen -- ever write here at all".
+            // A register watch can only ever see what the one loop already in view does; a memory
+            // watch catches a write from anywhere, which is what a "does this ever get signaled"
+            // investigation actually needs.
+            bool watchingMemory = uint.TryParse(sh2TraceWatchMemBox.Text, System.Globalization.NumberStyles.HexNumber, null, out uint watchAddress);
+            int watchReg = int.TryParse(sh2TraceWatchBox.Text, out int parsedWatch) ? Math.Clamp(parsedWatch, 0, 15) : 3;
+
+            var watchLines = new List<string>();
+            var tail = new Queue<string>(TailLines + 1);
+            uint lastWatchValue = watchingMemory ? bus.ReadLong(watchAddress) : core.R[watchReg];
+            watchLines.Add(watchingMemory
+                ? $"[{watchAddress:X8}] starts at {lastWatchValue:X8} (PC={core.PC:X8})"
+                : $"R{watchReg} starts at {lastWatchValue:X8} (PC={core.PC:X8})");
+
+            for (int i = 0; i < count; i++)
+            {
+                uint pc = core.PC;
+                string text = SafeDecode(() => Sh2Disassembler.Decode(pc, bus).Text);
+                tail.Enqueue($"{pc:X8}: {text}");
+                if (tail.Count > TailLines)
+                {
+                    tail.Dequeue();
+                }
+
+                core.Step();
+
+                uint newWatchValue = watchingMemory ? bus.ReadLong(watchAddress) : core.R[watchReg];
+                if (newWatchValue != lastWatchValue)
+                {
+                    watchLines.Add(watchingMemory
+                        ? $"[{watchAddress:X8}] {lastWatchValue:X8} -> {newWatchValue:X8}  (after step {i}, now at PC={core.PC:X8})"
+                        : $"R{watchReg} {lastWatchValue:X8} -> {newWatchValue:X8}  (after step {i}, now at PC={core.PC:X8})");
+                    lastWatchValue = newWatchValue;
+                    if (watchLines.Count > 200)
+                    {
+                        watchLines.RemoveAt(1); // keep the "starts at" line, trim from the oldest transition
+                    }
+                }
+            }
+
+            var output = new List<string>(watchLines.Count + tail.Count + 3)
+            {
+                watchingMemory
+                    ? $"-- [{watchAddress:X8}] watch, {count} steps executed --"
+                    : $"-- R{watchReg} watch, {count} steps executed --",
+            };
+            output.AddRange(watchLines);
+            output.Add("");
+            output.Add($"-- last {tail.Count} instructions executed --");
+            output.AddRange(tail);
+
+            _sh2TraceText.Lines = output.ToArray();
+            RefreshSnapshot(); // registers/live disassembly panels now reflect the advanced PC too
+        };
+
+        // Mirrors the CPU tab's own 68000 "Peek" row (peekRow, above) for the SH-2 disassembly
+        // panels -- lets either panel show a fixed address range instead of always following its
+        // core's live PC, for reading a callee's code (reached only via an indirect JSR through a
+        // literal-pool pointer, say) without needing that core to actually execute it first.
+        var sh2PeekRow = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(4), BackColor = RetroTheme.Panel };
+        sh2PeekRow.Controls.Add(new Label { Text = "Peek SH-2 addr ($):", Font = peekRowFont, ForeColor = RetroTheme.Text, AutoSize = true, Margin = new Padding(4, 8, 4, 0) });
+        var sh2PeekAddressBox = new TextBox { Font = peekRowFont, Width = 80, Margin = new Padding(4, 4, 4, 4) };
+        sh2PeekRow.Controls.Add(sh2PeekAddressBox);
+        var sh2PeekCoreSelector = new ComboBox
+        {
+            DropDownStyle = ComboBoxStyle.DropDownList,
+            Font = peekRowFont,
+            BackColor = RetroTheme.Panel,
+            ForeColor = RetroTheme.Text,
+            Width = 90,
+            Margin = new Padding(4, 4, 4, 4),
+        };
+        sh2PeekCoreSelector.Items.AddRange(new object[] { "Master", "Slave" });
+        sh2PeekCoreSelector.SelectedIndex = 0;
+        sh2PeekRow.Controls.Add(sh2PeekCoreSelector);
+        var sh2PeekGoButton = new Button { Text = "Go", AutoSize = true };
+        RetroTheme.StyleButton(sh2PeekGoButton);
+        sh2PeekGoButton.Click += (_, _) =>
+        {
+            if (uint.TryParse(sh2PeekAddressBox.Text, System.Globalization.NumberStyles.HexNumber, null, out uint address))
+            {
+                _sh2PeekAddress = address;
+                _sh2PeekIsSlave = sh2PeekCoreSelector.SelectedIndex == 1;
+                RefreshSnapshot();
+            }
+        };
+        sh2PeekRow.Controls.Add(sh2PeekGoButton);
+        var sh2PeekFollowPcButton = new Button { Text = "Follow PC", AutoSize = true };
+        RetroTheme.StyleButton(sh2PeekFollowPcButton);
+        sh2PeekFollowPcButton.Click += (_, _) =>
+        {
+            _sh2PeekAddress = null;
+            RefreshSnapshot();
+        };
+        sh2PeekRow.Controls.Add(sh2PeekFollowPcButton);
+
         var paletteRowFont = new Font(FontFamily.GenericSansSerif, 12);
         var paletteRow = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(6), BackColor = RetroTheme.Panel };
         paletteRow.Controls.Add(new Label { Text = "VRAM palette line:", Font = paletteRowFont, ForeColor = RetroTheme.Text, AutoSize = true, Margin = new Padding(4, 10, 6, 0) });
@@ -215,6 +642,17 @@ public sealed class DebugForm : Form
         var cpuTab = new TabPage("CPU") { BackColor = RetroTheme.Background };
         cpuTab.Controls.Add(disasmPanel);
         cpuTab.Controls.Add(_registersText);
+        cpuTab.Controls.Add(peekRow);
+        cpuTab.Controls.Add(hexRow);
+        cpuTab.Controls.Add(bpRow);
+        cpuTab.Controls.Add(versionRow);
+
+        var sh2Tab = new TabPage("32X") { BackColor = RetroTheme.Background };
+        sh2Tab.Controls.Add(sh2DisasmPanel);
+        sh2Tab.Controls.Add(_sh2RegistersText);
+        sh2Tab.Controls.Add(sh2PeekRow);
+        sh2Tab.Controls.Add(sh2TraceRow);
+        sh2Tab.Controls.Add(_sh2TraceText);
 
         var vramTab = new TabPage("VRAM") { BackColor = RetroTheme.Background };
         vramTab.Controls.Add(_vramScroll);
@@ -227,6 +665,7 @@ public sealed class DebugForm : Form
         var tabs = new TabControl { DrawMode = TabDrawMode.OwnerDrawFixed };
         tabs.DrawItem += DrawTab;
         tabs.TabPages.Add(cpuTab);
+        tabs.TabPages.Add(sh2Tab);
         tabs.TabPages.Add(vramTab);
 
         // Tab-strip chrome height is essentially font-driven, not size-driven, so it can be
@@ -271,9 +710,14 @@ public sealed class DebugForm : Form
         int menuStripHeight = menuStrip.GetPreferredSize(Size.Empty).Height;
         int toolbarHeight = toolbar.GetPreferredSize(Size.Empty).Height;
         int paletteRowHeight = paletteRow.GetPreferredSize(Size.Empty).Height;
-        int cpuTabContentHeight = _registersText.Height + disasmFont.Height * DisasmLineCount + 16;
+        int peekRowHeight = peekRow.GetPreferredSize(Size.Empty).Height;
+        int hexRowHeight = hexRow.GetPreferredSize(Size.Empty).Height;
+        int cpuTabContentHeight = peekRowHeight + hexRowHeight + _registersText.Height + disasmFont.Height * DisasmLineCount + 16;
+        int sh2TraceRowHeight = sh2TraceRow.GetPreferredSize(Size.Empty).Height;
+        int sh2PeekRowHeight = sh2PeekRow.GetPreferredSize(Size.Empty).Height;
+        int sh2TabContentHeight = _sh2RegistersText.Height + sh2PeekRowHeight + sh2TraceRowHeight + _sh2TraceText.Height + disasmFont.Height * DisasmLineCount + 16;
         int vramTabContentHeight = paletteRowHeight + _vramBitmap.Height;
-        int contentHeight = menuStripHeight + toolbarHeight + tabChromeHeight + Math.Max(cpuTabContentHeight, vramTabContentHeight);
+        int contentHeight = menuStripHeight + toolbarHeight + tabChromeHeight + Math.Max(Math.Max(cpuTabContentHeight, sh2TabContentHeight), vramTabContentHeight);
         // Half the full grid width, on top of the vertical-fit sizing above -- at 128 columns
         // the grid itself is wider than any window needs to default to; _vramScroll's own
         // AutoScroll (already relied on for the vertical case) picks up a horizontal scrollbar
@@ -400,13 +844,50 @@ public sealed class DebugForm : Form
     /// <summary>Called whenever <see cref="MainForm"/> swaps in a different console (a fresh
     /// ROM load) -- everything below just reads from whatever this points at, so there's
     /// nothing else to reset here.</summary>
+    /// <summary>Set from <see cref="GenesisSharp.Cpu68000.M68000.ExceptionRaised"/> -- a debugging
+    /// hook only (see that event's own remarks), wired up here purely so a real 32X ROM
+    /// unexpectedly hitting a software-detected trap (illegal instruction, CHK, TRAPV, privilege
+    /// violation, a TRAP #n) shows up directly in the debug window instead of needing to be
+    /// inferred from a frozen-looking "BRA *-2" and a hand-traced vector table. Fires on the
+    /// emulation thread; a benign race with the UI thread reading these same fields during
+    /// <see cref="RefreshSnapshot"/> is acceptable, matching how every other live property this
+    /// window reads is already handled.</summary>
+    private int? _lastExceptionVector;
+    private uint? _lastExceptionPc;
+    private int _lastExceptionCount;
+
     public void SetConsole(GenesisConsole? console)
     {
+        if (_console is not null)
+        {
+            _console.Cpu.ExceptionRaised -= OnCpuExceptionRaised;
+        }
+
         _console = console;
+        _lastExceptionVector = null;
+        _lastExceptionPc = null;
+        _lastExceptionCount = 0;
+
+        if (_console is not null)
+        {
+            _console.Cpu.ExceptionRaised += OnCpuExceptionRaised;
+        }
+
         RefreshSnapshot();
     }
 
-    public void SetPausedLabel(bool paused) => _pauseButton.Text = paused ? "Resume" : "Pause";
+    private void OnCpuExceptionRaised(int vectorNumber, uint pc)
+    {
+        _lastExceptionVector = vectorNumber;
+        _lastExceptionPc = pc;
+        _lastExceptionCount++;
+    }
+
+    public void SetPausedLabel(bool paused)
+    {
+        _pauseButton.Text = paused ? "Resume" : "Pause";
+        _isPaused = paused;
+    }
 
     /// <summary>Repaints every section from the console's current state. Cheap enough to call
     /// after every single frame/instruction step and after every real-time timer tick while
@@ -421,11 +902,14 @@ public sealed class DebugForm : Form
         if (_console is null)
         {
             _registersText.Text = "(no ROM loaded)";
+            _sh2RegistersText.Text = "(no ROM loaded)";
             return;
         }
 
         UpdateRegistersText();
         UpdateDisassembly();
+        UpdateSh2RegistersText();
+        UpdateSh2Disassembly();
         UpdatePalette();
         UpdateVram();
     }
@@ -456,6 +940,27 @@ public sealed class DebugForm : Form
             lines.Add($"  A{i}-A{i + 3}: {cpu.A[i]:X8} {cpu.A[i + 1]:X8} {cpu.A[i + 2]:X8} {cpu.A[i + 3]:X8}");
         }
 
+        // Peek at the top few longwords of the 68000 stack (A7) -- a quick, no-breakpoint way to
+        // find a caller's return address when the "Next:" line only shows whatever subroutine is
+        // currently executing. Not reliable in general (a value that happens to look like a valid
+        // ROM address could just be leftover stack data, not a real return address), but useful
+        // as a first guess when hunting for who's repeatedly calling something.
+        string stackPeek = SafeDecode(() =>
+        {
+            var bus68k = (Cpu68000Bus)_console!;
+            var values = new List<string>();
+            for (uint offset = 0; offset < 0x18; offset += 4)
+            {
+                values.Add($"+{offset:X2}={bus68k.ReadLong(cpu.A[7] + offset):X8}");
+            }
+
+            return string.Join(" ", values);
+        });
+        lines.Add($"  Stack@A7: {stackPeek}");
+        lines.Add(_lastExceptionVector.HasValue
+            ? $"  LastException: vector={_lastExceptionVector} PC={_lastExceptionPc:X6} count={_lastExceptionCount}"
+            : "  LastException: (none)");
+
         lines.Add("");
         lines.Add($"Z80    PC={z80.PC:X4}  Cycles={z80.TotalCycles}  Halted={z80.Halted}");
         lines.Add($"  Next: {z80Instruction}");
@@ -466,6 +971,7 @@ public sealed class DebugForm : Form
         lines.Add("");
         lines.Add($"VDP    Scanline={vdp.CurrentScanline,3}  DisplayEnabled={vdp.DisplayEnabled}");
         lines.Add($"       Reg0={vdp.Registers[0]:X2} Reg1={vdp.Registers[1]:X2} Reg11={vdp.Registers[11]:X2} Reg12={vdp.Registers[12]:X2}");
+        lines.Add($"       DmaMode={vdp.CurrentDmaMode}  DmaLength={vdp.DmaLength:X4}  DmaSource={vdp.DmaSourceAddress:X6}  IsDmaBusy={vdp.IsDmaBusy}  DmaBusyRemainingCycles={vdp.DmaBusyRemainingCycles}  DmaTriggerCount={vdp.DmaTriggerCount}");
         lines.Add("");
         // UnderrunCount climbing steadily during normal play (not just a handful right at
         // startup) means the thread producing audio is falling behind real-time playback --
@@ -517,9 +1023,10 @@ public sealed class DebugForm : Form
         var cpu = _console!.Cpu;
         var z80 = _console.SoundCpu;
 
+        uint m68kDisasmStart = _m68kPeekAddress ?? cpu.PC;
         var m68kLines = SafeDecodeLines(() =>
         {
-            var instructions = M68kDisassembler.DisassembleRange(cpu.PC, DisasmLineCount, (Cpu68000Bus)_console);
+            var instructions = M68kDisassembler.DisassembleRange(m68kDisasmStart, DisasmLineCount, (Cpu68000Bus)_console);
             return DisassemblyLabeler.FormatWithLabels(instructions, cpu.PC, a => a.ToString("X6"));
         });
         var z80Lines = SafeDecodeLines(() =>
@@ -530,6 +1037,79 @@ public sealed class DebugForm : Form
 
         _m68kDisasmText.Lines = m68kLines.ToArray();
         _z80DisasmText.Lines = z80Lines.ToArray();
+    }
+
+    private void UpdateSh2RegistersText()
+    {
+        var sega32X = _console!.Sega32X;
+        var master = sega32X.MasterSh2;
+        var slave = sega32X.SlaveSh2;
+
+        // Peek reads only, same reasoning as UpdateRegistersText -- disassembling the current
+        // instruction must never itself advance PC or otherwise perturb emulation state.
+        string masterInstruction = SafeDecode(() => Sh2Disassembler.Decode(master.PC, sega32X.MasterSh2Bus).Text);
+        string slaveInstruction = SafeDecode(() => Sh2Disassembler.Decode(slave.PC, sega32X.SlaveSh2Bus).Text);
+
+        // Sh2IrqMask's low nibble, decoded bit-by-bit -- which of PWM/CMD/HINT/VINT each core has
+        // actually unmasked. Added specifically to stop guessing whether a given interrupt source
+        // is even enabled for a core before spending effort chasing why it isn't visibly doing
+        // anything -- e.g. HINT firing is a no-op if neither core ever set HIntMaskBit.
+        static string DecodeIrqMask(byte mask) =>
+            $"{mask:X2} (PWM={(mask & 1) != 0} CMD={(mask & 2) != 0} HINT={(mask & 4) != 0} VINT={(mask & 8) != 0})";
+
+        var lines = new List<string>
+        {
+            $"32X    nRES={sega32X.NRes}  ADEN={sega32X.Aden}",
+            $"       Sh2IrqMask: Master={DecodeIrqMask(sega32X.Sh2IrqMask[0])}  Slave={DecodeIrqMask(sega32X.Sh2IrqMask[1])}",
+            "",
+            $"Master PC={master.PC:X8}  SR={master.SR:X8}  Cycles={master.TotalCycles}",
+            $"  Next: {masterInstruction}",
+        };
+        for (int i = 0; i < 16; i += 4)
+        {
+            lines.Add($"  R{i}-R{i + 3}: {master.R[i]:X8} {master.R[i + 1]:X8} {master.R[i + 2]:X8} {master.R[i + 3]:X8}");
+        }
+        lines.Add($"  PR={master.PR:X8}  GBR={master.GBR:X8}  VBR={master.VBR:X8}  MACH={master.MACH:X8}  MACL={master.MACL:X8}");
+
+        lines.Add("");
+        lines.Add($"Slave  PC={slave.PC:X8}  SR={slave.SR:X8}  Cycles={slave.TotalCycles}");
+        lines.Add($"  Next: {slaveInstruction}");
+        for (int i = 0; i < 16; i += 4)
+        {
+            lines.Add($"  R{i}-R{i + 3}: {slave.R[i]:X8} {slave.R[i + 1]:X8} {slave.R[i + 2]:X8} {slave.R[i + 3]:X8}");
+        }
+        lines.Add($"  PR={slave.PR:X8}  GBR={slave.GBR:X8}  VBR={slave.VBR:X8}  MACH={slave.MACH:X8}  MACL={slave.MACL:X8}");
+
+        _sh2RegistersText.Lines = lines.ToArray();
+    }
+
+    /// <summary>Labeled instruction-stream listing for both SH-2 cores -- same shape as
+    /// <see cref="UpdateDisassembly"/>, using <see cref="Sega32X.MasterSh2Bus"/>/
+    /// <see cref="Sega32X.SlaveSh2Bus"/> (the same bus each core executes against, exposed
+    /// read-only for exactly this peek-disassembly purpose) rather than a bus this form owns
+    /// itself.</summary>
+    private void UpdateSh2Disassembly()
+    {
+        var sega32X = _console!.Sega32X;
+        var master = sega32X.MasterSh2;
+        var slave = sega32X.SlaveSh2;
+
+        uint masterDisasmStart = (_sh2PeekAddress.HasValue && !_sh2PeekIsSlave) ? _sh2PeekAddress.Value : master.PC;
+        uint slaveDisasmStart = (_sh2PeekAddress.HasValue && _sh2PeekIsSlave) ? _sh2PeekAddress.Value : slave.PC;
+
+        var masterLines = SafeDecodeLines(() =>
+        {
+            var instructions = Sh2Disassembler.DisassembleRange(masterDisasmStart, DisasmLineCount, sega32X.MasterSh2Bus);
+            return DisassemblyLabeler.FormatWithLabels(instructions, master.PC, a => a.ToString("X8"));
+        });
+        var slaveLines = SafeDecodeLines(() =>
+        {
+            var instructions = Sh2Disassembler.DisassembleRange(slaveDisasmStart, DisasmLineCount, sega32X.SlaveSh2Bus);
+            return DisassemblyLabeler.FormatWithLabels(instructions, slave.PC, a => a.ToString("X8"));
+        });
+
+        _msh2DisasmText.Lines = masterLines.ToArray();
+        _ssh2DisasmText.Lines = slaveLines.ToArray();
     }
 
     private void UpdatePalette()

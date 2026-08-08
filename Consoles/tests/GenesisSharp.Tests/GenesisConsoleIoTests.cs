@@ -45,6 +45,13 @@ public class GenesisConsoleIoTests
         Assert.Equal(0, bus.ReadByte(0xA10002) & 0x01); // X pressed, visible through the 68000 bus
     }
 
+    /// <summary>0xA0 confirmed correct (bit 6 = 0 = NTSC) via a live, verified 32X boot-sequence
+    /// trace against a real commercial title (Pitfall: The Mayan Adventure). An earlier revision
+    /// of this default briefly flipped bit 6 to 0xE0 after tracing only the first of two region
+    /// checks that title performs; the real root cause turned out to be a separate bug (Sega32X's
+    /// own NPalBit defaulting backwards -- see its remarks), and once that was fixed, the second
+    /// region check confirmed 0xA0 was correct all along. See <see
+    /// cref="GenesisConsole.VersionRegisterValue"/>'s own remarks for the full story.</summary>
     [Fact]
     public void VersionRegister_ReadsTheFixedDefaultValue()
     {
