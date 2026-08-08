@@ -3,8 +3,8 @@ namespace GenesisSharp.Core;
 /// <summary>Phase 3 of the in-progress Sega 32X extension (see ARCHITECTURE.md §4a.1) — the frame
 /// buffer, palette, and display-mode register block, plus the compositing rule that overlays the
 /// 32X's own output onto the Genesis VDP's, wired into <see cref="Vdp.External32XPixelBlend"/>.
-/// Packed Pixel and Direct Color display modes only; Run Length is deferred (degrades to blank
-/// rather than rendering garbage — see <see cref="TryGetPixel"/>).
+/// All three real display modes are implemented: Packed Pixel, Direct Color, and Run Length (see
+/// <see cref="DecodeRunLengthLine"/>).
 ///
 /// Ground truth: <c>reference/PicoDrive/picodrive/pico/32x/draw.c</c> and <c>32x.c</c>, cited
 /// per-member below. Like the rest of this class, always live but inert for a non-32X ROM:
@@ -99,6 +99,23 @@ public sealed partial class Sega32X
     /// software can draw the next frame without corrupting what's on screen.</summary>
     private int WriteBankIndex => 1 - DisplayBankIndex;
 
+    /// <summary>One decoded scanline's worth of palette indices for Run Length mode, plus the key
+    /// identifying which line is currently decoded into it.
+    ///
+    /// Run Length is the one display mode whose pixels can't be addressed directly: a pixel's
+    /// value depends on every run before it on that line, so answering "what is at x?" means
+    /// walking from the line start. Doing that per pixel inside <see cref="TryGetPixel"/> would be
+    /// quadratic (~51k word reads per 320-pixel line, ~11M per frame). Since the renderer walks
+    /// each scanline left-to-right and no CPU steps during a single <c>Vdp.RenderScanline</c> call,
+    /// decoding the whole line once on first touch and serving the rest from here is both correct
+    /// and linear.
+    ///
+    /// Keyed on line <em>and</em> bank so a mid-frame <c>FS</c> swap can't serve pixels decoded
+    /// from the bank that is no longer being displayed.</summary>
+    private readonly byte[] _runLengthLine = new byte[Vdp.ScreenWidth];
+    private int _runLengthLineNumber = -1;
+    private int _runLengthLineBank = -1;
+
     private void ResetVdp()
     {
         Array.Clear(VdpRegs);
@@ -115,6 +132,7 @@ public sealed partial class Sega32X
         VdpRegs[0] = NPalBit;
         _wasVBlank = true;
         _pendingFrameSelectValue = false; // matches FS=0's power-on default
+        InvalidateRunLengthLine();
         _blankFakeCounter = 0;
     }
 
@@ -148,9 +166,80 @@ public sealed partial class Sega32X
         _wasVBlank = isVBlank;
     }
 
+    /// <summary>Decodes one Run Length scanline into <see cref="_runLengthLine"/> and returns it,
+    /// reusing the previous decode when the same line of the same bank is asked for again.
+    ///
+    /// Each frame-buffer word is one run: <b>low byte = palette index, high byte = run length minus
+    /// one</b>, so a word emits between 1 and 256 pixels. Confirmed against PicoDrive's
+    /// <c>do_line_rl</c> (<c>draw.c:107-121</c>):
+    /// <code>
+    /// for (i = 320; i > 0; p32x++) {
+    ///   t = pal[*p32x &amp; 0xff];
+    ///   for (len = (*p32x >> 8) + 1; len > 0 &amp;&amp; i > 0; len--, i--, pd++, pmd++)
+    /// </code>
+    /// Runs are consumed until the 320-pixel line is filled, and a run that would overshoot is
+    /// simply truncated (PicoDrive's own <c>i &gt; 0</c> guard) rather than wrapping into the next
+    /// line. Unlike Packed Pixel this mode does <em>not</em> apply <c>SFT</c> — that shift exists
+    /// only in <c>do_line_pp</c>, and there is no equivalent in the run-length path.
+    ///
+    /// Data running out before the line is full (a short or malformed stream, or a line-table entry
+    /// pointing near the end of the bank) pads with palette index 0 rather than throwing or reading
+    /// out of bounds — the same "degrade visibly, don't crash" stance the rest of this file
+    /// takes.</summary>
+    private byte[] DecodeRunLengthLine(byte[] bank, int lineWordOffset, int line)
+    {
+        int bankIndex = DisplayBankIndex;
+        if (_runLengthLineNumber == line && _runLengthLineBank == bankIndex)
+        {
+            return _runLengthLine;
+        }
+
+        int x = 0;
+        int wordOffset = lineWordOffset;
+        while (x < Vdp.ScreenWidth)
+        {
+            int byteOffset = wordOffset * 2;
+            if (byteOffset + 1 >= bank.Length)
+            {
+                break;
+            }
+
+            byte paletteIndex = bank[byteOffset + 1]; // low byte of the big-endian word
+            int runLength = bank[byteOffset] + 1;     // high byte + 1
+            wordOffset++;
+
+            for (int i = 0; i < runLength && x < Vdp.ScreenWidth; i++)
+            {
+                _runLengthLine[x++] = paletteIndex;
+            }
+        }
+
+        while (x < Vdp.ScreenWidth)
+        {
+            _runLengthLine[x++] = 0;
+        }
+
+        _runLengthLineNumber = line;
+        _runLengthLineBank = bankIndex;
+        return _runLengthLine;
+    }
+
     private void ApplyFrameSelect(bool fs)
     {
         VdpRegs[5] = fs ? (ushort)(VdpRegs[5] | FsBit) : (ushort)(VdpRegs[5] & ~FsBit);
+
+        // A bank swap is the only way the *displayed* bank's contents can change: both CPUs' frame
+        // buffer windows always target WriteBankIndex, so nothing can write the bank currently on
+        // screen. That makes this the exact and only point at which a decoded Run Length line can
+        // go stale -- including the case the bank index alone would miss, where FS goes 0->1->0 and
+        // bank 0 was rewritten in between while it was the write bank.
+        InvalidateRunLengthLine();
+    }
+
+    private void InvalidateRunLengthLine()
+    {
+        _runLengthLineNumber = -1;
+        _runLengthLineBank = -1;
     }
 
     /// <summary>Resolves the 32X layer's contribution to one Genesis pixel, implementing the
@@ -163,7 +252,7 @@ public sealed partial class Sega32X
     {
         r = g = b = 0;
         int mode = VdpRegs[0] & MxMask;
-        if (mode is 0 or 3) // 0 = off; 3 = Run Length, deferred -- degrade to "layer off" rather than render garbage.
+        if (mode == 0) // display off
         {
             return false;
         }
@@ -221,6 +310,17 @@ public sealed partial class Sega32X
             }
 
             ushort paletteEntry = Palette[displayBank[byteOffset]];
+            priorityBit = (paletteEntry & 0x8000) != 0;
+            raw15 = (ushort)(paletteEntry & 0x7FFF);
+        }
+        else if (mode == 3) // Run Length: palette indices, run-length encoded per line.
+        {
+            if (pixelX >= Vdp.ScreenWidth)
+            {
+                return false;
+            }
+
+            ushort paletteEntry = Palette[DecodeRunLengthLine(displayBank, lineWordOffset, y)[pixelX]];
             priorityBit = (paletteEntry & 0x8000) != 0;
             raw15 = (ushort)(paletteEntry & 0x7FFF);
         }

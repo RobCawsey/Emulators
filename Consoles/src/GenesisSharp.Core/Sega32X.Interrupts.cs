@@ -216,6 +216,22 @@ public sealed partial class Sega32X
                 AssertPendingInterrupt(core, PwmPendingBit);
             }
         }
+
+        // RTP: the same event also asserts the PWM chip's DMA request line, letting a DMAC channel
+        // refill the FIFO without the SH-2 writing each sample by hand. Confirmed against
+        // PicoDrive's do_pwm_irq (pwm.c:49-58), where the DREQ1 trigger sits alongside the
+        // interrupt under exactly this bit. Offered to both cores because either may have armed a
+        // channel for it; each ignores it unless its own channel 1 is enabled and unfinished (see
+        // Sega32XSh2Bus.TriggerDreq1).
+        //
+        // Note this is the interrupt *and* the DMA request, not one or the other: software can
+        // legitimately mask the PWM interrupt off on both cores and still rely on RTP to feed the
+        // FIFO, which is why this sits outside the per-core mask loop above.
+        if ((Regs[PwmControlIndex] & PwmRtpBit) != 0)
+        {
+            _masterSh2Bus.TriggerDreq1();
+            _slaveSh2Bus.TriggerDreq1();
+        }
     }
 
     /// <summary>The highest-priority 32X interrupt (level 14, the top of the five-source table

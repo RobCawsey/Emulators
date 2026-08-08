@@ -427,7 +427,8 @@ arbitration code's "genuinely stopped while held, not just skipped mid-loop" sha
 
 **Explicitly deferred this phase** (named, not silently dropped — see `Sega32X.cs`'s own remarks):
 the frame buffer/VDP overlay (CS2, the 68k `$840000`/`$860000` windows, `vdp_regs`, palette) — now
-built in Phase 3 (§4a.2, below); PWM (Phase 4); DREQ/DMAC (storage-only, no transfer logic yet);
+built in Phase 3 (§4a.2, below); PWM (Phase 4); DREQ/DMAC (storage-only then — the on-chip DMAC and
+PWM's RTP-driven DREQ1 auto-feed have since landed, §4a.3);
 interrupt routing (VRES/VINT/HINT/CMD/PWM) — not needed for the register-block wiring this phase
 proves; the 68k-side ROM banking window (`$900000-$9FFFFF`) — SH-2 CS1 reads the cartridge image
 directly and unbanked instead; a synthesized boot-stub/Initial-Data-Load fallback the way PicoDrive
@@ -440,10 +441,19 @@ subsystem is always wired in and simply stays inert unless a ROM's own boot code
 
 `src/GenesisSharp.Core/Sega32X.Vdp.cs` — the 32X's own frame-buffer-based graphics chip: its
 double-buffered frame buffer, its 256-entry palette, its display-mode/fill/FBCR register block,
-and the compositing rule that overlays its output onto the Genesis VDP's own — Packed Pixel and
-Direct Color display modes only; Run Length is deferred (degrades to "layer off" rather than
-rendering garbage). Ground truth: `reference/PicoDrive/picodrive/pico/32x/draw.c` and `32x.c`,
-cited per-member in `Sega32X.Vdp.cs`.
+and the compositing rule that overlays its output onto the Genesis VDP's own — all three display
+modes (Packed Pixel, Direct Color, Run Length). Ground truth:
+`reference/PicoDrive/picodrive/pico/32x/draw.c` and `32x.c`, cited per-member in `Sega32X.Vdp.cs`.
+
+**Run Length** is the one mode whose pixels aren't directly addressable: each frame-buffer word is
+a run (low byte = palette index, high byte = length − 1), so a pixel's value depends on every run
+before it on that line. Answering per-pixel would be quadratic, so `DecodeRunLengthLine` expands a
+whole scanline on first touch and serves the rest from that. The cache is invalidated on `FS`
+swap — which is exactly and only when displayed content can change, since both CPUs' frame-buffer
+windows always target the *write* bank, so nothing can write the bank currently on screen. A bank
+index alone would be insufficient: `FS` going 0→1→0 returns to a bank rewritten in between.
+Overlong runs truncate at the line edge, and data running out early pads with index 0. Unlike
+Packed Pixel, this mode does not apply `SFT`.
 
 **The rendering hook**: `Vdp` stays 32X-agnostic, exactly like it already is about `Cartridge` —
 `Vdp.External32XPixelBlend` (a `delegate bool Try32XPixelBlend(int x, int y, bool
@@ -493,7 +503,7 @@ real hardware timing — confirmed as an admitted hack even in PicoDrive itself 
 "what's the deal with that?"), faked here identically via a free-running counter incremented on
 every FBCR read.
 
-**Known gaps this phase**: Run Length display mode; real multi-cycle autofill timing (the burst
+**Known gaps this phase**: real multi-cycle autofill timing (the burst
 completes instantly on write); the exact inclusive/exclusive word-count convention for the
 autofill length register (implemented as length+1 words, a reasonable but not byte-exact-confirmed
 interpretation); which physical R/G/B channel each of the three 5-bit fields in a 5:5:5 color
@@ -531,11 +541,18 @@ decimation *and* its underrun-holds-last-value behavior with no separate ring bu
 `GenesisConsole.GenerateAudioSample()` mixes its stereo output in alongside PSG/YM2612 — no
 `RunScanline` change was needed, since audio generation already runs at the right cadence.
 
-**Known gaps this phase**: PWM interrupts (`P32XI_PWM`) and RTP-triggered DREQ1/DMA auto-feed —
-both part of the interrupt/DMA subsystem Phase 2 already deferred wholesale. This is a real,
-load-bearing gap for games that rely on the interrupt as their "feed me more data" signal, but
-FIFO underrun degrades safely (holds the last sample rather than crashing or producing garbage).
-The exact bit-field meaning of routing-nibble values other than the two confirmed stereo modes
+**PWM's two "feed me more data" mechanisms are both implemented.** The interrupt (`P32XI_PWM`,
+§4a.6) is one; the other is **RTP**, control-register bit 7, which makes each PWM interrupt also
+assert the chip's DMA request line so a DMAC channel can refill the FIFO without the SH-2 writing
+each sample by hand. `Sega32XSh2Bus.TriggerDreq1` answers it, and differs from an auto-request
+transfer in three ways that all matter: it moves **exactly one unit per request** (PicoDrive's
+`dmac_transfer_one`, not a loop — draining the buffer in one go would overrun the 3-entry FIFO
+immediately), it is channel 1 only, and it deliberately does *not* require `AR`, since this
+**is** the external request an `AR`-clear channel is waiting for. Completion sets `TE` and, if
+`IE` is set, raises the SH-2's own DMA-complete interrupt through the internal (auto-clearing)
+path — not the external IRL pins, matching PicoDrive's `sh2_internal_irq` in `dmac_te_irq`.
+
+**Known gaps this phase**: the exact bit-field meaning of routing-nibble values other than the two confirmed stereo modes
 (normal/swapped) and the four confirmed-invalid ones — treated here as mono — isn't fully resolved
 even in PicoDrive's own source.
 
@@ -723,9 +740,9 @@ title** (user-supplied, legally-owned dump — the first real-ROM validation thi
   release), and the masked-write fix (`REN` survives writes that set/clear nRES/ADEN; clearing
   `ADEN` forces `NRes` back to `true`).
 
-**Known gaps**: DREQ-driven DMA (including PWM's own RTP auto-feed) remains unimplemented — some
-real titles' post-boot code may still stall or misbehave on it. Real-ROM validation (Phase 6's
-stated goal) is in progress but not complete; further real-ROM issues may still surface.
+**Known gaps**: Real-ROM validation (Phase 6's stated goal) is in progress but not complete. One
+commercial title now renders and sounds correct end-to-end through its intro and cutscenes, but
+that is one title and a few minutes of it; further real-ROM issues may still surface.
 
 ### 4a.6 Interrupt routing (VRES/VINT/HINT/CMD/PWM)
 
@@ -1560,11 +1577,9 @@ A consolidated list, pulled from §3–§9, of what to check first if a game mis
   the debug window has a live SH-2 register/disassembly tab, and — as of §4a.5 — a real,
   unmodified 32X ROM's boot sequence (the "M_OK"/"S_OK" COMM-register handshake, jumping to each
   core's own ROM-header-named entry point) runs without needing a real Sega BIOS this project
-  can't ship. There is still no Run Length display mode, no DREQ/DMAC, no 32X-side interrupt
-  routing (including PWM's own "feed me more data" interrupt — FIFO underrun degrades safely to
-  holding the last sample rather than breaking outright, but some real games may still go audibly
-  stale without it) — either of which could still stall or misbehave post-boot in a real title
-  independent of whether boot itself now succeeds. Within the CPU core itself: no cache/DMAC/timer/
+  can't ship. All three display modes, all five 32X interrupt sources (§4a.6), the on-chip DMAC
+  including PWM's own RTP-driven auto-feed, and real-ROM-verified frame-buffer rendering have since
+  landed too. Within the CPU core itself: no cache/timer/
   serial emulation; NMI's vector number and interrupt-entry cost are unverified (PicoDrive doesn't
   model SH-2 NMI); no hardware test-vector suite is known to exist for SH-2, unlike the 68000 core.
   Phase 6's boot-stub mechanism has synthetic test coverage (§4a.5) but has not yet been confirmed

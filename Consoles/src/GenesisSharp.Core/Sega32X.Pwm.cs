@@ -28,6 +28,12 @@ public sealed partial class Sega32X
     private const int PwmRightIndex = 0x1B;   // byte offset 0x36/0x37 (Right FIFO)
     private const int PwmMonoIndex = 0x1C;    // byte offset 0x38/0x39 (Mono alias -> Left FIFO)
 
+    /// <summary>RTP, control-register bit 7 (<c>P32XP_RTP</c>, pico_int.h:615) — SH-2-writable
+    /// only. When set, every PWM interrupt also asserts the chip's DMA request line, which is how
+    /// real software keeps the FIFO fed without hand-writing each sample. See
+    /// <see cref="RaisePwmInterrupt"/>.</summary>
+    private const ushort PwmRtpBit = 1 << 7;
+
     private const byte PwmFullBit = 1 << 7;  // high byte of a status read; P32XP_FULL (1<<15 of the word), pico_int.h:616
     private const byte PwmEmptyBit = 1 << 6; // P32XP_EMPTY (1<<14 of the word), pico_int.h:617
 

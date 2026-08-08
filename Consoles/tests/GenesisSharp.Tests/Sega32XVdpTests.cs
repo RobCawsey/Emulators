@@ -46,15 +46,86 @@ public class Sega32XVdpTests
         Assert.False(result);
     }
 
+    /// <summary>Sets up one Run Length scanline from (paletteIndex, runLength) pairs. Each pair
+    /// becomes one frame-buffer word: low byte = palette index, high byte = run length - 1
+    /// (confirmed against <c>do_line_rl</c>, draw.c:107-121).</summary>
+    private static void SetUpRunLengthLine(Sega32X sega32X, int line, params (byte PaletteIndex, int RunLength)[] runs)
+    {
+        sega32X.WriteVdpControlByteFrom68k(0x01, 0x03); // Mx = 3 (Run Length)
+        byte[] bank = sega32X.FrameBuffer[0];
+        bank[line * 2] = PixelDataWordOffset >> 8;
+        bank[line * 2 + 1] = PixelDataWordOffset & 0xFF;
+
+        int at = PixelDataWordOffset * 2;
+        foreach ((byte paletteIndex, int runLength) in runs)
+        {
+            bank[at] = (byte)(runLength - 1); // high byte
+            bank[at + 1] = paletteIndex;      // low byte
+            at += 2;
+        }
+    }
+
     [Fact]
-    public void TryGetPixel_RunLengthMode_DegradesToLayerOffRatherThanRenderingGarbage()
+    public void TryGetPixel_RunLength_ExpandsEachWordIntoItsRunOfPixels()
     {
         var sega32X = CreateSega32X();
-        sega32X.WriteVdpControlByteFrom68k(0x01, 0x03); // Mx = 3 (Run Length, deferred this phase)
+        SetUpRunLengthLine(sega32X, line: 0, (5, 3), (6, 2));
+        sega32X.Palette[5] = 0x8421; // priority set, so both show against a non-backdrop Genesis pixel
+        sega32X.Palette[6] = 0x8842;
 
-        bool result = sega32X.TryGetPixel(0, 0, isGenesisBackdrop: true, isH32: false, out _, out _, out _);
+        // Run 1 covers x=0..2, run 2 covers x=3..4.
+        Assert.True(sega32X.TryGetPixel(0, 0, isGenesisBackdrop: false, isH32: false, out _, out _, out byte b0));
+        Assert.True(sega32X.TryGetPixel(2, 0, isGenesisBackdrop: false, isH32: false, out _, out _, out byte b2));
+        Assert.True(sega32X.TryGetPixel(3, 0, isGenesisBackdrop: false, isH32: false, out _, out _, out byte b3));
+        Assert.Equal(b0, b2); // same run -> identical colour
+        Assert.NotEqual(b0, b3); // next run -> a different palette entry
+    }
 
-        Assert.False(result);
+    /// <summary>A run that would overshoot the 320-pixel line is truncated rather than wrapping
+    /// into the next one — PicoDrive's own <c>i &gt; 0</c> guard in <c>do_line_rl</c>'s inner
+    /// loop.</summary>
+    [Fact]
+    public void TryGetPixel_RunLength_TruncatesARunThatOvershootsTheLine()
+    {
+        var sega32X = CreateSega32X();
+        SetUpRunLengthLine(sega32X, line: 0, (7, 256), (7, 256)); // 512 pixels of data for a 320-pixel line
+        sega32X.Palette[7] = 0x8421;
+
+        Assert.True(sega32X.TryGetPixel(319, 0, isGenesisBackdrop: false, isH32: false, out _, out _, out _));
+        // Nothing past the line's own width is addressable, so the overshoot has nowhere to land.
+        Assert.False(sega32X.TryGetPixel(320, 0, isGenesisBackdrop: false, isH32: false, out _, out _, out _));
+    }
+
+    /// <summary>Run Length data that runs out before the line is full pads with palette index 0
+    /// rather than reading past the bank or throwing.</summary>
+    [Fact]
+    public void TryGetPixel_RunLength_PadsWithIndexZeroWhenTheDataRunsOutEarly()
+    {
+        var sega32X = CreateSega32X();
+        SetUpRunLengthLine(sega32X, line: 0, (9, 2)); // only 2 pixels of a 320-pixel line
+        sega32X.Palette[9] = 0x8421; // priority set
+        sega32X.Palette[0] = 0x0421; // priority CLEAR -- the pad colour must lose to a Genesis pixel
+
+        Assert.True(sega32X.TryGetPixel(1, 0, isGenesisBackdrop: false, isH32: false, out _, out _, out _));
+        Assert.False(sega32X.TryGetPixel(2, 0, isGenesisBackdrop: false, isH32: false, out _, out _, out _));
+    }
+
+    /// <summary>The decoded-line cache must not survive a bank swap. FS going 0→1→0 returns to a
+    /// bank whose contents were rewritten in between (while it was the write bank), which a cache
+    /// keyed on bank index alone would miss.</summary>
+    [Fact]
+    public void TryGetPixel_RunLength_DecodedLineIsInvalidatedByABankSwap()
+    {
+        var sega32X = CreateSega32X();
+        SetUpRunLengthLine(sega32X, line: 0, (5, 320));
+        sega32X.Palette[5] = 0x8421;
+        sega32X.Palette[0] = 0x0421; // priority clear
+        Assert.True(sega32X.TryGetPixel(0, 0, isGenesisBackdrop: false, isH32: false, out _, out _, out _));
+
+        // Swap to bank 1, which was never populated -- its line table is all zeros.
+        sega32X.WriteVdpControlByteFrom68k(0x0B, 0x01);
+
+        Assert.False(sega32X.TryGetPixel(0, 0, isGenesisBackdrop: false, isH32: false, out _, out _, out _));
     }
 
     [Fact]

@@ -70,10 +70,22 @@ internal sealed class Sega32XSh2Bus : IBus
     private const int Dmac1Dar = 0x194;
     private const int Dmac1Tcr = 0x198;
     private const int Dmac1Chcr = 0x19C;
+    // Continuing the same struct dmac layout: chan[2] occupies 0x180-0x19f, then vcrdma0,
+    // unknown0, vcrdma1, unknown1, dmaor -- so the two channels' own DMA-complete vector registers
+    // land at 0x1a0 and 0x1a8, and DMAOR at 0x1b0.
+    private const int Dmac0Vcr = 0x1A0;
+    private const int Dmac1Vcr = 0x1A8;
     private const int DmaorOffset = 0x1B0;
+
+    /// <summary>IPRA, the on-chip interrupt-priority register whose low nibble supplies the level a
+    /// completed DMA transfer interrupts at (<c>PREG8(regs, 0xe2) &amp; 0x0f</c>,
+    /// <c>dmac_te_irq</c>, sh2soc.c). Byte offset within the peripheral block, i.e. real address
+    /// $FFFFFEE2.</summary>
+    private const int IpraOffset = 0xE2;
 
     private const uint ChcrDe = 1 << 0; // DMA enable
     private const uint ChcrTe = 1 << 1; // transfer end
+    private const uint ChcrIe = 1 << 2; // interrupt enable (on transfer end)
     private const uint ChcrAr = 1 << 9; // auto-request (vs. external DREQ-driven)
     private const uint DmaorDme = 1 << 0; // DMA master enable
 
@@ -416,8 +428,115 @@ internal sealed class Sega32XSh2Bus : IBus
             return;
         }
 
-        TryTriggerDmaChannel(Dmac0Sar, Dmac0Dar, Dmac0Tcr, Dmac0Chcr);
-        TryTriggerDmaChannel(Dmac1Sar, Dmac1Dar, Dmac1Tcr, Dmac1Chcr);
+        TryTriggerDmaChannel(Dmac0Sar, Dmac0Dar, Dmac0Tcr, Dmac0Chcr, Dmac0Vcr);
+        TryTriggerDmaChannel(Dmac1Sar, Dmac1Dar, Dmac1Tcr, Dmac1Chcr, Dmac1Vcr);
+    }
+
+    /// <summary>The PWM chip's own DMA request line, asserted once per PWM interrupt while RTP is
+    /// set — the mechanism real 32X software uses to keep the PWM FIFO fed without the SH-2 doing
+    /// it by hand. Confirmed against PicoDrive's <c>p32x_dreq1_trigger</c> (<c>sh2soc.c:559</c>),
+    /// called from <c>do_pwm_irq</c> (<c>pwm.c:53-57</c>).
+    ///
+    /// Three things distinguish this from the auto-request path above, and all three matter:
+    /// <list type="bullet">
+    /// <item>It transfers <b>exactly one unit per request</b>, not the whole block —
+    /// <c>dmac_transfer_one</c>, not a loop. The PWM chip asking for one sample is the whole
+    /// point; draining the entire buffer in one go would overrun the 3-entry FIFO immediately.</item>
+    /// <item>It is channel 1 only.</item>
+    /// <item>It deliberately does <em>not</em> require <c>AR</c>. This <em>is</em> the external
+    /// request that channels with <c>AR</c> clear are waiting for, so requiring it would reject
+    /// exactly the configuration this exists to serve.</item>
+    /// </list>
+    /// PicoDrive additionally sanity-checks that the destination looks like the PWM FIFO
+    /// (<c>(dar &amp; ~0xf) != 0x20004030</c>) and logs if not; that is a diagnostic in its own
+    /// source, not a gate on the transfer, so it isn't reproduced as one here.</summary>
+    internal void TriggerDreq1()
+    {
+        if ((ReadPeripheralLong(DmaorOffset) & DmaorDme) == 0)
+        {
+            return;
+        }
+
+        uint chcr = ReadPeripheralLong(Dmac1Chcr);
+        if ((chcr & (ChcrTe | ChcrDe)) != ChcrDe) // enabled, and not already finished
+        {
+            return;
+        }
+
+        uint remaining = TransferOneDmaUnit(Dmac1Sar, Dmac1Dar, Dmac1Tcr, chcr);
+        if (remaining == 0)
+        {
+            CompleteDmaChannel(Dmac1Chcr, chcr, Dmac1Vcr);
+        }
+    }
+
+    /// <summary>Moves a single transfer unit and advances SAR/DAR/TCR, returning the transfer count
+    /// still outstanding. Shared by the auto-request burst and <see cref="TriggerDreq1"/> so both
+    /// agree on size decoding and address stepping — <c>dmac_transfer_one</c> (sh2soc.c) is
+    /// likewise the single primitive both of PicoDrive's paths call.</summary>
+    private uint TransferOneDmaUnit(int sarOffset, int darOffset, int tcrOffset, uint chcr)
+    {
+        uint sar = ReadPeripheralLong(sarOffset);
+        uint dar = ReadPeripheralLong(darOffset);
+        uint tcr = ReadPeripheralLong(tcrOffset) & 0x00FF_FFFF;
+
+        int transferSize = (int)((chcr >> 10) & 3);
+        TransferDmaUnit(transferSize, sar, dar);
+        AdvanceDmaAddresses(chcr, DmaStepSize(transferSize), ref sar, ref dar);
+        tcr = tcr == 0 ? 0 : tcr - 1;
+
+        WritePeripheralLong(sarOffset, sar);
+        WritePeripheralLong(darOffset, dar);
+        WritePeripheralLong(tcrOffset, tcr);
+        return tcr;
+    }
+
+    private static int DmaStepSize(int transferSize) => transferSize switch { 0 => 1, 1 => 2, _ => 4 };
+
+    private void TransferDmaUnit(int transferSize, uint sar, uint dar)
+    {
+        switch (transferSize)
+        {
+            case 0: WriteByte(dar, ReadByte(sar)); break;
+            case 1: WriteWord(dar, ReadWord(sar)); break;
+            default: WriteLong(dar, ReadLong(sar)); break;
+        }
+    }
+
+    /// <summary>CHCR's four address-mode bits, matching <c>dmac_transfer_one</c>'s own
+    /// bit-at-a-time form (sh2soc.c): bit 15 decrements DAR, bit 14 increments it, bit 13
+    /// decrements SAR, bit 12 increments it. Neither bit set means the address is held.</summary>
+    private static void AdvanceDmaAddresses(uint chcr, int stepSize, ref uint sar, ref uint dar)
+    {
+        if ((chcr & (1 << 15)) != 0) dar -= (uint)stepSize;
+        if ((chcr & (1 << 14)) != 0) dar += (uint)stepSize;
+        if ((chcr & (1 << 13)) != 0) sar -= (uint)stepSize;
+        if ((chcr & (1 << 12)) != 0) sar += (uint)stepSize;
+    }
+
+    /// <summary>Marks a channel finished and, if its IE bit is set, raises the SH-2's own
+    /// DMA-complete interrupt. Confirmed against <c>dmac_transfer_complete</c>/<c>dmac_te_irq</c>
+    /// (sh2soc.c): the level comes from IPRA's low nibble and the vector from that channel's own
+    /// VCRDMA register, masked to 7 bits.
+    ///
+    /// This is an <em>on-chip peripheral</em> interrupt, so it goes through
+    /// <see cref="Sh2.RaiseInternalInterrupt"/> — the auto-clearing path — and not the external
+    /// IRL pins the 32X's own five adapter-level sources drive. PicoDrive draws the same
+    /// distinction, calling <c>sh2_internal_irq</c> here.</summary>
+    private void CompleteDmaChannel(int chcrOffset, uint chcr, int vcrOffset)
+    {
+        WritePeripheralLong(chcrOffset, chcr | ChcrTe);
+
+        if ((chcr & ChcrIe) == 0)
+        {
+            return;
+        }
+
+        int level = _peripheralRegs[IpraOffset] & 0x0F;
+        if (level > 0)
+        {
+            _ownSh2?.RaiseInternalInterrupt(level, (int)(ReadPeripheralLong(vcrOffset) & 0x7F));
+        }
     }
 
     /// <summary>Performs one DMAC channel's transfer synchronously and instantly on the
@@ -437,7 +556,7 @@ internal sealed class Sega32XSh2Bus : IBus
     /// is not implemented — falls back to one 32-bit unit at a time, which under-transfers per
     /// step rather than corrupting anything already-decoded correctly; no PicoDrive source access
     /// used it during this project's own research pass.</summary>
-    private void TryTriggerDmaChannel(int sarOffset, int darOffset, int tcrOffset, int chcrOffset)
+    private void TryTriggerDmaChannel(int sarOffset, int darOffset, int tcrOffset, int chcrOffset, int vcrOffset)
     {
         uint chcr = ReadPeripheralLong(chcrOffset);
         if ((chcr & (ChcrTe | ChcrDe)) != ChcrDe)
@@ -447,50 +566,19 @@ internal sealed class Sega32XSh2Bus : IBus
 
         if ((chcr & ChcrAr) == 0)
         {
-            return; // external-request transfer -- not implemented, see this method's own remarks
+            // External-request channel: it transfers when its DREQ line is asserted, not on the
+            // register write that armed it. PWM's RTP drives channel 1's -- see TriggerDreq1.
+            return;
         }
 
-        uint sar = ReadPeripheralLong(sarOffset);
-        uint dar = ReadPeripheralLong(darOffset);
         uint tcr = ReadPeripheralLong(tcrOffset) & 0x00FF_FFFF; // 24-bit count, matches PicoDrive's `tcr &= 0xffffff`
-        if (tcr > MaxDmaTransferUnits)
+        uint units = Math.Min(tcr, MaxDmaTransferUnits); // defensive cap -- see MaxDmaTransferUnits' own remarks
+
+        for (uint i = 0; i < units; i++)
         {
-            tcr = MaxDmaTransferUnits; // defensive cap -- see MaxDmaTransferUnits' own remarks
+            TransferOneDmaUnit(sarOffset, darOffset, tcrOffset, chcr);
         }
 
-        int transferSize = (int)((chcr >> 10) & 3); // 0=byte, 1=word, 2=long, 3=16-byte block (unimplemented, falls to long)
-        int stepSize = transferSize switch { 0 => 1, 1 => 2, _ => 4 };
-        uint destinationMode = (chcr >> 14) & 3;
-        uint sourceMode = (chcr >> 12) & 3;
-
-        while (tcr > 0)
-        {
-            switch (transferSize)
-            {
-                case 0: WriteByte(dar, ReadByte(sar)); break;
-                case 1: WriteWord(dar, ReadWord(sar)); break;
-                default: WriteLong(dar, ReadLong(sar)); break;
-            }
-
-            if (destinationMode == 1) dar += (uint)stepSize;
-            else if (destinationMode == 2) dar -= (uint)stepSize;
-
-            if (sourceMode == 1) sar += (uint)stepSize;
-            else if (sourceMode == 2) sar -= (uint)stepSize;
-
-            tcr--;
-        }
-
-        WritePeripheralLong(sarOffset, sar);
-        WritePeripheralLong(darOffset, dar);
-        WritePeripheralLong(tcrOffset, 0);
-        WritePeripheralLong(chcrOffset, chcr | ChcrTe);
-
-        // IE (bit 2) would raise an SH-2-internal DMA-complete interrupt on real hardware
-        // (PicoDrive's dmac_transfer_complete -> dmac_te_irq, sh2soc.c:64-83) -- this core has no
-        // equivalent of that second, SH-2-peripheral-driven interrupt path (distinct from the
-        // 32X's own five adapter-level sources in Sega32X.Interrupts.cs). Named gap, not silently
-        // dropped: TE is still set correctly above, so software that polls CHCR's own TE bit
-        // (rather than waiting on the IRQ specifically) will still see the transfer complete.
+        CompleteDmaChannel(chcrOffset, chcr, vcrOffset);
     }
 }
