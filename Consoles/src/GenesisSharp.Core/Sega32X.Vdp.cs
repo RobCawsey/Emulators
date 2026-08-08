@@ -274,12 +274,17 @@ public sealed partial class Sega32X
         // Worth spelling out, because the obvious-looking candidate is a trap this code fell into
         // twice: `Pico32xRenderSync`'s `offs = 8; if (Pico.video.reg[1] & 8) offs = 0;`
         // (32x.c:257-259) reads exactly like a V28/V30 line-table offset, and is nothing of the
-        // sort -- `offs` feeds `Pico.est.DrawLineDest = DrawLineDestBase32x + offs *
-        // DrawLineDestIncrement32x` (draw.c:290), i.e. it is a *destination* offset that centres a
-        // 224-line picture inside PicoDrive's 240-line output buffer. It reaches the draw loops
-        // only in `lines_sft_offs`'s low byte, which those loops never read. GenesisSharp's own
-        // FrameBuffer is the 224-line active display alone, so the equivalent centring offset here
-        // is structurally zero, in both V28 and V30.
+        // sort. `offs` is a *frame-alignment* value -- a 224-line picture sits 8 lines down inside
+        // the 240-line frame -- and it is used in exactly two places, both alignment:
+        //     Pico.est.DrawLineDest = DrawLineDestBase32x + offs * DrawLineDestIncrement32x
+        //         (draw.c:293) -- which output row 32X scanline 0 lands on; and
+        //     pmd = Pico.est.Draw2FB + 328 * (lines_sft_offs & 0xff) + 8
+        //         (draw.c:196-197,218-219,240-241) -- which *Genesis-layer* scanline is composited
+        //         against 32X scanline 0, so the two layers line up.
+        // Neither is the 32X's own line table, which is indexed independently and never sees offs
+        // at all. GenesisSharp's FrameBuffer is the 224-line active display alone and its 32X/
+        // Genesis layers are already row-aligned by construction, so both alignment offsets are
+        // structurally zero here, in both V28 and V30.
         //
         // Adding 8 here instead cost real, visible corruption on a real 32X title (Pitfall: The
         // Mayan Adventure): the game populates exactly 224 table entries, 0-223, so every visible
