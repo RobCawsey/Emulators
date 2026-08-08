@@ -320,7 +320,7 @@
     <li><a href="#interrupts">Interrupts</a></li>
     <li><a href="#audio">Audio subsystem</a></li>
     <li><a href="#controllers">Controller ports</a></li>
-    <li><a href="#sh2-32x">The 32X extension: SH-2 CPUs (in progress)</a></li>
+    <li><a href="#sh2-32x">The 32X extension</a></li>
     <li><a href="#instr-68000">68000 instruction reference</a></li>
     <li><a href="#instr-z80">Z80 instruction reference</a></li>
     <li><a href="#instr-sh2">SH-2 instruction reference</a></li>
@@ -3044,14 +3044,22 @@
 </section>
 
 <section id="sh2-32x">
-  <h2><span class="num">12</span> The 32X extension: SH-2 CPUs (in progress)</h2>
+  <h2><span class="num">12</span> The 32X extension</h2>
   <p class="section-intro">
     The <strong>Sega 32X</strong> (1994) is a cartridge-slot add-on that turns the console into a
     three-CPU machine: it plugs a small board carrying <strong>two Hitachi SH-2 RISC processors</strong>,
     a second frame-buffer-based graphics chip that overlays the existing VDP's output, and a PWM
     sound chip, all sharing bus access with the 68000/Z80/VDP system described above. This section
-    covers only the two SH-2 CPUs — the part of the 32X that GenesisSharp currently has any support
-    for.
+    covers the whole subsystem — the CPUs, the bus they share, the frame buffer and its three
+    display modes, the five interrupt sources, and the PWM chip.
+  </p>
+  <p>
+    A theme worth carrying through this section: the 32X is not a graphics upgrade bolted onto the
+    Genesis, it is a <em>second machine sharing a bus</em>. Almost every design decision below
+    follows from that — who owns which register, which CPU a write is coming from, which of two
+    banks is being displayed versus drawn into, and which chip is allowed to stop asserting an
+    interrupt. Nearly all of the hard bugs found while implementing it were ownership and
+    direction questions, not arithmetic ones.
   </p>
   <ul>
     <li><strong>Two SH-2s, "master" and "slave"</strong> — nominally identical chips, distinguished
@@ -3071,8 +3079,9 @@
   <div class="callout confidence">
     <span class="tag">Confidence note</span>
     <p>
-      The tables below are sourced entirely from <strong>PicoDrive</strong>
-      (<code>reference/PicoDrive/picodrive/pico/32x/memory.c</code> and <code>32x.c</code>), the
+      This section is sourced entirely from <strong>PicoDrive</strong>
+      (<code>pico/32x/memory.c</code>, <code>32x.c</code>, <code>draw.c</code>, <code>pwm.c</code>
+      and <code>sh2soc.c</code>), the
       sole real reference implementation used for this project's 32X work — genesis-plus-gx has
       never shipped 32X emulation, so there was no second source to cross-check against here the
       way earlier sections of this document cross-check the base 68000/Z80/VDP facts against
@@ -3124,10 +3133,11 @@
     <tbody>
       <tr><td class="mono">$00</td><td>FM / REN</td><td>Framebuffer-access-owner and cartridge-enable bits.</td></tr>
       <tr><td class="mono">$01</td><td>nRES / ADEN</td><td>68000-exclusive: nRES/ADEN gate whether either SH-2 runs at all (both bits must be set), and there is a single shared reset line — no independent per-core reset exists anywhere in the register model. A 0→1 transition of nRES resets both cores together.</td></tr>
-      <tr><td class="mono">$02–$03</td><td>IRQ control</td><td>Storage only in GenesisSharp today — no 32X-side interrupt routing is implemented yet (see the status note below).</td></tr>
-      <tr><td class="mono">$04–$05</td><td>ROM bank (68000 side)</td><td>Storage only — GenesisSharp's SH-2 CS1 reads the cartridge image directly and unbanked instead of needing this.</td></tr>
-      <tr><td class="mono">$08–$13</td><td>DREQ source/destination/length/FIFO</td><td>Storage only — no DMA transfer logic implemented yet.</td></tr>
-      <tr><td class="mono">$14–$1D</td><td>IRQ pending-clear registers</td><td>Storage only, same reason as IRQ control above.</td></tr>
+      <tr><td class="mono">$01</td><td class="mono">(SH-2 view)</td><td><strong>The same offset means something completely different depending on who writes it.</strong> To the 68000 it is nRES/ADEN, above. To an SH-2 it is that core's own interrupt-enable register: bit 0 = PWM, 1 = CMD, 2 = HINT, 3 = VINT. Not a renaming of the same bits — a genuinely different register selected by the requester. See the interrupt section below.</td></tr>
+      <tr><td class="mono">$02–$03</td><td>IRQ control</td><td>The 68000's CMD-interrupt request line: bit 0 requests to the master, bit 1 to the slave. A live condition, not a latch — see the interrupt section below.</td></tr>
+      <tr><td class="mono">$04–$05</td><td>ROM bank (68000 side) / H count (SH-2 side)</td><td>Another split-meaning pair. 68000: ROM bank select (GenesisSharp's SH-2 CS1 reads the cartridge unbanked, so it doesn't depend on this). SH-2: the HINT period — HINT fires every (value + 1) scanlines during active display.</td></tr>
+      <tr><td class="mono">$08–$13</td><td>DREQ source/destination/length/FIFO</td><td>The 68000-side DMA request block. Distinct from the SH-2s' own on-chip DMAC, which is what PWM's RTP auto-feed actually drives.</td></tr>
+      <tr><td class="mono">$14–$1D</td><td>IRQ pending-clear registers</td><td>Per-core, one offset per source: <code>$14</code> VRES, <code>$16</code> VINT, <code>$18</code> HINT, <code>$1A</code> CMD, <code>$1C</code> PWM. Writing one is how a handler <em>deasserts</em> its interrupt — which, as the interrupt section explains, is the only thing that stops it firing again.</td></tr>
       <tr><td class="mono">$20–$2F</td><td>COMM0–COMM7</td><td>Eight 16-bit registers, plain shared storage both the 68000 and both SH-2s can freely read and write — the primary channel real 32X software uses to hand data and commands between the three CPUs. GenesisSharp implements this fully; see <a href="#instr-sh2">§15</a>'s emulator for the CPU side.</td></tr>
       <tr><td class="mono">$30–$3F</td><td>PWM</td><td>See the PWM register table below.</td></tr>
     </tbody>
@@ -3137,7 +3147,7 @@
   <table>
     <thead><tr><th class="mono">Offset</th><th>Register</th><th>Notes</th></tr></thead>
     <tbody>
-      <tr><td class="mono">$00</td><td>Display mode / PRI / Mx</td><td><code>Mx</code> (bits 1:0) selects the display mode: 0 = blank (32X layer off), 1 = Packed Pixel (8bpp indexed), 2 = Direct Color (15-bit RGB), 3 = Run Length. GenesisSharp implements modes 0–2; Run Length degrades to blank rather than rendering garbage.</td></tr>
+      <tr><td class="mono">$00</td><td>Display mode / PRI / Mx</td><td><code>Mx</code> (bits 1:0) selects the display mode: 0 = blank (32X layer off), 1 = Packed Pixel (8bpp indexed), 2 = Direct Color (15-bit RGB), 3 = Run Length. <code>PRI</code> (bit 7) globally inverts the sense of every priority bit — see the compositing rule below.</td></tr>
       <tr><td class="mono">$02</td><td>SFT</td><td>Shifts the Packed Pixel scanline start by one byte. Direct Color mode ignores this bit.</td></tr>
       <tr><td class="mono">$04</td><td>Fill length</td><td>Word count for the autofill burst.</td></tr>
       <tr><td class="mono">$06</td><td>Fill start address</td><td>Frame-buffer word offset the autofill burst begins at.</td></tr>
@@ -3159,6 +3169,213 @@
     </tbody>
   </table>
 
+  <h3>The frame buffer: two banks, and a line table</h3>
+  <p>
+    The 32X's graphics chip is not a tilemap engine like the VDP in <a href="#vdp">§6</a>. It is a
+    plain <strong>frame buffer</strong> — software draws pixels itself, with the SH-2s doing the
+    work the VDP's sprite and plane hardware would otherwise do. There are two 128KB banks, and two
+    pieces of indirection sit between "a bank" and "what appears on screen". Both matter, and both
+    have caused real, visible bugs in this emulator.
+  </p>
+
+  <h4>1. Which bank is which — and why software can't write the one it's looking at</h4>
+  <p>
+    FBCR's <code>FS</code> bit selects which bank is <em>displayed</em>. The other bank is the one
+    both CPUs' frame-buffer windows actually read and write. That is not a convention the software
+    opts into — it is how the hardware wires the windows, and it has a useful consequence:
+    <strong>nothing can write the bank currently on screen</strong>, so a half-drawn frame can never
+    be displayed. Software draws into the hidden bank, flips <code>FS</code>, and the roles swap.
+  </p>
+  <p>
+    A write to <code>FS</code> takes effect immediately if the display is already blanking, and is
+    otherwise deferred to the start of the next vblank — so a flip requested mid-frame doesn't tear
+    the picture being scanned out.
+  </p>
+
+  <h4>2. Where a scanline's pixels live — the line table</h4>
+  <p>
+    A frame buffer with a fixed stride would let you compute a pixel's address arithmetically. The
+    32X doesn't work that way. The <strong>low 512 bytes of each bank hold a 256-entry table of
+    16-bit word offsets</strong>, one per scanline, and <em>software writes that table itself</em>.
+    To render scanline <var>y</var> the hardware reads entry <var>y</var>, multiplies by two, and
+    starts reading pixels there.
+  </p>
+  <p>
+    This is not a quirk to work around — it is the point. Because each line's start is independently
+    programmable, software gets effects that would otherwise cost a full redraw: scrolling a line
+    by rewriting one table entry, vertical wrap by pointing several lines at the same data, or
+    split-screen by pointing halves of the screen into different regions. It also means the pixel
+    data itself need not be contiguous or in scanline order.
+  </p>
+  <div class="diagram">
+    <svg viewBox="0 0 940 300" xmlns="http://www.w3.org/2000/svg" font-family="Consolas, monospace">
+      <defs>
+        <marker id="fbArrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="#5f7291"/>
+        </marker>
+      </defs>
+      <g font-size="10">
+        <text x="20" y="24" fill="#c6ecf5" font-size="12">One frame-buffer bank (128KB)</text>
+
+        <rect x="20" y="40" width="200" height="130" fill="#12202a" stroke="#5ad1e6"/>
+        <text x="120" y="60" fill="#c6ecf5" text-anchor="middle">Line table</text>
+        <text x="120" y="74" fill="#5f7291" font-size="9" text-anchor="middle">low 512 bytes</text>
+        <text x="120" y="88" fill="#5f7291" font-size="9" text-anchor="middle">256 × 16-bit word offsets</text>
+        <line x1="30" y1="96" x2="210" y2="96" stroke="#2b3a4a"/>
+        <text x="34" y="112" fill="#8fb6c9" font-size="9">entry 0   → $0640</text>
+        <text x="34" y="126" fill="#8fb6c9" font-size="9">entry 1   → $06E8</text>
+        <text x="34" y="140" fill="#8fb6c9" font-size="9">entry 2   → $0790</text>
+        <text x="34" y="154" fill="#5f7291" font-size="9">   …written by software</text>
+
+        <line x1="220" y1="120" x2="300" y2="120" stroke="#5f7291" marker-end="url(#fbArrow)"/>
+        <text x="260" y="112" fill="#5f7291" font-size="9" text-anchor="middle">×2 = byte offset</text>
+
+        <rect x="300" y="40" width="240" height="130" fill="#12202a" stroke="#5ad1e6"/>
+        <text x="420" y="60" fill="#c6ecf5" text-anchor="middle">Pixel data</text>
+        <text x="420" y="74" fill="#5f7291" font-size="9" text-anchor="middle">format depends on Mx</text>
+        <line x1="310" y1="86" x2="530" y2="86" stroke="#2b3a4a"/>
+        <text x="314" y="104" fill="#8fb6c9" font-size="9">$0C80: line 0's pixels…</text>
+        <text x="314" y="120" fill="#8fb6c9" font-size="9">$0DD0: line 1's pixels…</text>
+        <text x="314" y="136" fill="#8fb6c9" font-size="9">$0F20: line 2's pixels…</text>
+        <text x="314" y="156" fill="#5f7291" font-size="9">need not be contiguous,</text>
+        <text x="314" y="168" fill="#5f7291" font-size="9">or even in line order</text>
+
+        <line x1="540" y1="105" x2="620" y2="105" stroke="#5f7291" marker-end="url(#fbArrow)"/>
+
+        <rect x="620" y="40" width="300" height="130" fill="#1a1420" stroke="#ff8fb0"/>
+        <text x="770" y="60" fill="#ffb9cf" text-anchor="middle">Compositing, per pixel</text>
+        <line x1="630" y1="70" x2="910" y2="70" stroke="#3a2b35"/>
+        <text x="634" y="88" fill="#ffb9cf" font-size="9">Genesis pixel is backdrop?</text>
+        <text x="646" y="102" fill="#8fb6c9" font-size="9">→ 32X pixel wins, always</text>
+        <text x="634" y="120" fill="#ffb9cf" font-size="9">otherwise:</text>
+        <text x="646" y="134" fill="#8fb6c9" font-size="9">→ 32X wins only if its</text>
+        <text x="646" y="146" fill="#8fb6c9" font-size="9">   priority bit is set</text>
+        <text x="646" y="160" fill="#5f7291" font-size="9">(PRI inverts that test globally)</text>
+
+        <rect x="20" y="200" width="900" height="80" fill="#181c24" stroke="#3a4250"/>
+        <text x="34" y="222" fill="#ffb9cf" font-size="11">Why this bit them:</text>
+        <text x="34" y="240" fill="#8fb6c9" font-size="10">A game that populates exactly 224 entries (0–223) is normal. Reading entry y+8 instead of y therefore shifts every</text>
+        <text x="34" y="256" fill="#8fb6c9" font-size="10">row, and runs the bottom 8 rows off the end into zeros — word offset 0, which points back at the line table itself,</text>
+        <text x="34" y="272" fill="#8fb6c9" font-size="10">so those rows render the table's own bytes as pixels: a stable band of structured colour noise at the screen bottom.</text>
+      </g>
+    </svg>
+  </div>
+
+  <div class="callout confidence">
+    <span class="tag">Implementation note</span>
+    <p>
+      The line-table index is simply the scanline number — no offset, in either 224-line or
+      240-line mode. This is worth stating flatly because the obvious-looking candidate is a trap:
+      PicoDrive's renderer computes <code>offs = 8</code> for 224-line mode, which reads exactly
+      like a line-table offset and is nothing of the sort. It is a <em>destination</em> offset that
+      centres a 224-line picture inside a 240-line output buffer, and never reaches the code that
+      indexes the table. GenesisSharp fell for it twice — the second time while "fixing" the first
+      — producing precisely the corruption band drawn above.
+    </p>
+  </div>
+
+  <h4>The three display modes</h4>
+  <table>
+    <thead><tr><th>Mx</th><th>Mode</th><th>Pixel format</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td class="mono">1</td><td>Packed Pixel</td><td>1 byte = palette index</td><td>The common case. <code>SFT</code> shifts the line start by one byte, letting software scroll horizontally by one pixel without redrawing.</td></tr>
+      <tr><td class="mono">2</td><td>Direct Color</td><td>1 word = 5:5:5 RGB + priority</td><td>No palette lookup — the pixel word <em>is</em> the colour, and its bit 15 is the priority bit directly. Ignores <code>SFT</code>.</td></tr>
+      <tr><td class="mono">3</td><td>Run Length</td><td>1 word = index + run length</td><td>Low byte = palette index, high byte = run length − 1, so one word paints 1–256 identical pixels. Runs are consumed until the 320-pixel line is full; an overlong run is truncated at the line edge rather than spilling into the next line. Ignores <code>SFT</code>.</td></tr>
+    </tbody>
+  </table>
+  <p>
+    Run Length is the one mode whose pixels are not randomly addressable: a pixel's value depends on
+    every run before it on that line, so "what is at <var>x</var>?" can only be answered by walking
+    from the line start. An emulator that renders pixel-at-a-time has to decode the whole line once
+    and cache it, or pay a quadratic cost. That cache then needs invalidating at exactly one moment
+    — the <code>FS</code> flip — because as established above, the displayed bank's contents cannot
+    change by any other means.
+  </p>
+
+  <h3>Interrupts: five sources, and who is allowed to stop them</h3>
+  <p>
+    All five 32X interrupt sources target the <strong>SH-2s only</strong>. Nothing in the 32X raises
+    an interrupt on the 68000; the 68000 learns what the SH-2s are doing by polling the COMM
+    registers. Priority is fixed, and the vector is derived from the level rather than supplied by
+    the interrupting device (the SH-2's auto-vector convention for external interrupts).
+  </p>
+  <table>
+    <thead><tr><th>Source</th><th>Level</th><th>Vector</th><th>Maskable?</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td>VRES</td><td class="mono">14</td><td class="mono">71</td><td><strong>No</strong></td><td>Whole-system reset. Despite the name this is <em>not</em> the SH-2 reset line — see below.</td></tr>
+      <tr><td>VINT</td><td class="mono">12</td><td class="mono">70</td><td>bit 3</td><td>Vertical blank, mirroring the Genesis VDP's own vblank edge.</td></tr>
+      <tr><td>HINT</td><td class="mono">10</td><td class="mono">69</td><td>bit 2</td><td>Horizontal, every (H-count + 1) active scanlines.</td></tr>
+      <tr><td>CMD</td><td class="mono">8</td><td class="mono">68</td><td>bit 1</td><td>The 68000 asking an SH-2 to do something.</td></tr>
+      <tr><td>PWM</td><td class="mono">6</td><td class="mono">67</td><td>bit 0</td><td>"FIFO needs feeding" — see the audio section below.</td></tr>
+    </tbody>
+  </table>
+
+  <h4>These are levels, not events</h4>
+  <p>
+    This is the single most consequential thing to understand about 32X interrupts, and the easiest
+    to get wrong. <strong>Servicing one of these does not clear it.</strong> The source holds the
+    line asserted, and the handler is expected to tell it to stop — by writing that source's own
+    per-core clear register (<code>$14</code>–<code>$1C</code>). If it doesn't, the interrupt fires
+    again the moment <code>RTE</code> restores <code>SR</code>, forever. Re-entry
+    <em>during</em> the handler is prevented separately, by the CPU raising its interrupt mask to
+    the serviced level on entry.
+  </p>
+  <p>
+    CMD is the exception that proves the rule: it has no pending bit to clear, because it is a
+    <em>live condition</em> — the AND of the 68000's request bit and that core's enable bit,
+    re-evaluated whenever either changes. Writing its <code>$1A</code> offset clears the 68000's
+    request, and the condition goes false on its own.
+  </p>
+  <p>
+    The SH-2 also has a second, unrelated interrupt input: its <strong>on-chip peripherals</strong>
+    (the DMAC, the serial interface, the timers). Those behave the opposite way — one-shot, latched,
+    and <em>auto-cleared</em> when taken, carrying their own vector from the peripheral's own vector
+    register rather than one derived from the level. An emulator that models only one of these two
+    input paths will get one of them wrong.
+  </p>
+
+  <div class="callout confidence">
+    <span class="tag">Naming trap</span>
+    <p>
+      <strong>VRES is not the SH-2 reset line.</strong> The adapter's <code>nRES</code> bit resets
+      both cores and raises no interrupt at all; VRES-the-interrupt is raised by whole-system reset
+      and is simply the highest-priority thing on the interrupt controller. They are separate
+      mechanisms that happen to share three letters. A practical consequence: because VRES outranks
+      everything and is unmaskable, any SH-2 boot code that unmasks <code>SR</code> without
+      acknowledging VRES first immediately takes an interrupt it usually has no handler for — and
+      then takes it again forever. Real boot code acknowledges first.
+    </p>
+  </div>
+
+  <h3>PWM audio</h3>
+  <p>
+    Despite the name, emulating this is not duty-cycle waveform synthesis. Each FIFO entry is
+    treated as a linear amplitude, rescaled against the cycle register — which sets both the output
+    sample rate (3 × the 68000 clock ÷ cycle) and the amplitude scale. Silence sits at the middle of
+    the writable range, not at zero.
+  </p>
+  <p>
+    The FIFO is only <strong>three entries deep</strong>, which is the fact that shapes everything
+    else. At a typical ~22 kHz output rate that is well under a millisecond of audio, so software
+    cannot simply write a buffer and walk away — it has to be told, continuously, when to push more.
+    The chip offers two mechanisms for that, and they are independent:
+  </p>
+  <ul>
+    <li><strong>The PWM interrupt</strong> — fires every (IRQ-timer + 1) samples actually consumed,
+      gated per core by that core's own enable bit.</li>
+    <li><strong>RTP</strong> (control bit 7) — the same event also asserts the chip's <em>DMA
+      request</em> line, so an SH-2's on-chip DMAC channel 1 can refill the FIFO with no CPU
+      involvement at all. Each request moves <strong>exactly one transfer unit</strong>, not a
+      block: the chip is asking for one sample, and draining a whole buffer into a three-entry FIFO
+      would simply overflow it.</li>
+  </ul>
+  <p>
+    Because these are independent, software can legitimately mask the PWM interrupt off entirely and
+    still rely on RTP to keep the audio running. Underrun is not catastrophic in either case — the
+    chip holds its last sample rather than going silent, so a starved FIFO sounds stale rather than
+    broken.
+  </p>
+
   <h3>Current GenesisSharp status</h3>
   <p>
     GenesisSharp implements a complete, standalone SH-2 instruction interpreter — every standard
@@ -3169,23 +3386,33 @@
     <code>IBus</code> it's given.
   </p>
   <p>
-    Both SH-2s can now be released from reset by the 68000 and exchange data with it through the
-    shared communication registers, a 32X title's own frame buffer — Packed Pixel (8bpp indexed)
-    and Direct Color (15-bit RGB) display modes, composited correctly against the Genesis VDP's
-    own output — actually shows up, and its PWM audio output is audibly mixed in alongside the
-    PSG/YM2612. The whole subsystem also round-trips through GenesisSharp's own save states now,
-    and the debug window has a live tab showing both SH-2 cores' registers and a disassembly
-    listing. GenesisSharp doesn't ship a real 32X BIOS (Sega's own firmware, not something this
-    project can distribute) — but it now synthesizes an equivalent boot stub, the same fallback
-    PicoDrive itself uses when no real BIOS is supplied: both cores run the real "M_OK"/"S_OK"
-    COMM-register handshake and jump into the entry point named at their ROM's own header, rather
-    than hitting a blank boot ROM and spinning on an illegal instruction forever. What still
-    doesn't exist: Run Length display mode, DREQ/DMAC, and 32X-side interrupt routing (including
-    PWM's own "feed me more data" interrupt — underrun degrades safely to holding the last sample
-    rather than breaking outright, but some real games may still go audibly stale without it) —
-    any of which could still stall or misbehave in a real title's post-boot code independent of
-    whether boot itself now succeeds. See the project's own <code>ARCHITECTURE.md</code>
-    (§4a-§4a.5) for the software design and what's planned next.
+    Everything described in this section is implemented: both SH-2s, the shared bus and COMM
+    registers, all three display modes composited correctly against the Genesis VDP's output, all
+    five interrupt sources with their level-triggered semantics, the on-chip DMAC including PWM's
+    RTP-driven auto-feed, and PWM audio mixed alongside the PSG/YM2612. The subsystem round-trips
+    through save states, and the debug window has a live tab showing both cores' registers,
+    disassembly, and a memory peek. GenesisSharp doesn't ship a real 32X BIOS (Sega's firmware, not
+    something this project can distribute) — it synthesizes an equivalent boot stub instead, the
+    same fallback PicoDrive uses: both cores run the real "M_OK"/"S_OK" COMM handshake and jump to
+    the entry point named in the ROM's own header.
+  </p>
+  <p>
+    <strong>How much of that is proven is a separate question from whether it is implemented.</strong>
+    One commercial title now renders and sounds correct end-to-end through its intro and cutscenes,
+    which is what shook out most of the bugs called out above — they were found by comparing against
+    a running game, not by reading the reference source more carefully. But that is one title
+    exercising one path through the hardware: it uses Packed Pixel and never programs PWM at all, so
+    Run Length, Direct Color and the entire audio chain are verified against the reference
+    implementation and unit tests rather than against software that actually uses them. Broader
+    real-ROM validation is the open work.
+  </p>
+  <p>
+    Known simplifications, named rather than glossed: autofill completes instantly instead of over
+    real burst timing; <code>HBLK</code>/<code>nFEN</code> are faked with a free-running counter
+    (real hardware behaviour here is poorly understood in the reference implementation too);
+    interrupt delivery is instruction-granular rather than cycle-accurate; and the SH-2 cores model
+    no on-chip cache, so the cache-through mirrors behave identically to the base addresses. See the
+    project's own <code>ARCHITECTURE.md</code> §4a for the software design.
   </p>
 </section>
 
@@ -5336,7 +5563,7 @@
     <li><strong>clown68000</strong>, validated against the <strong>SingleStepTests/m68000</strong>
       hardware-captured test-vector suite — consulted for 68000 edge-case behavior.</li>
     <li><strong>PicoDrive</strong> (Gražvydas "notaz" Ignotas) — the only vendored reference with
-      real 32X and SH-2 support; the sole source for §12's SH-2 CPU facts, since Genesis Plus GX
+      real 32X and SH-2 support; the sole source for every fact in §12, since Genesis Plus GX
       has never shipped 32X emulation. Its SH-2 interpreter is itself MAME's portable SH-2 core
       (Juergen Buchmueller).</li>
   </ul>
