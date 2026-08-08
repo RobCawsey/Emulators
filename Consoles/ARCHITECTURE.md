@@ -1315,6 +1315,28 @@ If you add a new UI action that needs to touch console state, follow this same p
 flag, let the emulation thread do the actual work on itself, never call into `GenesisConsole` from
 the UI thread directly.
 
+**Falling behind real time** is handled in two places, because the two symptoms it produces are
+unrelated to each other.
+
+*Frame-skip*: the catch-up burst runs every frame the clock says is due but calls
+`UpdateFrameSnapshot` only once, after the burst. Emulation is untouched — this drops *rendering*,
+never emulated frames, so behavior is identical and only what reaches the screen changes.
+Presenting is not free (a full 320×224 RGB24 copy), and during a burst every copy but the last was
+being overwritten before the UI thread could read it, so the old code paid for invisible work
+exactly when it had least headroom.
+
+*Audio*: `GenesisAudioProvider` coasts from the last real sample with a short decay on underrun
+rather than emitting silence. Cutting to zero puts a step discontinuity in the waveform — a click —
+and a run of underruns becomes a click train, which is the "garbled" sound. Holding flat instead
+gives a DC offset or a buzz at the refill rate. Decaying avoids both: a few missing samples are
+smoothed over, a long gap fades to real silence. `AudioUnderrunCount` still counts every one, so
+the condition stays diagnosable rather than smoothed out of existence.
+
+Neither of these makes a slow build fast — see §9.8, which is the first thing to check. What they
+do is make the failure *graceful and visible*: the window title shows `— behind Nf` while
+emulation is actually behind, so a speed deficit reads as a speed deficit instead of presenting
+identically to a broken sound chip.
+
 ### 9.2 Rendering
 
 `CopyFrameBufferToBitmap()` swaps the VDP's RGB byte order into GDI+'s expected BGR order at

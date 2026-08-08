@@ -56,6 +56,17 @@ public sealed class MainForm : Form
     private volatile bool _stepFrameRequested;
     private volatile bool _stepInstructionRequested;
 
+    /// <summary>How many frames the last catch-up burst rendered-but-didn't-present, i.e. how far
+    /// behind real time emulation currently is. 0 whenever it's keeping up. Written by the
+    /// emulation thread and read by the UI thread's status line -- a plain diagnostic, deliberately
+    /// not <c>volatile</c>: a stale read just shows a slightly old number for one tick.</summary>
+    private int _framesSkippedLastBurst;
+
+    /// <summary>The window title without any "behind real time" suffix, so
+    /// <see cref="RepaintAndRefreshDebugWindow"/> can add and remove that suffix without
+    /// progressively eating the ROM name.</summary>
+    private string _baseTitle = "GenesisSharp";
+
     /// <summary>The UI thread's hand-off to the emulation thread for a save/load-state request
     /// -- <see cref="GenesisConsole.SaveState"/>/<see cref="GenesisConsole.LoadState"/> touch the
     /// same mutable state <see cref="RunOneFrame"/> does, so they must run on that same thread,
@@ -596,7 +607,8 @@ public sealed class MainForm : Form
         // change how the ROM is loaded or how Sega32X is wired in, which happens unconditionally
         // either way.
         string x32Suffix = cartridge.Is32X ? " [32X]" : "";
-        Text = romPath is null ? "GenesisSharp" : $"GenesisSharp — {Path.GetFileName(romPath)}{x32Suffix}";
+        _baseTitle = romPath is null ? "GenesisSharp" : $"GenesisSharp — {Path.GetFileName(romPath)}{x32Suffix}";
+        Text = _baseTitle;
 
         // WASAPI's own internal buffer stays this many ms of audio queued ahead at all times --
         // a direct, constant contributor to the delay between a game action and hearing its
@@ -751,6 +763,7 @@ public sealed class MainForm : Form
 
                 lastTicks = stopwatch.ElapsedTicks;
                 accumulatedSeconds = 0;
+                _framesSkippedLastBurst = 0; // being paused isn't being behind
                 continue;
             }
 
@@ -759,15 +772,27 @@ public sealed class MainForm : Form
             lastTicks = nowTicks;
             accumulatedSeconds = Math.Min(accumulatedSeconds, maxCatchUpSeconds);
 
-            bool ranAny = false;
+            // Frame-skip: run every frame the clock says is due, but present only the last one.
+            // Emulation is untouched -- this drops *rendering* work, never emulated frames, so
+            // behavior stays identical and only what reaches the screen changes. Worth doing
+            // because presenting is not free: UpdateFrameSnapshot copies the whole 320x224 RGB24
+            // buffer, and during a catch-up burst every copy but the final one is overwritten
+            // before the UI thread ever looks at it, so the burst was paying for work nobody could
+            // see -- exactly when there was least headroom to spare.
+            int framesRun = 0;
             while (accumulatedSeconds >= frameSeconds && _emulationThreadRunning && !_paused)
             {
-                RunOneFrame();
+                RunOneFrame(present: false);
                 accumulatedSeconds -= frameSeconds;
-                ranAny = true;
+                framesRun++;
             }
 
-            if (!ranAny)
+            if (framesRun > 0)
+            {
+                UpdateFrameSnapshot();
+                _framesSkippedLastBurst = framesRun - 1; // diagnostic only; 0 when keeping up
+            }
+            else
             {
                 Thread.Sleep(1);
             }
@@ -778,7 +803,10 @@ public sealed class MainForm : Form
     /// work, and also what a paused <see cref="StepFrame"/> request performs. Stops the
     /// emulation thread's own loop (by clearing <see cref="_emulationThreadRunning"/>) on error
     /// rather than the UI thread's timer, since this now runs there instead.</summary>
-    private void RunOneFrame()
+    /// <param name="present">Whether to publish the finished frame for the UI thread. False during
+    /// a catch-up burst for every frame but the last — see <see cref="RunEmulationLoop"/>. The
+    /// paused step-frame path passes true, since there the whole point is to see that one frame.</param>
+    private void RunOneFrame(bool present = true)
     {
         int pcCountBefore = _visitedPcs.Count;
         try
@@ -813,7 +841,10 @@ public sealed class MainForm : Form
             DumpLockupDiagnostics();
         }
 
-        UpdateFrameSnapshot();
+        if (present)
+        {
+            UpdateFrameSnapshot();
+        }
     }
 
     /// <summary>Runs a single 68000 instruction -- see <see cref="StepInstruction"/>'s remarks
@@ -869,6 +900,17 @@ public sealed class MainForm : Form
 
         _display.Invalidate();
         _debugForm?.RefreshSnapshot();
+
+        // Surface a speed deficit rather than leaving it to be inferred from how the game feels or
+        // sounds. Without this, "running at a third speed" and "the sound chip is broken" present
+        // identically -- which is exactly how a Debug-vs-Release build once cost a long detour into
+        // the PWM implementation (see ARCHITECTURE.md §9.8). Only shown while actually behind.
+        int framesBehind = _framesSkippedLastBurst;
+        string desiredTitle = framesBehind > 0 ? $"{_baseTitle} — behind {framesBehind}f" : _baseTitle;
+        if (Text != desiredTitle)
+        {
+            Text = desiredTitle;
+        }
 
         if (_breakpointHit)
         {
