@@ -481,13 +481,19 @@ render).
 
 This is worth stating explicitly because the obvious-looking candidate is a trap this codebase
 fell into twice. `Pico32xRenderSync`'s `offs = 8; if (Pico.video.reg[1] & 8) offs = 0;`
-(`32x.c:257-259`) reads exactly like a V28/V30 line-table offset and is nothing of the sort — it
-feeds `Pico.est.DrawLineDest = DrawLineDestBase32x + offs * DrawLineDestIncrement32x`
-(`draw.c:290`), i.e. it is a *destination* offset centring a 224-line picture inside PicoDrive's
-240-line output buffer, and reaches the draw loops only in `lines_sft_offs`'s low byte, which they
-never read. GenesisSharp's `Vdp.FrameBuffer` is the 224-line active display alone, so the
-equivalent centring offset here is structurally zero. Using `dram[y+8]` instead cost real,
-visible corruption on a real title — see `Sega32X.Vdp.cs`'s `TryGetPixel` remarks.
+(`32x.c:257-259`) reads exactly like a V28/V30 line-table offset and is nothing of the sort.
+`offs` is a **frame-alignment** value — a 224-line picture sits 8 lines down inside the 240-line
+frame — used in exactly two places, both alignment:
+
+- `Pico.est.DrawLineDest = DrawLineDestBase32x + offs * DrawLineDestIncrement32x` (`draw.c:293`) —
+  which output row 32X scanline 0 lands on.
+- `pmd = Pico.est.Draw2FB + 328 * (lines_sft_offs & 0xff) + 8` (`draw.c:196-197`, and the same in
+  each mode's loop) — which *Genesis-layer* scanline is composited against 32X scanline 0.
+
+Neither is the 32X's own line table, which is indexed independently and never sees `offs`.
+GenesisSharp's `Vdp.FrameBuffer` is the 224-line active display alone and its two layers are
+row-aligned by construction, so both offsets are structurally zero here. Using `dram[y+8]` instead
+cost real, visible corruption on a real title — see `Sega32X.Vdp.cs`'s `TryGetPixel` remarks.
 
 H32 mode additionally offsets the Genesis x-coordinate by 4 relative to the 32X pixel index
 (confirmed directly against `draw.c:18-19,148`'s `pmd += H32_OFFSET`).

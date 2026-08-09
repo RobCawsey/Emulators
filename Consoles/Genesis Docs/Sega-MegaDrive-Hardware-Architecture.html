@@ -46,6 +46,17 @@
     font-size:0.92em;
     color:var(--amber);
   }
+  pre.mono{
+    background:var(--panel-alt);
+    border:1px solid var(--border-soft);
+    border-radius:6px;
+    padding:12px 14px;
+    margin:14px 0;
+    overflow-x:auto;
+    font-size:13px;
+    line-height:1.5;
+    color:var(--amber);
+  }
   .layout{
     display:grid;
     grid-template-columns:260px minmax(0,1fr);
@@ -3261,16 +3272,79 @@
     </svg>
   </div>
 
+  <h4>Worked example: the <code>offs = 8</code> trap</h4>
+  <p>
+    The line-table index is simply the scanline number — no offset, in either 224-line or 240-line
+    mode. That deserves spelling out, because the obvious-looking candidate is a trap that cost
+    this emulator a long-lived visible bug, twice. PicoDrive's renderer opens with:
+  </p>
+  <pre class="mono">offs = 8;
+if (Pico.video.reg[1] &amp; 8)   /* V30: 240-line mode */
+  offs = 0;</pre>
+  <p>
+    Two things make that look like a line-table offset. It is derived from the display-height bit,
+    and 8 is exactly the number of rows that go wrong if you get the table index off by 8. It is
+    nevertheless nothing to do with the table.
+  </p>
+  <p>
+    <strong>Where the 8 actually comes from:</strong> a Genesis frame is 240 lines tall, and a
+    224-line picture occupies the middle of it with 8 blank border lines above and below
+    (<a href="#timing">§7</a>). PicoDrive renders into a buffer sized for the taller mode, so a
+    224-line picture has to be pushed down by 8 rows to sit where it belongs;
+    240-line mode already fills the buffer, hence <code>offs = 0</code>. It is a
+    <em>frame-alignment</em> value, and it is used in exactly two places, both alignment:
+  </p>
+  <table>
+    <thead><tr><th>Use</th><th class="mono">Code</th><th>What it aligns</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>Output position</td>
+        <td class="mono">DrawLineDest = DrawLineDestBase32x + offs × increment</td>
+        <td>Which row of the 240-line output buffer 32X scanline 0 is written to.</td>
+      </tr>
+      <tr>
+        <td>Genesis-layer pairing</td>
+        <td class="mono">pmd = Draw2FB + 328 × offs + 8</td>
+        <td>Which Genesis-layer scanline is composited against 32X scanline 0, so the two layers line up.</td>
+      </tr>
+    </tbody>
+  </table>
+  <p>
+    The 32X line table is indexed separately and never sees <code>offs</code> at all — the fetch is
+    <code>dram[l + sync_line]</code>, where <code>l</code> counts visible lines from 0 and
+    <code>sync_line</code> is the partial-render resume point (0 for a whole-frame render). So for
+    a normal frame the index is just <code>l</code>.
+  </p>
+  <p>
+    <strong>What using it as a table index does.</strong> Take a game that populates all 224 entries
+    normally — entry 0 for the top row, entry 223 for the bottom:
+  </p>
+  <table>
+    <thead><tr><th>Scanline</th><th>Correct entry</th><th>With <code>+8</code></th><th>Result</th></tr></thead>
+    <tbody>
+      <tr><td class="mono">0</td><td class="mono">0</td><td class="mono">8</td><td>Shows row 8's pixels — whole picture shifted up 8 rows.</td></tr>
+      <tr><td class="mono">100</td><td class="mono">100</td><td class="mono">108</td><td>Same 8-row shift; usually unnoticed on its own.</td></tr>
+      <tr><td class="mono">215</td><td class="mono">215</td><td class="mono">223</td><td>Last correct read — the final populated entry.</td></tr>
+      <tr><td class="mono">216–223</td><td class="mono">216–223</td><td class="mono">224–231</td><td><strong>Past everything the game wrote.</strong> Those entries are still zero.</td></tr>
+    </tbody>
+  </table>
+  <p>
+    And a zero table entry is not harmlessly blank. Entry value 0 means "this line's pixels start at
+    word offset 0" — which is the <em>start of the line table itself</em>. So the bottom 8 rows
+    render the table's own bytes as pixel data: an ascending ramp of 16-bit offsets, read as colour.
+    That produces a stable, full-width band of structured-looking colour noise pinned to the bottom
+    of the screen — regular enough to look deliberate, which is why it passed for a genuine hardware
+    artifact (Genesis CRAM dots, <a href="#vdp">§6</a>) for as long as it did.
+  </p>
   <div class="callout confidence">
-    <span class="tag">Implementation note</span>
+    <span class="tag">Diagnosing this class of bug</span>
     <p>
-      The line-table index is simply the scanline number — no offset, in either 224-line or
-      240-line mode. This is worth stating flatly because the obvious-looking candidate is a trap:
-      PicoDrive's renderer computes <code>offs = 8</code> for 224-line mode, which reads exactly
-      like a line-table offset and is nothing of the sort. It is a <em>destination</em> offset that
-      centres a 224-line picture inside a 240-line output buffer, and never reaches the code that
-      indexes the table. GenesisSharp fell for it twice — the second time while "fixing" the first
-      — producing precisely the corruption band drawn above.
+      What settled it was reading the game's own line table out of the running emulator: a clean
+      ascending ramp through entry 223, then zeros from 224 on — exactly 224 populated entries, and
+      an unambiguous statement that the game was right and the renderer was wrong. When 32X output
+      looks wrong, dumping the line table is usually a faster question to ask than staring at
+      pixels, because it separates "the game drew the wrong thing" from "we read the right thing
+      from the wrong place".
     </p>
   </div>
 
